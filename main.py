@@ -1,12 +1,11 @@
 import argparse
-import constants
+from pyexpat import features
+import constants, plotting_features
 from Bio import SeqIO
-import pysam
 from dna_features_viewer import BiopythonTranslator
 from bokeh.models import Range1d
 from bokeh.layouts import column
 from bokeh.plotting import output_file, save
-from bokeh.models.annotations import LabelSet, Label
 
 def check_single_locus(gbk_file):
     try:
@@ -39,8 +38,10 @@ def main():
     parser.add_argument("-a", "--annotation", required=True, help="Annotation tool used (options allowed 'pharokka' or 'other')")
     parser.add_argument("-m", "--mapping", required=True, help="Path to mapping file")
     parser.add_argument("-s", "--sequencing", required=True, choices=["short", "long"], help="Type of sequencing (options allowed 'short' for short-read sequencing and 'long' for long-read sequencing)")
-    parser.add_argument("-w", "--width", required=False, default=1200, help="Width of the plot (in pixels)")
-    parser.add_argument("-sh", "--subplot_height", required=False, default=100, help="Height of each subplot (in pixels)")
+    parser.add_argument("-f", "--features", required=False, help="List of feature subplots to include (comma-separated) (options allowed: coverage)")
+    parser.add_argument("-p", "--precision", required=False, default=100, help="Size of the average window for the features' calculation (in bp)")
+    parser.add_argument("-w", "--width", required=False, default=1800, help="Width of the plot (in pixels)")
+    parser.add_argument("-sh", "--subplot_height", required=False, default=130, help="Height of each subplot (in pixels)")
     args = parser.parse_args()
 
     # Read annotation file
@@ -57,8 +58,7 @@ def main():
     record.features = filtered_features
 
     mapping_file = args.mapping
-    bam_file = pysam.AlignmentFile(mapping_file, "rb")
-    bam_name = mapping_file.split("/")[-1].replace(".bam", "")
+    bam_name = args.mapping.split("/")[-1].replace(".bam", "")
 
     global ANNOTATION_TOOL
     ANNOTATION_TOOL = args.annotation
@@ -74,7 +74,18 @@ def main():
     annotation_fig.width = max_visible_width
     annotation_fig.height = subplot_size
 
-    layout = column(annotation_fig)
+    shared_xrange = Range1d(0, locus_size)
+    annotation_fig.x_range = shared_xrange
+
+    # Adding the feature subplots
+    print("Plotting feature subplots...", flush=True)
+    feature_list = args.features
+    window_size = int(args.precision)
+    subplots = []
+    if feature_list:
+        subplots = plotting_features.adding_subplots(mapping_file, feature_list, locus_name, locus_size, max_visible_width, subplot_size, shared_xrange, window_size)
+
+    layout = column(annotation_fig, *subplots)
     output_path = f"MGFeaturesViewer_{bam_name}_mapped_on_{locus_name}.html"
     output_file(output_path)
     save(layout)
