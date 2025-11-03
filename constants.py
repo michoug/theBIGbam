@@ -13,3 +13,21 @@ PHAROKKA_COLORS = {
     "head and packaging": "#ff008d",
     "connector": "#5A5A5A",
 }
+
+# Define subplots characteristics
+def config_feature_subplot(plot_type, color, alpha, size, title):
+    return {
+        "type_picked": plot_type,
+        "color_picked": color,
+        "alpha_picked": alpha,
+        "size_picked": size,
+        "title_picked": title
+    }
+
+FEATURE_SUBPLOTS = {
+    "coverage": config_feature_subplot("curve", "black", 0.5, 2, "Coverage Depth"),
+    "coverage_reduced": config_feature_subplot("curve", "black", 0.5, 2, "Coverage Depth (only reads starting and ending with a match)"),
+    "reads_starts": config_feature_subplot("dots", "blue", 0.3, 6, "Reads' Starts (more than deviation_factor*std away from the mean)"),
+    "reads_ends": config_feature_subplot("dots", "red", 0.3, 6, "Reads' Ends (more than deviation_factor*std away from the mean)"),
+    "tau": config_feature_subplot("dots", "green", 0.3, 6, "Tau (more than deviation_factor*std away from the mean)"),
+}

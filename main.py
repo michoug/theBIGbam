@@ -38,7 +38,7 @@ def main():
     parser.add_argument("-a", "--annotation", required=True, help="Annotation tool used (options allowed 'pharokka' or 'other')")
     parser.add_argument("-m", "--mapping", required=True, help="Path to mapping file")
     parser.add_argument("-s", "--sequencing", required=True, choices=["short", "long"], help="Type of sequencing (options allowed 'short' for short-read sequencing and 'long' for long-read sequencing)")
-    parser.add_argument("-f", "--features", required=False, help="List of feature subplots to include (comma-separated) (options allowed: coverage)")
+    parser.add_argument("-f", "--features", required=False, help="List of feature subplots to include (comma-separated) (options allowed: coverage, starts, tau)")
     parser.add_argument("-p", "--precision", required=False, default=100, help="Size of the average window for the features' calculation (in bp)")
     parser.add_argument("-w", "--width", required=False, default=1800, help="Width of the plot (in pixels)")
     parser.add_argument("-sh", "--subplot_height", required=False, default=130, help="Height of each subplot (in pixels)")
@@ -78,12 +78,21 @@ def main():
     annotation_fig.x_range = shared_xrange
 
     # Adding the feature subplots
-    print("Plotting feature subplots...", flush=True)
-    feature_list = args.features
+    requested_features = args.features.split(",") if args.features else []
+    # if starts in feature_list replace it by starts_plus, starts_minus, ends_plus, ends_minus
+    feature_list = []
+    for feature in requested_features:
+        if feature == "starts":
+            feature_list.extend(["coverage_reduced", "reads_starts", "reads_ends"])
+        else:
+            feature_list.append(feature)
+
     window_size = int(args.precision)
+    sequencing_type = args.sequencing
+    
     subplots = []
     if feature_list:
-        subplots = plotting_features.adding_subplots(mapping_file, feature_list, locus_name, locus_size, max_visible_width, subplot_size, shared_xrange, window_size)
+        subplots = plotting_features.adding_subplots(mapping_file, feature_list, locus_name, locus_size, sequencing_type, max_visible_width, subplot_size, shared_xrange, window_size)
 
     layout = column(annotation_fig, *subplots)
     output_path = f"MGFeaturesViewer_{bam_name}_mapped_on_{locus_name}.html"
