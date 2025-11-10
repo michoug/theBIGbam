@@ -1,17 +1,15 @@
+import argparse, sys, os, csv
+from multiprocessing import Pool, cpu_count
 from pyexpat import features
+from numba import njit
 import numpy as np
 import pysam
-from re import findall
-from multiprocessing import Pool, cpu_count
-import os
-import csv
-from numba import njit
 
 import time
 from functools import wraps
 from collections import defaultdict
 
-# global dictionary to accumulate times
+### Measuring time spent in each function
 function_times = defaultdict(float)
 
 def track_time(func):
@@ -32,7 +30,77 @@ def print_timing_summary():
         print(f"{name:35s}: {t:.3f} s ({t/total*100:.1f}%)", flush=True)
     print(f"Total tracked time: {total:.3f} s", flush=True)
 
-# Function dedicated to specific features
+### Summarise data for each feature
+def merge_sorted_unique(*arrays):
+    """Merge multiple sorted 1D arrays into a unique sorted array (very fast)."""
+    arrays = [arr for arr in arrays if len(arr) > 0]
+    if not arrays:
+        return np.array([], dtype=int)
+    merged = np.concatenate(arrays)
+    merged.sort(kind='mergesort')  # stable and fast for pre-sorted subarrays
+    # Drop duplicates efficiently
+    return merged[np.concatenate(([True], np.diff(merged) != 0))]
+
+@track_time
+def compress_signal(feature_values, ref_length, step=50, z_thresh=3, deriv_thresh=3, max_points=10000):
+    """
+    step : int, Keep every Nth point
+    z_thresh : float, Z-score threshold for keeping high/low outlier values
+    deriv_thresh : float, Z-score threshold for keeping large derivative changes
+    max_points : int, Hard limit on total number of kept points
+    """
+    # Value outliers
+    y_mean = np.mean(feature_values)
+    y_std = np.std(feature_values) or 1e-9
+    val_outliers = np.abs(feature_values - y_mean) > z_thresh * y_std
+
+    # Derivative outliers
+    dy = np.diff(feature_values, prepend=feature_values[0])
+    dy_std = np.std(dy) or 1e-9
+    der_outliers = np.abs(dy) > deriv_thresh * dy_std
+
+    # Regular subsampling
+    n = len(feature_values)
+    keep_idx = merge_sorted_unique(
+        np.arange(0, n, step, dtype=int),
+        np.nonzero(val_outliers | der_outliers)[0],
+        np.array([n - 1], dtype=int)
+    )
+
+    # Apply hard limit if needed
+    if len(keep_idx) > max_points:
+        step_lim = len(keep_idx) // max_points
+        keep_idx = keep_idx[::step_lim]
+        if keep_idx[-1] != n - 1:
+            keep_idx = np.append(keep_idx, n - 1)
+
+    # Initialize x array of ref_length size
+    x = np.arange(1, ref_length + 1)
+    return {"x": x[keep_idx], "y": feature_values[keep_idx]}
+
+### Save data computed per sample
+# Will be replaced by calls to database in future version
+def save_feature_values_per_contig_per_sample(feature, feature_values, output_dir, sample_name, ref_name):
+    # Define CSV headers
+    fieldnames = ["sample", "contig", "position", "value"]
+
+    output_file = os.path.join(output_dir, feature+"_values_for_"+ref_name+"_in_"+sample_name+".csv")
+    with open(output_file, mode="w", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+        xs = feature_values.get("x", [])
+        ys = feature_values.get("y", [])
+        # Ensure lengths match
+        for pos, val in zip(xs, ys):
+            writer.writerow({
+                "sample": sample_name,
+                "contig": ref_name,
+                "position": pos,
+                "value": val
+            })
+
+### Functions of coverage module
 @njit
 def calculate_coverage_numba(coverage, starts, ends, ref_length):
     for i in range(starts.size):
@@ -49,14 +117,21 @@ def calculate_coverage_numba(coverage, starts, ends, ref_length):
                 coverage[j] += 1
 
 @track_time
-def calculate_coverage(coverage, read, ref_length):
-    blocks = np.array(read.get_blocks(), dtype=np.int32)
-    if blocks.size == 0:
-        return
-    starts = blocks[:, 0]
-    ends = blocks[:, 1]
-    calculate_coverage_numba(coverage, starts, ends, ref_length)
+def get_feature_coverage(reads_mapped, ref_length, output_dir, sample_name, ref_name):    
+    coverage = np.zeros(ref_length, dtype=np.uint64)
 
+    for read in reads_mapped:
+        blocks = np.array(read.get_blocks(), dtype=np.int32)
+        if blocks.size == 0:
+            return
+        starts = blocks[:, 0]
+        ends = blocks[:, 1]
+        calculate_coverage_numba(coverage, starts, ends, ref_length)
+
+    coverage_compact = compress_signal(coverage, ref_length)
+    save_feature_values_per_contig_per_sample("coverage", coverage_compact, output_dir, sample_name, ref_name)
+
+### Functions of phagetermini module
 def starts_with_match(read, start):
     """
     Return True if the first aligned base is a match (not clipped, not insertion, not mismatch).
@@ -120,6 +195,24 @@ def compute_final_starts_ends_and_tau(feature_dict, temporary_dict, sequencing_t
     tau[mask] = (feature_dict["reads_starts"][mask] + feature_dict["reads_ends"][mask]) / feature_dict["coverage_reduced"][mask]
     feature_dict["tau"] = tau
 
+@track_time
+def get_features_phagetermini(reads_mapped, ref_length, sequencing_type, output_dir, sample_name, ref_name):    
+    features = ["coverage_reduced", "reads_starts", "reads_ends", "tau"]
+    temporary_features = ["coverage_reduced", "start_plus", "start_minus", "end_plus", "end_minus", "tau"]
+
+    feature_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in features}
+    temporary_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in temporary_features}
+
+    for read in reads_mapped:
+        calculate_reads_starts_and_ends(read, temporary_dict, ref_length)
+
+    compute_final_starts_ends_and_tau(feature_dict, temporary_dict, sequencing_type, ref_length)
+
+    for feature in features:
+        feature_values = compress_signal(feature_dict[feature], ref_length)
+        save_feature_values_per_contig_per_sample(feature, feature_values, output_dir, sample_name, ref_name)
+
+### Functions of assemblycheck module
 @track_time
 def compute_read_lengths(sum_read_lengths, counts_read_lengths, read, ref_length):
     positions = np.fromiter(read.get_reference_positions(), dtype=np.int32)
@@ -228,199 +321,121 @@ def compute_final_lengths(sum_lengths, count_lengths, ref_length):
     arr[count_lengths == 0] = 0
     return arr.astype(np.float32)
 
-### Main logic to get features per position
 @track_time
-def get_features(reads_mapped, features, ref_length, sequencing_type):    
-    # Initialize arrays
+def get_features_assemblycheck(reads_mapped, ref_length, sequencing_type, output_dir, sample_name, ref_name):    
+    features = []
+    temporary_features = []
+    if sequencing_type == "long":
+        features.extend(["read_lengths"])
+        temporary_features.extend(["sum_read_lengths", "count_read_lengths"])
+    if sequencing_type == "short-paired":
+        features.extend(["insert_sizes", "bad_orientations"])
+        temporary_features.extend(["sum_insert_sizes", "count_insert_sizes", "bad_orientation"])
+    features.extend(["left_clippings", "right_clippings", "insertions", "deletions", "mismatches"])
+
     feature_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in features}
-    temporary_dict = {}
-    
-    # Temporary arrays
-    if "tau" in features:
-        for f in ["start_plus", "start_minus", "end_plus", "end_minus", "coverage_reduced"]:
-            temporary_dict[f] = np.zeros(ref_length, dtype=np.uint64)
-    if "read_lengths" in features:
-        temporary_dict["sum_read_lengths"] = np.zeros(ref_length, dtype=np.uint64)
-        temporary_dict["count_read_lengths"] = np.zeros(ref_length, dtype=np.uint64)
-    if "insert_sizes" in features:
-        temporary_dict["sum_insert_sizes"] = np.zeros(ref_length, dtype=np.uint64)
-        temporary_dict["count_insert_sizes"] = np.zeros(ref_length, dtype=np.uint64)
-    if "bad_orientations" in features:
-        feature_dict["bad_orientations"] = np.zeros(ref_length, dtype=np.float32)
+    temporary_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in temporary_features}
 
     for read in reads_mapped:
-        if read.is_unmapped:
-            continue
-
-        if "coverage" in features:
-            calculate_coverage(feature_dict["coverage"], read, ref_length)
-        if "tau" in features:
-            calculate_reads_starts_and_ends(read, temporary_dict, ref_length)
-        if "read_lengths" in features:
+        if sequencing_type == "long":
             compute_read_lengths(temporary_dict["sum_read_lengths"], temporary_dict["count_read_lengths"], read, ref_length)
-        if {"insert_sizes", "bad_orientations"}.intersection(features):
+        if sequencing_type == "short-paired":
             compute_inserts_characteristics(
                 temporary_dict["sum_insert_sizes"], temporary_dict["count_insert_sizes"],
                 feature_dict.get("bad_orientations", None),
                 features, read, ref_length
             )
-        if {"left_clippings", "right_clippings"}.intersection(features):
-            compute_clippings(feature_dict, features, read, ref_length)
-        if {"insertions", "deletions"}.intersection(features):
-            compute_indels(feature_dict, features, read, ref_length)
-        if "mismatches" in features:
-            compute_mismatches(feature_dict, features, read, ref_length)
+        compute_clippings(feature_dict, features, read, ref_length)
+        compute_indels(feature_dict, features, read, ref_length)
+        compute_mismatches(feature_dict, features, read, ref_length)
 
-    if "tau" in features:
-        compute_final_starts_ends_and_tau(feature_dict, temporary_dict, sequencing_type, ref_length)
-    if "read_lengths" in features:
+    if sequencing_type == "long":
         feature_dict["read_lengths"] = compute_final_lengths(temporary_dict["sum_read_lengths"], temporary_dict["count_read_lengths"], ref_length)
-    if "insert_sizes" in features:
+    if sequencing_type == "short-paired":
         feature_dict["insert_sizes"] = compute_final_lengths(temporary_dict["sum_insert_sizes"], temporary_dict["count_insert_sizes"], ref_length)
 
-    return feature_dict
-
-### Summarise data for each feature
-def merge_sorted_unique(*arrays):
-    """Merge multiple sorted 1D arrays into a unique sorted array (very fast)."""
-    arrays = [arr for arr in arrays if len(arr) > 0]
-    if not arrays:
-        return np.array([], dtype=int)
-    merged = np.concatenate(arrays)
-    merged.sort(kind='mergesort')  # stable and fast for pre-sorted subarrays
-    # Drop duplicates efficiently
-    return merged[np.concatenate(([True], np.diff(merged) != 0))]
-
-@track_time
-def compress_signal(feature_values, ref_length, step=50, z_thresh=3, deriv_thresh=3, max_points=10000):
-    """
-    Fast signal compression while preserving spikes and sharp transitions.
-    
-    Parameters
-    ----------
-    x, y : np.ndarray, Input signal data (same length).
-    step : int, Keep every Nth point.
-    z_thresh : float, Z-score threshold for keeping high/low outlier values.
-    deriv_thresh : float, Z-score threshold for keeping large derivative changes.
-    max_points : int, Hard limit on total number of kept points.
-    
-    Returns
-    -------
-    x_new, y_new : np.ndarray, Compressed signal retaining key features.
-    """
-    # Value outliers
-    y_mean = np.mean(feature_values)
-    y_std = np.std(feature_values) or 1e-9
-    val_outliers = np.abs(feature_values - y_mean) > z_thresh * y_std
-
-    # Derivative outliers
-    dy = np.diff(feature_values, prepend=feature_values[0])
-    dy_std = np.std(dy) or 1e-9
-    der_outliers = np.abs(dy) > deriv_thresh * dy_std
-
-    # Regular subsampling
-    n = len(feature_values)
-    keep_idx = merge_sorted_unique(
-        np.arange(0, n, step, dtype=int),
-        np.nonzero(val_outliers | der_outliers)[0],
-        np.array([n - 1], dtype=int)
-    )
-
-    # Apply hard limit if needed
-    if len(keep_idx) > max_points:
-        step_lim = len(keep_idx) // max_points
-        keep_idx = keep_idx[::step_lim]
-        if keep_idx[-1] != n - 1:
-            keep_idx = np.append(keep_idx, n - 1)
-
-    # Initialize x array of ref_length size
-    x = np.arange(1, ref_length + 1)
-    return {"x": x[keep_idx], "y": feature_values[keep_idx]}
+    for feature in features:
+        feature_values = compress_signal(feature_dict[feature], ref_length)
+        save_feature_values_per_contig_per_sample(feature, feature_values, output_dir, sample_name, ref_name)
 
 ### Calculating features per contig per sample
 @track_time
-def calculating_features_per_contig_per_sample(reads_mapped, locus_size, feature_list, sequencing_type, window_size):
+def calculating_features_per_contig_per_sample(module_list, reads_mapped, locus_size, sequencing_type, output_dir, sample_name, ref_name):
     sequencing_type = "short" if sequencing_type.startswith("short") else "long"
 
-    # Read bam once to calculate all features
-    feature_values = get_features(reads_mapped, feature_list, locus_size, sequencing_type)
-
-    # Averaging and masking data per feature
-    data = {}
-    for feature in feature_list:
-        feature_compressed = compress_signal(feature_values[feature], locus_size)
-        if feature_compressed is not None:
-            data[feature] = feature_compressed
-                
-    return data
+    # Calculate all features
+    if "coverage" in module_list:
+        coverage_values = get_feature_coverage(reads_mapped, locus_size, output_dir, sample_name, ref_name)
+    if "phagetermini" in module_list:
+        phagetermini_values = get_features_phagetermini(reads_mapped, locus_size, sequencing_type, output_dir, sample_name, ref_name)
+    if "assemblycheck" in module_list:
+        assemblycheck_values = get_features_assemblycheck(reads_mapped, locus_size, sequencing_type, output_dir, sample_name, ref_name)
     
 ### Distributing the calculation for all the contigs in the bam file
-def calculating_features_per_sample(mapping_file, feature_list, sequencing_type, window_size):
+def calculating_features_per_sample(module_list, mapping_file, sequencing_type, output_dir, sample_name):
     bam_file = pysam.AlignmentFile(mapping_file, "rb")
     references = bam_file.references
     lengths = [l // 2 for l in bam_file.lengths]  # need to divide by 2 because each contig was doubled for mapping to deal with circularity
 
-    all_data = {}
     for ref, length in zip(references, lengths):
         # Fetch reads only for this contig
         reads_iter = bam_file.fetch(ref)
-        contig_data = calculating_features_per_contig_per_sample(reads_iter, length, feature_list, sequencing_type, window_size)
-        all_data[ref] = contig_data
+        calculating_features_per_contig_per_sample(module_list, reads_iter, length, sequencing_type, output_dir, sample_name, ref)
 
     bam_file.close()
-    print_timing_summary()
-    return all_data
-
-### Save data computed per sample
-# Will be replaced by calls to database in future version
-def save_data_dictionary(bam_name, contigs_list, output_file):
-    """
-    Save a nested data dictionary to a CSV file.
-    """
-    # Define CSV headers
-    fieldnames = ["sample", "contig", "variable", "position", "value"]
-
-    with open(output_file, mode="w", newline="") as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for contig_name, variables_list in contigs_list.items():
-            for variable_name, content in variables_list.items():
-                xs = content.get("x", [])
-                ys = content.get("y", [])
-                # Ensure lengths match
-                for pos, val in zip(xs, ys):
-                    writer.writerow({
-                        "sample": bam_name,
-                        "contig": contig_name,
-                        "variable": variable_name,
-                        "position": pos,
-                        "value": val
-                    })
 
 ### Distributing the calculation for all the bam files (samples)
-def _process_single_sample(bam_file, feature_list, sequencing_type, window_size, output_prefix, n_contig_cores=None):
+def _process_single_sample(list_modules, bam_file, sequencing_type, output_dir):
     sample_name = os.path.basename(bam_file).replace(".bam", "")
 
     # Calculate features per contig (can still be parallelized with n_contig_cores)
-    sample_data = calculating_features_per_sample(bam_file, feature_list, sequencing_type, window_size)
+    calculating_features_per_sample(list_modules, bam_file, sequencing_type, output_dir, sample_name)
 
-    # Save to CSV
-    output_name = f"{output_prefix}_{os.path.splitext(sample_name)[0]}_features.csv"
-    save_data_dictionary(sample_name, sample_data, output_name)
-    return sample_name, sample_data
+    # Temporary debugging
+    print_timing_summary()
 
-def calculating_all_features_parallel(bam_files, feature_list, sequencing_type, window_size, output_prefix, n_sample_cores=None, n_contig_cores=None):
+def calculating_all_features_parallel(list_modules, bam_files, sequencing_type, output_dir, n_sample_cores=None):
     if n_sample_cores is None:
         n_sample_cores = max(1, cpu_count() - 1)
     print(f"Using {n_sample_cores} cores to process {len(bam_files)} samples in parallel...", flush=True)
 
-    args_list = [(bam, feature_list, sequencing_type, window_size, output_prefix, n_contig_cores) for bam in bam_files]
+    args_list = [(list_modules, bam, sequencing_type, output_dir) for bam in bam_files]
 
     with Pool(processes=n_sample_cores) as pool:
-        results = pool.starmap(_process_single_sample, args_list)
-
-    all_samples_data = {sample: data for sample, data in results}
+        pool.starmap(_process_single_sample, args_list)
     print("Finished all samples.", flush=True)
 
-    return all_samples_data
+### Main function
+def main():
+    # Parse command line arguments
+    print("Parsing arguments...", flush=True)
+    parser = argparse.ArgumentParser(description="Parse input files.")
+    parser.add_argument("-t", "--threads", required=True, help="Number of threads available")
+    parser.add_argument("-b", "--bam_files", required=True, help="Path to bam file or directory containing mapping files (BAM format)")
+    parser.add_argument("-s", "--sequencing", required=True, choices=["short-paired", "short-single", "long"], help="Type of sequencing (options allowed 'short-paired' and 'short-single' for short-read sequencing and 'long' for long-read sequencing)")
+    parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
+    parser.add_argument("-o", "--output_dir", required=True, help="Output directory to store output csv files")
+    args = parser.parse_args()
+
+    # Get list of BAM files
+    if os.path.isdir(args.bam_files):
+        bam_files = [os.path.join(args.bam_files, f) for f in os.listdir(args.bam_files) if f.endswith(".bam")]
+    else:
+        bam_files = [args.bam_files]
+    if not bam_files:
+        sys.exit("ERROR: No BAM files found in the specified mapping path.")
+
+    # Getting list of features requested
+    # If starts in feature_list replace it by starts_plus, starts_minus, ends_plus, ends_minus
+    requested_modules = args.modules.split(",")
+    sequencing_type = args.sequencing
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    n_cores = int(args.threads)
+
+    # Calculating values for all requested features from mapping files
+    print("### Calculating values for all requested features from mapping files...", flush=True)
+    calculating_all_features_parallel(requested_modules, bam_files, sequencing_type, output_dir, n_cores)
+
+if __name__ == "__main__":
+    main()
