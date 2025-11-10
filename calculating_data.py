@@ -143,6 +143,7 @@ def calculate_coverage_numba(coverage, starts, ends, ref_length):
             for j in range(0, end_mod):
                 coverage[j] += 1
 
+@track_time
 def get_feature_coverage(ref_starts, ref_ends, ref_length, output_dir, sample_name, ref_name):
     coverage = np.zeros(ref_length, dtype=np.uint64)
     calculate_coverage_numba(coverage, ref_starts, ref_ends, ref_length)
@@ -235,13 +236,6 @@ def add_read_lengths_numba(sum_read_lengths, counts_read_lengths, positions, rea
         sum_read_lengths[pos] += read_len
         counts_read_lengths[pos] += 1
 
-@track_time
-def compute_read_lengths(sum_read_lengths, counts_read_lengths, read, ref_length):
-    positions = np.fromiter(read.get_reference_positions(), dtype=np.int32)
-    if positions.size == 0:
-        return
-    add_read_lengths_numba(sum_read_lengths, counts_read_lengths, positions, read.query_length, ref_length)
-
 @njit
 def add_insert_sizes_numba(sum_insert_sizes, counts_insert_sizes, bad_orientations, positions, insert_len, is_read1, proper_pair, insert_flag, bad_flag, ref_length):
     for i in range(positions.size):
@@ -251,28 +245,6 @@ def add_insert_sizes_numba(sum_insert_sizes, counts_insert_sizes, bad_orientatio
             counts_insert_sizes[pos] += 1
         if bad_flag and not proper_pair:
             bad_orientations[pos] += 1
-
-@track_time
-def compute_inserts_characteristics(sum_insert_sizes, counts_insert_sizes, bad_orientations, features, read, ref_length):
-    if not read.is_paired or read.mate_is_unmapped:
-        return
-    positions = np.fromiter(read.get_reference_positions(), dtype=np.int32)
-    if positions.size == 0:
-        return
-    insert_len = abs(read.template_length)
-    insert_flag = 1 if "insert_sizes" in features else 0
-    bad_flag = 1 if "bad_orientations" in features else 0
-    add_insert_sizes_numba(sum_insert_sizes, counts_insert_sizes, bad_orientations, positions, insert_len, read.is_read1, read.is_proper_pair, insert_flag, bad_flag, ref_length)
-
-@track_time
-def compute_clippings(feature_dict, features, read, ref_length):
-    if read.cigartuples:
-        first_op, _ = read.cigartuples[0]
-        last_op, _ = read.cigartuples[-1]
-        if "left_clippings" in features and first_op in (4, 5):
-            feature_dict["left_clippings"][read.reference_start % ref_length] += 1
-        if "right_clippings" in features and last_op in (4, 5):
-            feature_dict["right_clippings"][(read.reference_end - 1) % ref_length] += 1
 
 @njit
 def add_indels_numba(deletions, insertions, cigartuples, ref_start, ref_length):
@@ -289,16 +261,6 @@ def add_indels_numba(deletions, insertions, cigartuples, ref_start, ref_length):
             ref_pos += length
         else:
             ref_pos += length
-
-@track_time
-def compute_indels(feature_dict, features, read, ref_length):
-    if read.cigartuples is None:
-        return feature_dict
-    cigartuples = np.array(read.cigartuples, dtype=np.int32)
-    deletions = feature_dict["deletions"] if "deletions" in features else None
-    insertions = feature_dict["insertions"] if "insertions" in features else None
-    add_indels_numba(deletions, insertions, cigartuples, read.reference_start, ref_length)
-    return feature_dict
 
 @njit
 def add_mismatches_numba_from_md(mismatches, md_chars, md_len, ref_start, ref_length):
@@ -325,16 +287,6 @@ def add_mismatches_numba_from_md(mismatches, md_chars, md_len, ref_start, ref_le
             ref_pos += 1
             i += 1
 
-@track_time
-def compute_mismatches(feature_dict, features, read, ref_length):
-    if "mismatches" not in features or not read.has_tag("MD"):
-        return
-    md_tag = read.get_tag("MD")
-    # Convert string to numpy array of bytes for Numba
-    md_chars = np.frombuffer(md_tag.encode('ascii'), dtype=np.uint8)
-    add_mismatches_numba_from_md(feature_dict["mismatches"], md_chars, md_chars.size, read.reference_start, ref_length)
-    
-@track_time
 def compute_final_lengths(sum_lengths, count_lengths):
     count_lengths = np.maximum(count_lengths, 1)  # avoid division by zero
     arr = sum_lengths / count_lengths
@@ -342,41 +294,66 @@ def compute_final_lengths(sum_lengths, count_lengths):
     return arr.astype(np.float32)
 
 @track_time
-def get_features_assemblycheck(reads_mapped, ref_length, sequencing_type, output_dir, sample_name, ref_name):    
+def get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_lengths, is_read1, 
+                               is_proper_pair, is_paired, is_reverse, cigars, has_md, md_list, md_lengths,
+                               sequencing_type, ref_length, output_dir, sample_name, ref_name):
     features = []
     temporary_features = []
 
-    # Select features depending on sequencing type
     if sequencing_type == "long":
-        features.extend(["read_lengths"])
+        features.append("read_lengths")
         temporary_features.extend(["sum_read_lengths", "count_read_lengths"])
     if sequencing_type == "short-paired":
         features.extend(["insert_sizes", "bad_orientations"])
         temporary_features.extend(["sum_insert_sizes", "count_insert_sizes", "bad_orientation"])
     features.extend(["left_clippings", "right_clippings", "insertions", "deletions", "mismatches"])
 
-    # Initialize arrays
     feature_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in features}
     temporary_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in temporary_features}
 
-    for read in reads_mapped:
+    n_reads = ref_starts.size
+    for i in range(n_reads):
+        # --- Long reads ---
         if sequencing_type == "long":
-            compute_read_lengths(temporary_dict["sum_read_lengths"], temporary_dict["count_read_lengths"], read, ref_length)
-        if sequencing_type == "short-paired":
-            compute_inserts_characteristics(
-                temporary_dict["sum_insert_sizes"], temporary_dict["count_insert_sizes"],
-                feature_dict.get("bad_orientations", None),
-                features, read, ref_length
-            )
-        compute_clippings(feature_dict, features, read, ref_length)
-        compute_indels(feature_dict, features, read, ref_length)
-        compute_mismatches(feature_dict, features, read, ref_length)
+            positions = np.arange(ref_starts[i], ref_ends[i], dtype=np.int32) % ref_length
+            add_read_lengths_numba(temporary_dict["sum_read_lengths"], temporary_dict["count_read_lengths"],
+                                   positions, query_lengths[i], ref_length)
 
+        # --- Short-paired reads ---
+        if sequencing_type == "short-paired":
+            positions = np.arange(ref_starts[i], ref_ends[i], dtype=np.int32) % ref_length
+            insert_len = template_lengths[i]
+            insert_flag = 1 if "insert_sizes" in features else 0
+            bad_flag = 1 if "bad_orientations" in features else 0
+            add_insert_sizes_numba(temporary_dict["sum_insert_sizes"], temporary_dict["count_insert_sizes"],
+                                   feature_dict.get("bad_orientations", None),
+                                   positions, insert_len, is_read1[i], is_proper_pair[i], insert_flag, bad_flag, ref_length)
+
+        # --- Clippings ---
+        if cigars[i].size > 0:
+            first_op, _ = cigars[i][0]
+            last_op, _ = cigars[i][-1]
+            if "left_clippings" in features and first_op in (4,5):
+                feature_dict["left_clippings"][ref_starts[i] % ref_length] += 1
+            if "right_clippings" in features and last_op in (4,5):
+                feature_dict["right_clippings"][(ref_ends[i]-1) % ref_length] += 1
+
+        # --- Indels ---
+        deletions = feature_dict["deletions"] if "deletions" in features else None
+        insertions = feature_dict["insertions"] if "insertions" in features else None
+        add_indels_numba(deletions, insertions, cigars[i], ref_starts[i], ref_length)
+
+        # --- Mismatches ---
+        if "mismatches" in features and has_md[i]:
+            add_mismatches_numba_from_md(feature_dict["mismatches"], md_list[i], md_lengths[i], ref_starts[i], ref_length)
+
+    # --- Finalize lengths ---
     if sequencing_type == "long":
         feature_dict["read_lengths"] = compute_final_lengths(temporary_dict["sum_read_lengths"], temporary_dict["count_read_lengths"])
     if sequencing_type == "short-paired":
         feature_dict["insert_sizes"] = compute_final_lengths(temporary_dict["sum_insert_sizes"], temporary_dict["count_insert_sizes"])
 
+    # --- Save features ---
     for feature in features:
         feature_values = compress_signal(feature_dict[feature], ref_length)
         save_feature_values_per_contig_per_sample(feature, feature_values, output_dir, sample_name, ref_name)
@@ -389,6 +366,7 @@ def preprocess_reads(reads_mapped, modules):
     is_read1, is_proper_pair, is_paired, is_reverse = [], [], [], []
     cigars, has_md, md_list, md_lengths = [], [], [], []
 
+    need_md = {"phagetermini", "assemblycheck"}.intersection(modules)
     for read in reads_mapped:
         if read.is_unmapped:
             continue
@@ -406,7 +384,7 @@ def preprocess_reads(reads_mapped, modules):
         cigars.append(np.array(read.cigartuples, dtype=np.int32) if read.cigartuples else np.zeros((0,2), dtype=np.int32))
 
         # Only store MD tags if mismatches will be computed
-        if {"phagetermini", "assemblycheck"}.intersection(modules):
+        if need_md:
             if read.has_tag("MD"):
                 md_bytes = np.frombuffer(read.get_tag("MD").encode("ascii"), dtype=np.uint8)
                 md_list.append(md_bytes)
@@ -450,10 +428,12 @@ def calculating_features_per_contig_per_sample(module_list, bam_file, ref, locus
         get_features_phagetermini(ref_starts, ref_ends, is_reverse, cigars, md_list, 
                                   sequencing_type, locus_size, output_dir, sample_name, ref_name)
     if "assemblycheck" in module_list:
-        reads_mapped = bam_file.fetch(ref)
-        get_features_assemblycheck(reads_mapped, locus_size, sequencing_type, output_dir, sample_name, ref_name)
+        get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_lengths, is_read1, 
+                                   is_proper_pair, is_paired, is_reverse, cigars, has_md, md_list, md_lengths,
+                                   sequencing_type, locus_size, output_dir, sample_name, ref_name)
     
 ### Distributing the calculation for all the contigs in the bam file
+@track_time
 def calculating_features_per_sample(module_list, mapping_file, sequencing_type, output_dir, sample_name):
     bam_file = pysam.AlignmentFile(mapping_file, "rb")
     references = bam_file.references
