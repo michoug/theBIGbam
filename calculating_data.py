@@ -497,4 +497,7 @@ def main():
     calculating_all_features_parallel(requested_modules, bam_files, output_dir, n_cores)
 
 if __name__ == "__main__":
+    start_time = time.perf_counter()
     main()
+    end_time = time.perf_counter()
+    print(f"Total execution time: {end_time - start_time:.2f} seconds", flush=True)
