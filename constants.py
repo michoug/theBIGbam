@@ -20,11 +20,11 @@ def config_feature_subplot(plot_type, color, title, alpha=0.7, size=1):
         alpha = 0.5
         size = 3
     return {
-        "type_picked": plot_type,
-        "color_picked": color,
-        "alpha_picked": alpha,
-        "size_picked": size,
-        "title_picked": title
+        "type": plot_type,
+        "color": color,
+        "alpha": alpha,
+        "size": size,
+        "title": title
     }
 
 FEATURE_SUBPLOTS = {

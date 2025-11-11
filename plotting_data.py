@@ -24,17 +24,11 @@ class CustomTranslator(BiopythonTranslator):
         return feature.qualifiers.get("product", [])
     
 ### Plotting functions
-def make_bokeh_subplot(feature, xx, yy, width, height, x_range):
-    type_picked = constants.FEATURE_SUBPLOTS[feature]["type_picked"]
-    color_picked = constants.FEATURE_SUBPLOTS[feature]["color_picked"]
-    alpha_picked = constants.FEATURE_SUBPLOTS[feature]["alpha_picked"]
-    size_picked = constants.FEATURE_SUBPLOTS[feature]["size_picked"]
-    title_picked = constants.FEATURE_SUBPLOTS[feature]["title_picked"]
-
+def make_bokeh_subplot(xx, yy, width, height, x_range, type_picked, color, alpha, size, title):
     p = figure(
         width=width,
         height=height,
-        title=title_picked,
+        title=title,
         x_range=x_range,
         tools="xpan,xwheel_zoom,reset,save"
     )
@@ -46,9 +40,9 @@ def make_bokeh_subplot(feature, xx, yy, width, height, x_range):
             x='x',
             y='y',
             source=source,
-            line_color=color_picked,
-            line_alpha=alpha_picked,
-            line_width=size_picked,
+            line_color=color,
+            line_alpha=alpha,
+            line_width=size,
         )
     elif type_picked == "bars":
         source = ColumnDataSource(data=dict(x=xx, y=yy))
@@ -57,9 +51,9 @@ def make_bokeh_subplot(feature, xx, yy, width, height, x_range):
             bottom=0,
             top='y',
             source=source,
-            color=color_picked,
-            alpha=alpha_picked,
-            width=size_picked
+            color=color,
+            alpha=alpha,
+            width=size
         )
 
     # Add hover
@@ -71,7 +65,7 @@ def make_bokeh_subplot(feature, xx, yy, width, height, x_range):
     p.xgrid.visible = False
 
     p.y_range.start = 0
-    p.yaxis.axis_label = title_picked
+    p.yaxis.axis_label = title
     p.yaxis.axis_label_text_font_size = "10pt"
     p.yaxis.axis_label_standoff = 0
     p.ygrid.grid_line_alpha = 0.2
@@ -83,52 +77,34 @@ def make_bokeh_subplot(feature, xx, yy, width, height, x_range):
 
     return p
 
-def prepare_subplot(feature, features_x, features_y, shared_xrange, max_visible_width, subplot_size):
-    # Skip if nothing left
-    if len(features_x) == 0:
-        return None
-    feature_subplot = make_bokeh_subplot(feature, features_x, features_y, max_visible_width, subplot_size, shared_xrange)
-    return feature_subplot
-
 ### One function to rule them all
-def prepare_all_subplots(data, max_visible_width, subplot_size, shared_xrange):
+def prepare_all_subplots(data_all_features, max_visible_width, subplot_size, shared_xrange):
     subplots = []
-    for feature in data:
-        feature_positions = data[feature]["x"]
-        feature_values = data[feature]["y"]
+    for feature_dict in data_all_features:
+        feature_positions = feature_dict["x"]
+        feature_values = feature_dict["y"]
 
-        subplot_feature = prepare_subplot(feature, feature_positions, feature_values, shared_xrange, max_visible_width, subplot_size)
+        # Skip if nothing left
+        if len(feature_positions) == 0:
+            continue
+        
+        # Get subplot characteristics
+        type_picked = feature_dict["type"]
+        color = feature_dict["color"]
+        alpha = feature_dict["alpha"]
+        size = feature_dict["size"]
+        title = feature_dict["title"]
+
+        # Create subplot
+        subplot_feature = make_bokeh_subplot(feature_positions, feature_values, 
+                                             max_visible_width, subplot_size, shared_xrange,
+                                             type_picked, color, alpha, size, title)
         if subplot_feature is not None:
             subplots.append(subplot_feature)
 
     return subplots
 
-def prepare_main_plot(data_dictionary, genbank_record, protein_annotation_tool, locus_size, max_visible_width, subplot_size, output_name):
-    global ANNOTATION_TOOL
-    ANNOTATION_TOOL = protein_annotation_tool
-
-    # Plotting gene map
-    print("Plotting gene map...", flush=True)
-    graphic_record = CustomTranslator().translate_record(genbank_record)
-    # figure_width and figure_height for the arrow size
-    annotation_fig = graphic_record.plot_with_bokeh(figure_width=30, figure_height=40)
-    annotation_fig.width = max_visible_width
-    annotation_fig.height = subplot_size
-
-    shared_xrange = Range1d(0, locus_size)
-    annotation_fig.x_range = shared_xrange
-
-    subplots = prepare_all_subplots(data_dictionary, max_visible_width, subplot_size, shared_xrange)
-
-    layout = column(annotation_fig, *subplots)
-    output_file(output_name)
-    save(layout)
-    print(f"Saved interactive plot to {output_name}")
-
-def prepare_main_plot(data_dictionary, genbank_record, protein_annotation_tool, locus_size, max_visible_width, subplot_size, output_name):
-    global ANNOTATION_TOOL
-    ANNOTATION_TOOL = protein_annotation_tool
-
+def prepare_main_plot(data_dictionary, genbank_record, locus_size, max_visible_width, subplot_size, output_name):
     # --- Main gene annotation plot
     print("Plotting gene map...", flush=True)
     graphic_record = CustomTranslator().translate_record(genbank_record)
@@ -164,7 +140,8 @@ def parse_requested_features(requested_modules):
     return(features)
 
 ### Function to generate one HTML plot per locus
-def generate_html_plots(genbank_path, annotation_tool, bam_files, input_csv_dir, requested_features, output_prefix, max_visible_width, subplot_size):
+def generate_html_plots(genbank_path, bam_files, input_csv_dir, requested_features, 
+                        custom_characs, output_prefix, max_visible_width, subplot_size):
     print("Generating HTML plots per locus...", flush=True)
 
     allowed_types = ["CDS", "tRNA/tmRNA", "rRNA", "ncRNA", "ncRNA-region", "CRISPR", "Gap", "Misc"]
@@ -181,29 +158,44 @@ def generate_html_plots(genbank_path, annotation_tool, bam_files, input_csv_dir,
 
         for sample_name in bam_files:
             # Reading data from CSV files for all requested features
-            data_for_locus_sample = {}
+            all_features_for_one_locus_one_sample = []
             for feature in requested_features:
-                data_for_locus_sample.setdefault(feature, {"x": [], "y": []})
+                feature_dict = {}
+                feature_dict["filename"] = os.path.join(input_csv_dir, f"{feature}_values_for_{locus_name}_in_{sample_name}.csv")
+                
+                # Subplot characteristics
+                feature_dict["type"] = constants.FEATURE_SUBPLOTS[feature]["type"]
+                feature_dict["color"] = constants.FEATURE_SUBPLOTS[feature]["color"]
+                feature_dict["alpha"] = constants.FEATURE_SUBPLOTS[feature]["alpha"]
+                feature_dict["size"] = constants.FEATURE_SUBPLOTS[feature]["size"]
+                feature_dict["title"] = constants.FEATURE_SUBPLOTS[feature]["title"]
+                
+                # Initialize subplot values
+                feature_dict["x"] = []
+                feature_dict["y"] = []
+                all_features_for_one_locus_one_sample.append(feature_dict)
 
-                csv_file_path = os.path.join(input_csv_dir, f"{feature}_values_for_{locus_name}_in_{sample_name}.csv")
-                if not os.path.exists(csv_file_path):
-                    print(f"WARNING: CSV file {csv_file_path} not found")
+            # Add custom characs to the list
+            all_features_for_one_locus_one_sample.extend(custom_characs)
+
+            # For all subplots
+            for feature_dict in all_features_for_one_locus_one_sample:
+                if not os.path.exists(feature_dict["filename"]):
+                    print(f"WARNING: CSV file {feature_dict['filename']} not found")
                 else:
-                    with open(csv_file_path, 'r') as csvfile:
-                                        reader = csv.reader(csvfile)
-                                        next(reader)
-                                        for row in reader:
-                                            position = int(row[2])
-                                            value = float(row[3])
-                                            data_for_locus_sample[feature]["x"].append(position)
-                                            data_for_locus_sample[feature]["y"].append(value)
+                    with open(feature_dict["filename"], 'r') as csvfile:
+                        reader = csv.reader(csvfile)
+                        for row in reader:
+                            # For custom files need to keep only relevant rows
+                            if row[0] == sample_name and row[1] == locus_name:
+                                feature_dict["x"].append(int(row[2]))
+                                feature_dict["y"].append(float(row[3]))
 
             # Generate the HTML plot
             output_html = f"{output_prefix}_{locus_name}_in_{sample_name}.html"
             prepare_main_plot(
-                data_for_locus_sample,
+                all_features_for_one_locus_one_sample,
                 record,
-                annotation_tool,
                 locus_size,
                 max_visible_width,
                 subplot_size,
@@ -222,17 +214,33 @@ def main():
     parser.add_argument("-b", "--bam_files", required=True, help="Path to bam file or directory containing mapping files (BAM format)")
     parser.add_argument("-i", "--input_dir", required=True, help="Input directory where input csv files are stored")
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
+    parser.add_argument("-c", "--custom", required=False, help="List of custom variables to plot. Each variable should be in the format filename:type:color:title. Type can be 'curve' or 'bars'. Use comma between variables")
     parser.add_argument("-o", "--output_prefix", required=False, default="MGFeaturesViewer", help="Prefix for output files, including complete path if you want to save them in a specific folder")
     parser.add_argument("-pw", "--plot_width", required=False, default=1800, help="Width of the plot (in pixels)")
     parser.add_argument("-sh", "--subplot_height", required=False, default=130, help="Height of each subplot (in pixels)")
     args = parser.parse_args()
 
     genbank_file = args.genbank
-    annotation_method = args.annotation
+    global ANNOTATION_TOOL
+    ANNOTATION_TOOL = args.annotation
+    
     bam_files = args.bam_files
     input_csv_dir = args.input_dir
+
+    # Get requested features
     requested_modules = args.modules.split(",")
     requested_features = parse_requested_features(requested_modules)
+
+    custom_variables = args.custom
+    custom_characs = []
+    if custom_variables:
+        for custom_var in custom_variables.split(","):
+            filename, type_picked, color, title = custom_var.split(":")
+            custom_charac = {"filename": filename, "x": [], "y": []}
+            custom_charac.update(constants.config_feature_subplot(type_picked, color, title))
+            custom_characs.append(custom_charac)
+    
+    # Optional plotting parameters
     output_prefix = args.output_prefix
     max_visible_width = int(args.plot_width)
     subplot_size = int(args.subplot_height)
@@ -245,7 +253,8 @@ def main():
 
     # Reading values for all requested modules from mapping files
     print("Reading csv files and plotting (one output file per locus and sample)...", flush=True)
-    generate_html_plots(genbank_file, annotation_method, bam_names, input_csv_dir, requested_features, output_prefix, max_visible_width, subplot_size)    
+    generate_html_plots(genbank_file, bam_names, input_csv_dir, requested_features, 
+                        custom_characs, output_prefix, max_visible_width, subplot_size)    
     
 if __name__ == "__main__":
     main()

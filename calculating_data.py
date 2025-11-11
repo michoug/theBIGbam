@@ -4,6 +4,7 @@ from pyexpat import features
 from numba import njit
 import numpy as np
 import pysam
+import constants
 
 import time
 from functools import wraps
@@ -67,13 +68,16 @@ def merge_sorted_unique(*arrays):
     # Drop duplicates efficiently
     return merged[np.concatenate(([True], np.diff(merged) != 0))]
 
-def compress_signal(feature_values, ref_length, step=50, z_thresh=3, deriv_thresh=3, max_points=10000):
+def compress_signal(type_picked, feature_values, ref_length, step, z_thresh, deriv_thresh, max_points):
     """
     step : int, Keep every Nth point
     z_thresh : float, Z-score threshold for keeping high/low outlier values
     deriv_thresh : float, Z-score threshold for keeping large derivative changes
     max_points : int, Hard limit on total number of kept points
     """
+    feature_values = np.asarray(feature_values)
+    n = len(feature_values)
+
     # Value outliers
     y_mean = np.mean(feature_values)
     y_std = np.std(feature_values) or 1e-9
@@ -85,18 +89,22 @@ def compress_signal(feature_values, ref_length, step=50, z_thresh=3, deriv_thres
     der_outliers = np.abs(dy) > deriv_thresh * dy_std
 
     # Regular subsampling
-    n = len(feature_values)
-    keep_idx = merge_sorted_unique(
-        np.arange(0, n, step, dtype=int),
-        np.nonzero(val_outliers | der_outliers)[0],
-        np.array([n - 1], dtype=int)
-    )
-
+    if type_picked == "curve":
+        regular_idx = np.arange(0, n, step, dtype=int) if n > 0 else np.array([], dtype=int)
+        outlier_idx = np.nonzero(val_outliers | der_outliers)[0]
+        last_idx = np.array([n - 1], dtype=int) if n > 0 else np.array([], dtype=int)
+        keep_idx = merge_sorted_unique(regular_idx, outlier_idx, last_idx)
+    elif type_picked == "bars":
+        # For bars: only keep outliers (value OR derivative)
+        keep_idx = np.nonzero(val_outliers | der_outliers)[0]
+    else:
+        raise ValueError(f"Unknown type_picked: {type_picked}")
+    
     # Apply hard limit if needed
     if len(keep_idx) > max_points:
         step_lim = len(keep_idx) // max_points
         keep_idx = keep_idx[::step_lim]
-        if keep_idx[-1] != n - 1:
+        if len(keep_idx) > 0 and keep_idx[-1] != n - 1:
             keep_idx = np.append(keep_idx, n - 1)
 
     # Initialize x array of ref_length size
@@ -125,6 +133,11 @@ def save_feature_values_per_contig_per_sample(feature, feature_values, output_di
                 "value": val
             })
 
+def save_features_from_module(feature, feature_values, output_dir, sample_name, ref_name, ref_length, step, z_thresh, deriv_thresh, max_points):
+    type_picked = constants.FEATURE_SUBPLOTS[feature]["type_picked"]
+    feature_compressed = compress_signal(type_picked, feature_values, ref_length, step, z_thresh, deriv_thresh, max_points)
+    save_feature_values_per_contig_per_sample(feature, feature_compressed, output_dir, sample_name, ref_name)
+
 ### Functions of coverage module
 @njit
 def calculate_coverage_numba(coverage, starts, ends, ref_length):
@@ -144,11 +157,11 @@ def calculate_coverage_numba(coverage, starts, ends, ref_length):
                 coverage[j] += 1
 
 @track_time
-def get_feature_coverage(ref_starts, ref_ends, ref_length, output_dir, sample_name, ref_name):
+def get_feature_coverage(ref_starts, ref_ends, ref_length, output_dir, sample_name, ref_name, step, z_thresh, deriv_thresh, max_points):
     coverage = np.zeros(ref_length, dtype=np.uint64)
     calculate_coverage_numba(coverage, ref_starts, ref_ends, ref_length)
 
-    coverage_compact = compress_signal(coverage, ref_length)
+    coverage_compact = compress_signal("curve", coverage, ref_length, step, z_thresh, deriv_thresh, max_points)
     save_feature_values_per_contig_per_sample("coverage", coverage_compact, output_dir, sample_name, ref_name)
 
 ### Functions of phagetermini module
@@ -203,7 +216,8 @@ def compute_final_starts_ends_and_tau(feature_dict, temporary_dict, sequencing_t
 
 @track_time
 def get_features_phagetermini(ref_starts, ref_ends, is_reverse, cigars, md_list, 
-                              sequencing_type, ref_length, output_dir, sample_name, ref_name):
+                              sequencing_type, ref_length, output_dir, sample_name, ref_name,
+                              step, z_thresh, deriv_thresh, max_points):
     features = ["coverage_reduced", "reads_starts", "reads_ends", "tau"]
     temporary_features = ["coverage_reduced", "start_plus", "start_minus", "end_plus", "end_minus"]
 
@@ -225,8 +239,8 @@ def get_features_phagetermini(ref_starts, ref_ends, is_reverse, cigars, md_list,
 
     # Save features
     for feature in features:
-        feature_values = compress_signal(feature_dict[feature], ref_length)
-        save_feature_values_per_contig_per_sample(feature, feature_values, output_dir, sample_name, ref_name)
+        save_features_from_module(feature, feature_dict[feature], output_dir, sample_name, ref_name, ref_length, 
+                                  step, z_thresh, deriv_thresh, max_points)
 
 ### Functions of assemblycheck module
 @njit
@@ -296,7 +310,8 @@ def compute_final_lengths(sum_lengths, count_lengths):
 @track_time
 def get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_lengths, is_read1, 
                                is_proper_pair, is_paired, is_reverse, cigars, has_md, md_list, md_lengths,
-                               sequencing_type, ref_length, output_dir, sample_name, ref_name):
+                               sequencing_type, ref_length, output_dir, sample_name, ref_name,
+                               step, z_thresh, deriv_thresh, max_points):
     features = []
     temporary_features = []
 
@@ -355,8 +370,8 @@ def get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_len
 
     # --- Save features ---
     for feature in features:
-        feature_values = compress_signal(feature_dict[feature], ref_length)
-        save_feature_values_per_contig_per_sample(feature, feature_values, output_dir, sample_name, ref_name)
+        save_features_from_module(feature, feature_dict[feature], output_dir, sample_name, ref_name, ref_length,
+                                  step, z_thresh, deriv_thresh, max_points)
 
 ### Calculating features per contig per sample
 @track_time
@@ -414,7 +429,8 @@ def preprocess_reads(reads_mapped, modules):
             cigars, has_md, md_list, md_lengths)
 
 @track_time
-def calculating_features_per_contig_per_sample(module_list, bam_file, ref, locus_size, sequencing_type, output_dir, sample_name, ref_name):
+def calculating_features_per_contig_per_sample(module_list, bam_file, ref, locus_size, sequencing_type, output_dir, sample_name, ref_name,
+                                               step, z_thresh, deriv_thresh, max_points):
     reads_mapped = bam_file.fetch(ref)
     # Save relevant info from bam file
     (ref_starts, ref_ends, query_lengths, template_lengths,
@@ -422,45 +438,51 @@ def calculating_features_per_contig_per_sample(module_list, bam_file, ref, locus
      cigars, has_md, md_list, md_lengths) = preprocess_reads(reads_mapped, module_list)
 
     # Calculate all features
-    if "coverage" in module_list:
-        get_feature_coverage(ref_starts, ref_ends, locus_size, output_dir, sample_name, ref_name)
+    if {"coverage", "assemblycheck"}.intersection(module_list):
+        get_feature_coverage(ref_starts, ref_ends, locus_size, output_dir, sample_name, ref_name, 
+                             step, z_thresh, deriv_thresh, max_points)
     if "phagetermini" in module_list:
         get_features_phagetermini(ref_starts, ref_ends, is_reverse, cigars, md_list, 
-                                  sequencing_type, locus_size, output_dir, sample_name, ref_name)
+                                  sequencing_type, locus_size, output_dir, sample_name, ref_name,
+                                  step, z_thresh, deriv_thresh, max_points)
     if "assemblycheck" in module_list:
         get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_lengths, is_read1, 
                                    is_proper_pair, is_paired, is_reverse, cigars, has_md, md_list, md_lengths,
-                                   sequencing_type, locus_size, output_dir, sample_name, ref_name)
-    
+                                   sequencing_type, locus_size, output_dir, sample_name, ref_name,
+                                   step, z_thresh, deriv_thresh, max_points)
+
 ### Distributing the calculation for all the contigs in the bam file
 @track_time
-def calculating_features_per_sample(module_list, mapping_file, sequencing_type, output_dir, sample_name):
+def calculating_features_per_sample(module_list, mapping_file, sequencing_type, output_dir, sample_name,
+                                    step, z_thresh, deriv_thresh, max_points):
     bam_file = pysam.AlignmentFile(mapping_file, "rb")
     references = bam_file.references
     lengths = [l // 2 for l in bam_file.lengths]  # need to divide by 2 because each contig was doubled for mapping to deal with circularity
 
     for ref, length in zip(references, lengths):
-        calculating_features_per_contig_per_sample(module_list, bam_file, ref, length, sequencing_type, output_dir, sample_name, ref)
+        calculating_features_per_contig_per_sample(module_list, bam_file, ref, length, sequencing_type, output_dir, sample_name, ref,
+                                                   step, z_thresh, deriv_thresh, max_points)
 
     bam_file.close()
 
 ### Distributing the calculation for all the bam files (samples)
-def _process_single_sample(list_modules, bam_file, output_dir):
+def _process_single_sample(list_modules, bam_file, output_dir, step, z_thresh, deriv_thresh, max_points):
     sample_name = os.path.basename(bam_file).replace(".bam", "")
     sequencing_type = find_sequencing_type_from_bam(bam_file)
 
     # Calculate features per contig (can still be parallelized with n_contig_cores)
-    calculating_features_per_sample(list_modules, bam_file, sequencing_type, output_dir, sample_name)
+    calculating_features_per_sample(list_modules, bam_file, sequencing_type, output_dir, sample_name,
+                                    step, z_thresh, deriv_thresh, max_points)
 
     # Temporary debugging
     print_timing_summary()
 
-def calculating_all_features_parallel(list_modules, bam_files, output_dir, n_sample_cores=None):
+def calculating_all_features_parallel(list_modules, bam_files, output_dir, step, z_thresh, deriv_thresh, max_points, n_sample_cores=None):
     if n_sample_cores is None:
         n_sample_cores = max(1, cpu_count() - 1)
     print(f"Using {n_sample_cores} cores to process {len(bam_files)} samples in parallel...", flush=True)
 
-    args_list = [(list_modules, bam, output_dir) for bam in bam_files]
+    args_list = [(list_modules, bam, output_dir, step, z_thresh, deriv_thresh, max_points) for bam in bam_files]
 
     with Pool(processes=n_sample_cores) as pool:
         pool.starmap(_process_single_sample, args_list)
@@ -475,6 +497,11 @@ def main():
     parser.add_argument("-b", "--bam_files", required=True, help="Path to bam file or directory containing mapping files (BAM format)")
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
     parser.add_argument("-o", "--output_dir", required=True, help="Output directory to store output csv files")
+    parser.add_argument("--subsample", type=int, default=100, help="Only consider a coverage depth of N to speed up calculations")
+    parser.add_argument("--step", type=int, default=50, help="Step size for compression (keep every Nth point in addition to the outliers)")
+    parser.add_argument("--outlier_threshold", type=int, default=3, help="Points beyond mean+std*N are kept as outliers")
+    parser.add_argument("--derivative_threshold", type=int, default=3, help="Points were the derivative is beyond mean+std*N are kept as outliers")
+    parser.add_argument("--max_points", type=int, default=10000, help="Maximum number of points kept during compression")
     args = parser.parse_args()
 
     # Get list of BAM files
@@ -490,11 +517,22 @@ def main():
     requested_modules = args.modules.split(",")
     output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
+
+    # TO-CONSIDER: implement subsampling
+    # No subsampling for a certain coverage depth per sample for now
+    # It would speed up calculation but coverage numbers would be less accurate
+
+    # Parameters for compression
+    step = args.step
+    z_thresh = args.outlier_threshold
+    deriv_thresh = args.derivative_threshold
+    max_points = args.max_points
+
     n_cores = int(args.threads)
 
     # Calculating values for all requested features from mapping files
     print("### Calculating values for all requested features from mapping files...", flush=True)
-    calculating_all_features_parallel(requested_modules, bam_files, output_dir, n_cores)
+    calculating_all_features_parallel(requested_modules, bam_files, output_dir, step, z_thresh, deriv_thresh, max_points, n_cores)
 
 if __name__ == "__main__":
     start_time = time.perf_counter()
