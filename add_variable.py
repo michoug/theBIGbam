@@ -45,9 +45,9 @@ try:
 
     # --- Create new variable ---
     cur.execute("""
-    INSERT INTO Variable (Variable_name, Status, Type, Color, Alpha, Size, Title, Feature_table_name)
+    INSERT INTO Variable (Variable_name, Module, Type, Color, Alpha, Size, Title, Feature_table_name)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (var_name, "external", vtype, color, float(alpha), float(size), title, feature_table))
+    """, (var_name, "External", vtype, color, float(alpha), float(size), title, feature_table))
 
     # --- Create associated feature table ---
     cur.execute(f"""

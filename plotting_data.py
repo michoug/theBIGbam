@@ -1,5 +1,7 @@
-import argparse, sys, os, csv
-from Bio import SeqIO
+import argparse, sys, os, csv, sqlite3
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
+from Bio.SeqFeature import SeqFeature, FeatureLocation
 from bokeh.models import Range1d,ColumnDataSource, HoverTool
 from bokeh.layouts import column, gridplot
 from bokeh.plotting import output_file, save, figure
@@ -10,7 +12,7 @@ import colors_for_genbank
 class CustomTranslator(BiopythonTranslator):
     def compute_feature_color(self, feature):
         if ANNOTATION_TOOL == "pharokka":
-            function = feature.qualifiers.get("function", [""])[0].lower()
+            function = feature.qualifiers.get("function", [""]).lower()
             color_scheme = colors_for_genbank.PHAROKKA_COLORS
             for key, color in color_scheme.items():
                 if key in function:
@@ -104,10 +106,9 @@ def prepare_all_subplots(data_all_features, max_visible_width, subplot_size, sha
 
     return subplots
 
-def prepare_main_plot(data_dictionary, genbank_record, locus_size, max_visible_width, subplot_size, output_name):
+def prepare_main_plot(sequence_records, locus_size, data_dictionary, max_visible_width, subplot_size, output_name):
     # --- Main gene annotation plot
-    print("Plotting gene map...", flush=True)
-    graphic_record = CustomTranslator().translate_record(genbank_record)
+    graphic_record = CustomTranslator().translate_record(sequence_records)
     # figure_width and figure_height for the arrow size
     annotation_fig = graphic_record.plot_with_bokeh(figure_width=30, figure_height=40)
     annotation_fig.width = max_visible_width
@@ -124,84 +125,122 @@ def prepare_main_plot(data_dictionary, genbank_record, locus_size, max_visible_w
     grid = gridplot([[p] for p in all_plots], merge_tools=True)
 
     # --- Save interactive HTML
+    print(output_name, flush=True)
     output_file(output_name)
     save(grid)
-    print(f"Saved interactive plot with shared toolbar to {output_name}")
 
 ### Parsing features
-def parse_requested_features(requested_modules):
+def parse_requested_features(list_features):
     features = []
-    if "coverage" in requested_modules:
-        features = ["coverage"]
-    if "assemblycheck" in requested_modules:
-        features.extend(["read_lengths", "insert_sizes", "bad_orientations", "left_clippings", "right_clippings", "insertions", "deletions", "mismatches"])
-    if "phagetermini" in requested_modules:
-        features.extend(["coverage_reduced", "reads_starts", "reads_ends", "tau"])
+    for feature in list_features:
+        if feature == "coverage":
+            features.append("coverage")
+        elif feature == "assemblycheck":
+            features.extend(["read_lengths", "insert_sizes", "bad_orientations", "left_clippings", "right_clippings", "insertions", "deletions", "mismatches"])
+        elif feature == "phagetermini":
+            features.extend(["coverage_reduced", "reads_starts", "reads_ends", "tau"])
+        else:
+            features.append(feature)
     return(features)
 
 ### Function to generate one HTML plot per locus
-def generate_html_plots(genbank_path, bam_files, input_csv_dir, requested_features, 
-                        custom_characs, output_prefix, max_visible_width, subplot_size):
-    print("Generating HTML plots per locus...", flush=True)
+def generate_html_plots(db_path, requested_features, output_prefix, max_visible_width, subplot_size):
+    # Connect to DB and gather contigs and samples
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
 
-    allowed_types = ["CDS", "tRNA/tmRNA", "rRNA", "ncRNA", "ncRNA-region", "CRISPR", "Gap", "Misc"]
-    # Parse GenBank file
-    for record in SeqIO.parse(genbank_path, "genbank"):
-        locus_name = record.id
-        locus_size = len(record.seq)
+    # Get all contigs
+    cur.execute("SELECT Contig_id, Contig_name, Contig_length FROM Contig")
+    contigs = cur.fetchall()
 
+    # Get all samples
+    cur.execute("SELECT Sample_id, Sample_name FROM Sample")
+    samples = cur.fetchall()
+
+    for contig_id, contig_name, contig_length in contigs:
+        locus_name = contig_name
+        locus_size = contig_length
         print(f"Processing locus: {locus_name} ({locus_size} bp)", flush=True)
 
-        # Filter allowed feature types
-        filtered_features_gbk = [f for f in record.features if f.type in allowed_types]
-        record.features = filtered_features_gbk
+        # Build a SeqRecord from Sequence_annotation entries for this contig
+        cur.execute("SELECT Start, End, Strand, Type, Product, Function, Phrog FROM Sequence_annotation WHERE Contig_id=?", (contig_id,))
+        seq_ann_rows = cur.fetchall()
 
-        for sample_name in bam_files:
-            # Reading data from CSV files for all requested features
-            all_features_for_one_locus_one_sample = []
+        features = []
+        for start, end, strand, ftype, product, function, phrog in seq_ann_rows:
+            # Biopython FeatureLocation is 0-based half-open
+            try:
+                floc = FeatureLocation(start - 1, end, strand=strand)
+            except Exception:
+                continue
+            qualifiers = {}
+            if product:
+                qualifiers['product'] = product
+            if function:
+                qualifiers['function'] = function
+            if phrog:
+                qualifiers['phrog'] = phrog
+            feat = SeqFeature(location=floc, type=ftype, qualifiers=qualifiers)
+            features.append(feat)
+            
+        sequence_records = SeqRecord(Seq('N' * locus_size), id=locus_name, features=features)
+
+        # For each sample, gather requested features from DB
+        for sample_id, sample_name in samples:
+            data_for_one_locus_one_sample = []
+
+            # Requested features are variables like 'coverage', 'reads_starts', etc.
             for feature in requested_features:
                 feature_dict = {}
-                feature_dict["filename"] = os.path.join(input_csv_dir, f"{feature}_values_for_{locus_name}_in_{sample_name}.csv")
-                
-                # Subplot characteristics
-                feature_dict["type"] = colors_for_genbank.FEATURE_SUBPLOTS[feature]["type"]
-                feature_dict["color"] = colors_for_genbank.FEATURE_SUBPLOTS[feature]["color"]
-                feature_dict["alpha"] = colors_for_genbank.FEATURE_SUBPLOTS[feature]["alpha"]
-                feature_dict["size"] = colors_for_genbank.FEATURE_SUBPLOTS[feature]["size"]
-                feature_dict["title"] = colors_for_genbank.FEATURE_SUBPLOTS[feature]["title"]
-                
-                # Initialize subplot values
+                # Query Variable table to get rendering info and feature table name
+                cur.execute("SELECT Type, Color, Alpha, Size, Title, Feature_table_name FROM Variable WHERE Variable_name=?", (feature,))
+                row = cur.fetchone()
+
+                type_picked, color, alpha, size, title, feature_table = row
+                feature_dict["type"] = type_picked
+                feature_dict["color"] = color
+                feature_dict["alpha"] = alpha
+                feature_dict["size"] = size
+                feature_dict["title"] = title
                 feature_dict["x"] = []
                 feature_dict["y"] = []
-                all_features_for_one_locus_one_sample.append(feature_dict)
 
-            # Add custom characs to the list
-            all_features_for_one_locus_one_sample.extend(custom_characs)
+                # Query feature table for this sample and contig
+                try:
+                    cur.execute(f"SELECT Position, Value FROM {feature_table} WHERE Sample_id=? AND Contig_id=? ORDER BY Position", (sample_id, contig_id))
+                    rows = cur.fetchall()
+                    feature_dict["x"] = [r[0] for r in rows]
+                    feature_dict["y"] = [r[1] for r in rows]
+                except Exception as e:
+                    print(f"WARNING: Could not read feature table {feature_table}: {e}", flush=True)
 
-            # For all subplots
-            for feature_dict in all_features_for_one_locus_one_sample:
-                if not os.path.exists(feature_dict["filename"]):
-                    print(f"WARNING: CSV file {feature_dict['filename']} not found")
-                else:
-                    with open(feature_dict["filename"], 'r') as csvfile:
-                        reader = csv.reader(csvfile)
-                        for row in reader:
-                            # For custom files need to keep only relevant rows
-                            if row[0] == sample_name and row[1] == locus_name:
-                                feature_dict["x"].append(int(row[2]))
-                                feature_dict["y"].append(float(row[3]))
+                data_for_one_locus_one_sample.append(feature_dict)
 
             # Generate the HTML plot
-            output_html = f"{output_prefix}_{locus_name}_in_{sample_name}.html"
+            # If output_prefix looks like a directory path (contains a separator or is an existing dir),
+            # create that directory and write the HTML files inside it. Otherwise use it as a filename prefix.
+            norm_prefix = os.path.normpath(output_prefix)
+            looks_like_dir = os.path.isdir(norm_prefix) or (os.path.sep in output_prefix) or ("/" in output_prefix) or ("\\" in output_prefix)
+            if looks_like_dir:
+                outdir = norm_prefix
+                os.makedirs(outdir, exist_ok=True)
+                # use the directory basename as a short prefix for files
+                base = os.path.basename(outdir) or "output"
+                output_html = os.path.join(outdir, f"{base}_{locus_name}_in_{sample_name}.html")
+            else:
+                output_html = f"{output_prefix}_{locus_name}_in_{sample_name}.html"
+
             prepare_main_plot(
-                all_features_for_one_locus_one_sample,
-                record,
+                sequence_records,
                 locus_size,
+                data_for_one_locus_one_sample,
                 max_visible_width,
                 subplot_size,
                 output_html,
             )
             print(f"Saved: {output_html}", flush=True)
+
+    conn.close()
 
 ### Main function
 def main():
@@ -209,52 +248,32 @@ def main():
     print("Parsing arguments...", flush=True)
     parser = argparse.ArgumentParser(description="Parse input files.")
     parser.add_argument("-t", "--threads", required=True, help="Number of threads available")
-    parser.add_argument("-g", "--genbank", required=True, help="Path to genbank file of all investigated contigs")
-    parser.add_argument("-a", "--annotation", required=True, help="Annotation tool used (options allowed 'pharokka' or 'other')")
-    parser.add_argument("-b", "--bam_files", required=True, help="Path to bam file or directory containing mapping files (BAM format)")
-    parser.add_argument("-i", "--input_dir", required=True, help="Input directory where input csv files are stored")
+    parser.add_argument("-d", "--db", required=True, help="Path to sqlite database file to store results")
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
-    parser.add_argument("-c", "--custom", required=False, help="List of custom variables to plot. Each variable should be in the format filename:type:color:title. Type can be 'curve' or 'bars'. Use comma between variables")
     parser.add_argument("-o", "--output_prefix", required=False, default="MGFeaturesViewer", help="Prefix for output files, including complete path if you want to save them in a specific folder")
-    parser.add_argument("-pw", "--plot_width", required=False, default=1800, help="Width of the plot (in pixels)")
-    parser.add_argument("-sh", "--subplot_height", required=False, default=130, help="Height of each subplot (in pixels)")
+    parser.add_argument("--color", required=False, help="Color system for the sequence annotations (options allowed 'pharokka' or 'other')")
+    parser.add_argument("--plot_width", required=False, default=1800, help="Width of the plot (in pixels)")
+    parser.add_argument("--subplot_height", required=False, default=130, help="Height of each subplot (in pixels)")
     args = parser.parse_args()
 
-    genbank_file = args.genbank
-    global ANNOTATION_TOOL
-    ANNOTATION_TOOL = args.annotation
-    
-    bam_files = args.bam_files
-    input_csv_dir = args.input_dir
-
     # Get requested features
-    requested_modules = args.modules.split(",")
-    requested_features = parse_requested_features(requested_modules)
+    list_features = args.modules.split(",")
+    requested_features = parse_requested_features(list_features)
 
-    custom_variables = args.custom
-    custom_characs = []
-    if custom_variables:
-        for custom_var in custom_variables.split(","):
-            filename, type_picked, color, title = custom_var.split(":")
-            custom_charac = {"filename": filename, "x": [], "y": []}
-            custom_charac.update(colors_for_genbank.config_feature_subplot(type_picked, color, title))
-            custom_characs.append(custom_charac)
-    
-    # Optional plotting parameters
+    # Path parameters
+    db_path = args.db
     output_prefix = args.output_prefix
+
+    # Optional plotting parameters
+    global ANNOTATION_TOOL
+    ANNOTATION_TOOL = args.color if args.color else "other"
+    print(ANNOTATION_TOOL, flush=True)
     max_visible_width = int(args.plot_width)
     subplot_size = int(args.subplot_height)
 
-    # Get list of BAM files
-    if os.path.isdir(args.bam_files):
-        bam_names = [os.path.basename(bam_file).replace(".bam", "") for bam_file in os.listdir(bam_files) if bam_file.endswith(".bam")]
-    else:
-        bam_names = [os.path.basename(bam_files).replace(".bam", "")]
-
-    # Reading values for all requested modules from mapping files
-    print("Reading csv files and plotting (one output file per locus and sample)...", flush=True)
-    generate_html_plots(genbank_file, bam_names, input_csv_dir, requested_features, 
-                        custom_characs, output_prefix, max_visible_width, subplot_size)    
+    # Reading values from database and plotting (one output file per locus and sample)
+    print("Reading database and plotting (one output file per locus and sample)...", flush=True)
+    generate_html_plots(db_path, requested_features, output_prefix, max_visible_width, subplot_size)
     
 if __name__ == "__main__":
     main()

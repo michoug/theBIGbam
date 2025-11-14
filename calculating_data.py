@@ -1,4 +1,5 @@
 import argparse, sys, os
+from Bio import SeqIO
 from multiprocessing import Pool, cpu_count
 from numba import njit
 import numpy as np
@@ -120,17 +121,11 @@ def add_sample(conn, sample_name):
     row = cur.fetchone()
     return row[0] if row else None
 
-def add_contig(conn, contig_name, contig_length):
+def get_contig_id(conn, contig_name):
     cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO Contig (Contig_name, Contig_length) VALUES (?, ?)", (contig_name, contig_length))
-    # If contig already exists, update length if different
-    cur.execute("SELECT Contig_id, Contig_length FROM Contig WHERE Contig_name=?", (contig_name,))
-    row = cur.fetchone()
-    if row and row[1] != contig_length:
-        cur.execute("UPDATE Contig SET Contig_length=? WHERE Contig_name=?", (contig_length, contig_name))
-    conn.commit()
     cur.execute("SELECT Contig_id FROM Contig WHERE Contig_name=?", (contig_name,))
-    return cur.fetchone()[0]
+    contig_id = cur.fetchone()[0]
+    return contig_id
 
 def compress_and_write_features(feature, feature_values, db_conn, sample_id, contig_id, ref_length, step, z_thresh, deriv_thresh, max_points):
     # Read variable metadata from DB instead of constants
@@ -467,7 +462,7 @@ def calculating_features_per_sample(module_list, mapping_file, db_conn, step, z_
 
     sample_id = add_sample(db_conn, sample_name)
     for ref, length in zip(references, lengths):
-        contig_id = add_contig(db_conn, ref, length)
+        contig_id = get_contig_id(db_conn, ref)
         calculating_features_per_contig_per_sample(module_list, sample_name, bam_file, sequencing_type, ref, length, 
                                                    db_conn, sample_id, contig_id, step, z_thresh, deriv_thresh, max_points)
     bam_file.close()
@@ -501,6 +496,7 @@ def main():
     print("Parsing arguments...", flush=True)
     parser = argparse.ArgumentParser(description="Parse input files.")
     parser.add_argument("-t", "--threads", required=True, help="Number of threads available")
+    parser.add_argument("-g", "--genbank", required=True, help="Path to genbank file of all investigated contigs")
     parser.add_argument("-b", "--bam_files", required=True, help="Path to bam file or directory containing mapping files (BAM format)")
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
     parser.add_argument("-d", "--db", required=True, help="Path to sqlite database file to store results")
@@ -510,6 +506,12 @@ def main():
     parser.add_argument("--max_points", type=int, default=10000, help="Maximum number of points kept during compression")
     args = parser.parse_args()
 
+    ### Checking genbank and mapping files are compatible... (sanity checks)
+    print("### Checking that genbank and mapping files are compatible...", flush=True)
+    genbank_loci = set(rec.id for rec in SeqIO.parse(args.genbank, "genbank"))
+    if not genbank_loci:
+        sys.exit("ERROR: No loci found in the provided GenBank file.")
+
     # Get list of BAM files
     if os.path.isdir(args.bam_files):
         bam_files = [os.path.join(args.bam_files, f) for f in os.listdir(args.bam_files) if f.endswith(".bam")]
@@ -518,6 +520,34 @@ def main():
     if not bam_files:
         sys.exit("ERROR: No BAM files found in the specified mapping path.")
 
+    # Check that references in BAM headers match loci in GenBank
+    # If references in BAM not in GenBank -> ERROR
+    # If loci in GenBank not in BAM -> WARNING
+    for bam_file in bam_files:
+        try:
+            with pysam.AlignmentFile(bam_file, "rb") as bam:
+                bam_refs = set(bam.references)
+        except Exception as e:
+            sys.exit(f"ERROR: Could not open BAM file '{bam_file}': {e}")
+
+        missing_in_genbank = bam_refs - genbank_loci
+        missing_in_bam = genbank_loci - bam_refs
+
+        if missing_in_genbank:
+            raise ValueError(
+                f"ERROR: References in BAM file '{os.path.basename(bam_file)}' "
+                f"not found in GenBank:\n"
+                f"{', '.join(sorted(missing_in_genbank))}"
+            )
+
+        if missing_in_bam:
+            print(
+                f"Warning: Some GenBank loci not present in BAM '{os.path.basename(bam_file)}': "
+                f"{', '.join(sorted(missing_in_bam))}"
+            )
+    print("Sanity checks passed: No BAM contained unexpected reference names.", flush=True)
+
+    ### Parsing user parameters
     # Getting list of features requested
     # If starts in feature_list replace it by starts_plus, starts_minus, ends_plus, ends_minus
     requested_modules = args.modules.split(",")
@@ -536,11 +566,65 @@ def main():
     # TO-CONSIDER: implement also multithreading on contigs within each sample
     n_cores = int(args.threads)
 
-    # Running generate_database.py to create database
+    ### Running generate_database.py to create database
     db_path = args.db
+
+    # First check if database file already exists
+    # If exists, raise error to avoid overwriting
+    if os.path.exists(db_path):
+        sys.exit(f"ERROR: Database file '{db_path}' already exists. Please provide a new path to avoid overwriting.")
     subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "generate_database.py"), db_path], check=True)
 
-    # Calculating values for all requested features from mapping files
+    ### Saving genbank info into database
+    print("### Saving genbank info into database...", flush=True)
+    # Parse the provided GenBank file and save contig entries and feature annotations
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+
+    seq_rows = []
+    contig_count = 0
+    feature_count = 0
+    for rec in SeqIO.parse(args.genbank, "genbank"):
+        # Insert contig (or ignore if exists)
+        contig_name = rec.id
+        contig_length = len(rec.seq)
+        cur.execute("INSERT OR IGNORE INTO Contig (Contig_name, Contig_length) VALUES (?, ?)", (contig_name, contig_length))
+        contig_count += 1
+
+        # Ensure length is up-to-date
+        cur.execute("SELECT Contig_id FROM Contig WHERE Contig_name=?", (contig_name,))
+        contig_id = cur.fetchone()[0]
+        contig_count += 1
+
+        # Collect feature rows to insert later in bulk
+        for f in rec.features:
+            # only annotate typical features that have a location
+            try:
+                start = int(f.location.start) + 1  # convert to 1-based
+                end = int(f.location.end)
+                strand_val = f.location.strand
+            except Exception:
+                # skip features with no simple numeric location
+                continue
+
+            ftype = f.type
+            if not(ftype in {"source", "gene"}):
+                qualifiers = f.qualifiers if hasattr(f, 'qualifiers') else {}
+                product = qualifiers.get('product', [None])[0]
+                function = qualifiers.get('function', [None])[0]
+                phrog = qualifiers.get('phrog', [None])[0]
+
+                seq_rows.append((contig_id, start, end, strand_val, ftype, product, function, phrog))
+                feature_count += 1
+
+    if seq_rows:
+        cur.executemany("INSERT INTO Sequence_annotation (Contig_id, Start, End, Strand, Type, Product, Function, Phrog) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", seq_rows)
+    conn.commit()
+    conn.close()
+
+    print(f"Saved {contig_count} contigs and {feature_count} annotations into database", flush=True)
+
+    ### Calculating values for all requested features from mapping files
     print("Calculating values for all requested features from mapping files...", flush=True)
     calculating_all_features_parallel(requested_modules, bam_files, db_path, step, z_thresh, deriv_thresh, max_points, n_cores)
 
