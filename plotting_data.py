@@ -79,35 +79,51 @@ def make_bokeh_subplot(xx, yy, width, height, x_range, type_picked, color, alpha
 
     return p
 
-### One function to rule them all
-def prepare_all_subplots(data_all_features, max_visible_width, subplot_size, shared_xrange):
-    subplots = []
-    for feature_dict in data_all_features:
-        feature_positions = feature_dict["x"]
-        feature_values = feature_dict["y"]
+### Function to generate one HTML plot per locus
+def generate_bokeh_plot(db_path, requested_features, contig_name, sample_name, max_visible_width, subplot_size):
+    # Connect to DB and gather contigs and samples
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
 
-        # Skip if nothing left
-        if len(feature_positions) == 0:
+    # Get contig characteristics
+    cur.execute("SELECT Contig_id, Contig_name, Contig_length FROM Contig WHERE Contig_name=?", (contig_name,))
+    row = cur.fetchone()
+    if row is None:
+        raise ValueError(f"Contig not found: {contig_name}")
+    contig_id, locus_name, locus_size = row
+    print(f"Locus {locus_name} validated ({locus_size} bp)", flush=True)
+
+    # Get sample characteristics
+    cur.execute("SELECT Sample_id, Sample_name FROM Sample WHERE Sample_name=?", (sample_name,))
+    row = cur.fetchone()
+    if row is None:
+        raise ValueError(f"Sample not found: {sample_name}")
+    sample_id, sample_name = row
+    print(f"Sample {sample_name} validated.", flush=True)
+
+    # --- Main gene annotation plot ---
+    # Build a SeqRecord from Sequence_annotation entries for this contig
+    cur.execute("SELECT Start, End, Strand, Type, Product, Function, Phrog FROM Sequence_annotation WHERE Contig_id=?", (contig_id,))
+    seq_ann_rows = cur.fetchall()
+
+    sequence_annotations = []
+    for start, end, strand, ftype, product, function, phrog in seq_ann_rows:
+        # Biopython FeatureLocation is 0-based half-open
+        try:
+            floc = FeatureLocation(start - 1, end, strand=strand)
+        except Exception:
             continue
+        qualifiers = {}
+        if product:
+            qualifiers['product'] = product
+        if function:
+            qualifiers['function'] = function
+        if phrog:
+            qualifiers['phrog'] = phrog
+        feat = SeqFeature(location=floc, type=ftype, qualifiers=qualifiers)
+        sequence_annotations.append(feat)
         
-        # Get subplot characteristics
-        type_picked = feature_dict["type"]
-        color = feature_dict["color"]
-        alpha = feature_dict["alpha"]
-        size = feature_dict["size"]
-        title = feature_dict["title"]
-
-        # Create subplot
-        subplot_feature = make_bokeh_subplot(feature_positions, feature_values, 
-                                             max_visible_width, subplot_size, shared_xrange,
-                                             type_picked, color, alpha, size, title)
-        if subplot_feature is not None:
-            subplots.append(subplot_feature)
-
-    return subplots
-
-def prepare_main_plot(sequence_records, locus_size, data_dictionary, max_visible_width, subplot_size, output_name):
-    # --- Main gene annotation plot
+    sequence_records = SeqRecord(Seq('N' * locus_size), id=locus_name, features=sequence_annotations)
     graphic_record = CustomTranslator().translate_record(sequence_records)
     # figure_width and figure_height for the arrow size
     annotation_fig = graphic_record.plot_with_bokeh(figure_width=30, figure_height=40)
@@ -117,16 +133,68 @@ def prepare_main_plot(sequence_records, locus_size, data_dictionary, max_visible
     shared_xrange = Range1d(0, locus_size)
     annotation_fig.x_range = shared_xrange
 
-    # --- Prepare subplots
-    subplots = prepare_all_subplots(data_dictionary, max_visible_width,subplot_size, shared_xrange)
+    # --- Add one subplot per feature requested ---
+    # Requested features are variables like 'coverage', 'reads_starts', etc.
+    subplots = []
+    for feature in requested_features:
+        feature_dict = {}
+        # Query Variable table to get rendering info and feature table name
+        cur.execute("SELECT Type, Color, Alpha, Size, Title, Feature_table_name FROM Variable WHERE Variable_name=?", (feature,))
+        row = cur.fetchone()
 
-    # --- Combine all figures in a single grid with one shared toolbar
+        type_picked, color, alpha, size, title, feature_table = row
+        feature_dict["type"] = type_picked
+        feature_dict["color"] = color
+        feature_dict["alpha"] = alpha
+        feature_dict["size"] = size
+        feature_dict["title"] = title
+        feature_dict["x"] = []
+        feature_dict["y"] = []
+
+        # Query feature table for this sample and contig
+        try:
+            cur.execute(f"SELECT Position, Value FROM {feature_table} WHERE Sample_id=? AND Contig_id=? ORDER BY Position", (sample_id, contig_id))
+            rows = cur.fetchall()
+            feature_dict["x"] = [r[0] for r in rows]
+            feature_dict["y"] = [r[1] for r in rows]
+        except Exception as e:
+            print(f"WARNING: Could not read feature table {feature_table}: {e}", flush=True)
+
+        # --- Prepare subplots
+        if len(feature_dict["x"]) == 0:
+            continue
+
+        subplot_feature = make_bokeh_subplot(feature_dict["x"], feature_dict["y"], 
+                                             max_visible_width, subplot_size, shared_xrange,
+                                             type_picked, color, alpha, size, title)
+        if subplot_feature is not None:
+            subplots.append(subplot_feature)
+
+    conn.close()
+
+    # --- Combine all figures in a single grid with one shared toolbar ---
     all_plots = [annotation_fig] + subplots
     grid = gridplot([[p] for p in all_plots], merge_tools=True)
 
-    # --- Save interactive HTML
-    print(output_name, flush=True)
-    output_file(output_name)
+    return grid
+
+def save_html_plot(db_path, requested_features, contig_name, sample_name, output_prefix, max_visible_width, subplot_size): 
+    # --- Save interactive HTML plot ---
+    # If output_prefix looks like a directory path (contains a separator or is an existing dir),
+    # create that directory and write the HTML files inside it. Otherwise use it as a filename prefix.
+    norm_prefix = os.path.normpath(output_prefix)
+    looks_like_dir = os.path.isdir(norm_prefix) or (os.path.sep in output_prefix) or ("/" in output_prefix) or ("\\" in output_prefix)
+    if looks_like_dir:
+        outdir = norm_prefix
+        os.makedirs(outdir, exist_ok=True)
+        # use the directory basename as a short prefix for files
+        base = os.path.basename(outdir) or "output"
+        output_html = os.path.join(outdir, f"{base}_{contig_name}_in_{sample_name}.html")
+    else:
+        output_html = f"{output_prefix}_{contig_name}_in_{sample_name}.html"
+
+    output_file(output_html)
+    grid = generate_bokeh_plot(db_path, requested_features, contig_name, sample_name, max_visible_width, subplot_size)
     save(grid)
 
 ### Parsing features
@@ -143,105 +211,6 @@ def parse_requested_features(list_features):
             features.append(feature)
     return(features)
 
-### Function to generate one HTML plot per locus
-def generate_html_plots(db_path, requested_features, output_prefix, max_visible_width, subplot_size):
-    # Connect to DB and gather contigs and samples
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-
-    # Get all contigs
-    cur.execute("SELECT Contig_id, Contig_name, Contig_length FROM Contig")
-    contigs = cur.fetchall()
-
-    # Get all samples
-    cur.execute("SELECT Sample_id, Sample_name FROM Sample")
-    samples = cur.fetchall()
-
-    for contig_id, contig_name, contig_length in contigs:
-        locus_name = contig_name
-        locus_size = contig_length
-        print(f"Processing locus: {locus_name} ({locus_size} bp)", flush=True)
-
-        # Build a SeqRecord from Sequence_annotation entries for this contig
-        cur.execute("SELECT Start, End, Strand, Type, Product, Function, Phrog FROM Sequence_annotation WHERE Contig_id=?", (contig_id,))
-        seq_ann_rows = cur.fetchall()
-
-        features = []
-        for start, end, strand, ftype, product, function, phrog in seq_ann_rows:
-            # Biopython FeatureLocation is 0-based half-open
-            try:
-                floc = FeatureLocation(start - 1, end, strand=strand)
-            except Exception:
-                continue
-            qualifiers = {}
-            if product:
-                qualifiers['product'] = product
-            if function:
-                qualifiers['function'] = function
-            if phrog:
-                qualifiers['phrog'] = phrog
-            feat = SeqFeature(location=floc, type=ftype, qualifiers=qualifiers)
-            features.append(feat)
-            
-        sequence_records = SeqRecord(Seq('N' * locus_size), id=locus_name, features=features)
-
-        # For each sample, gather requested features from DB
-        for sample_id, sample_name in samples:
-            data_for_one_locus_one_sample = []
-
-            # Requested features are variables like 'coverage', 'reads_starts', etc.
-            for feature in requested_features:
-                feature_dict = {}
-                # Query Variable table to get rendering info and feature table name
-                cur.execute("SELECT Type, Color, Alpha, Size, Title, Feature_table_name FROM Variable WHERE Variable_name=?", (feature,))
-                row = cur.fetchone()
-
-                type_picked, color, alpha, size, title, feature_table = row
-                feature_dict["type"] = type_picked
-                feature_dict["color"] = color
-                feature_dict["alpha"] = alpha
-                feature_dict["size"] = size
-                feature_dict["title"] = title
-                feature_dict["x"] = []
-                feature_dict["y"] = []
-
-                # Query feature table for this sample and contig
-                try:
-                    cur.execute(f"SELECT Position, Value FROM {feature_table} WHERE Sample_id=? AND Contig_id=? ORDER BY Position", (sample_id, contig_id))
-                    rows = cur.fetchall()
-                    feature_dict["x"] = [r[0] for r in rows]
-                    feature_dict["y"] = [r[1] for r in rows]
-                except Exception as e:
-                    print(f"WARNING: Could not read feature table {feature_table}: {e}", flush=True)
-
-                data_for_one_locus_one_sample.append(feature_dict)
-
-            # Generate the HTML plot
-            # If output_prefix looks like a directory path (contains a separator or is an existing dir),
-            # create that directory and write the HTML files inside it. Otherwise use it as a filename prefix.
-            norm_prefix = os.path.normpath(output_prefix)
-            looks_like_dir = os.path.isdir(norm_prefix) or (os.path.sep in output_prefix) or ("/" in output_prefix) or ("\\" in output_prefix)
-            if looks_like_dir:
-                outdir = norm_prefix
-                os.makedirs(outdir, exist_ok=True)
-                # use the directory basename as a short prefix for files
-                base = os.path.basename(outdir) or "output"
-                output_html = os.path.join(outdir, f"{base}_{locus_name}_in_{sample_name}.html")
-            else:
-                output_html = f"{output_prefix}_{locus_name}_in_{sample_name}.html"
-
-            prepare_main_plot(
-                sequence_records,
-                locus_size,
-                data_for_one_locus_one_sample,
-                max_visible_width,
-                subplot_size,
-                output_html,
-            )
-            print(f"Saved: {output_html}", flush=True)
-
-    conn.close()
-
 ### Main function
 def main():
     # Parse command line arguments
@@ -250,6 +219,8 @@ def main():
     parser.add_argument("-t", "--threads", required=True, help="Number of threads available")
     parser.add_argument("-d", "--db", required=True, help="Path to sqlite database file to store results")
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
+    parser.add_argument("--contig", required=True, help="Name of the contig to plot")
+    parser.add_argument("--sample", required=True, help="Name of the sample to plot")
     parser.add_argument("-o", "--output_prefix", required=False, default="MGFeaturesViewer", help="Prefix for output files, including complete path if you want to save them in a specific folder")
     parser.add_argument("--color", required=False, help="Color system for the sequence annotations (options allowed 'pharokka' or 'other')")
     parser.add_argument("--plot_width", required=False, default=1800, help="Width of the plot (in pixels)")
@@ -262,6 +233,8 @@ def main():
 
     # Path parameters
     db_path = args.db
+    contig_name = args.contig
+    sample_name = args.sample
     output_prefix = args.output_prefix
 
     # Optional plotting parameters
@@ -273,7 +246,7 @@ def main():
 
     # Reading values from database and plotting (one output file per locus and sample)
     print("Reading database and plotting (one output file per locus and sample)...", flush=True)
-    generate_html_plots(db_path, requested_features, output_prefix, max_visible_width, subplot_size)
+    save_html_plot(db_path, requested_features, contig_name, sample_name, output_prefix, max_visible_width, subplot_size)
     
 if __name__ == "__main__":
     main()
