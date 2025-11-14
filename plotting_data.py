@@ -11,12 +11,12 @@ import colors_for_genbank
 ### Custom translator for coloring and labeling features (with DNAFeaturesViewer python library)
 class CustomTranslator(BiopythonTranslator):
     def compute_feature_color(self, feature):
-        if ANNOTATION_TOOL == "pharokka":
-            function = feature.qualifiers.get("function", [""]).lower()
-            color_scheme = colors_for_genbank.PHAROKKA_COLORS
-            for key, color in color_scheme.items():
-                if key in function:
-                    return color
+        #if ANNOTATION_TOOL == "pharokka":
+        #    function = feature.qualifiers.get("function", [""]).lower()
+        #    color_scheme = colors_for_genbank.PHAROKKA_COLORS
+        #    for key, color in color_scheme.items():
+        #        if key in function:
+        #            return color
         return "#AAAAAA"
 
     def compute_feature_label(self, feature):
@@ -227,22 +227,9 @@ def generate_bokeh_plot(db_path, requested_features, contig_name, sample_name, m
 
     return grid
 
-def save_html_plot(db_path, requested_features, contig_name, sample_name, output_prefix, max_visible_width, subplot_size): 
+def save_html_plot(db_path, requested_features, contig_name, sample_name, max_visible_width, subplot_size, output_filename):
     # --- Save interactive HTML plot ---
-    # If output_prefix looks like a directory path (contains a separator or is an existing dir),
-    # create that directory and write the HTML files inside it. Otherwise use it as a filename prefix.
-    norm_prefix = os.path.normpath(output_prefix)
-    looks_like_dir = os.path.isdir(norm_prefix) or (os.path.sep in output_prefix) or ("/" in output_prefix) or ("\\" in output_prefix)
-    if looks_like_dir:
-        outdir = norm_prefix
-        os.makedirs(outdir, exist_ok=True)
-        # use the directory basename as a short prefix for files
-        base = os.path.basename(outdir) or "output"
-        output_html = os.path.join(outdir, f"{base}_{contig_name}_in_{sample_name}.html")
-    else:
-        output_html = f"{output_prefix}_{contig_name}_in_{sample_name}.html"
-
-    output_file(output_html)
+    output_file(filename = output_filename)
     grid = generate_bokeh_plot(db_path, requested_features, contig_name, sample_name, max_visible_width, subplot_size)
     save(grid)
 
@@ -270,7 +257,7 @@ def main():
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
     parser.add_argument("--contig", required=True, help="Name of the contig to plot")
     parser.add_argument("--sample", required=True, help="Name of the sample to plot")
-    parser.add_argument("-o", "--output_prefix", required=False, default="MGFeaturesViewer", help="Prefix for output files, including complete path if you want to save them in a specific folder")
+    parser.add_argument("--html", required=True, default="MGFeaturesViewer.html", help="Name for output html files. A bokeh server will be started if not provided")
     parser.add_argument("--color", required=False, help="Color system for the sequence annotations (options allowed 'pharokka' or 'other')")
     parser.add_argument("--plot_width", required=False, default=1800, help="Width of the plot (in pixels)")
     parser.add_argument("--subplot_height", required=False, default=130, help="Height of each subplot (in pixels)")
@@ -284,7 +271,7 @@ def main():
     db_path = args.db
     contig_name = args.contig
     sample_name = args.sample
-    output_prefix = args.output_prefix
+    output_filename = args.html
 
     # Optional plotting parameters
     global ANNOTATION_TOOL
@@ -292,9 +279,9 @@ def main():
     max_visible_width = int(args.plot_width)
     subplot_size = int(args.subplot_height)
 
-    # Reading values from database and plotting (one output file per locus and sample)
-    print("Reading database and plotting (one output file per locus and sample)...", flush=True)
-    save_html_plot(db_path, requested_features, contig_name, sample_name, output_prefix, max_visible_width, subplot_size)
+    # Reading values from database and plotting
+    print(f"Saving static HTML to {output_filename}...", flush=True)
+    save_html_plot(db_path, requested_features, contig_name, sample_name, max_visible_width, subplot_size, output_filename)
     
 if __name__ == "__main__":
     main()
