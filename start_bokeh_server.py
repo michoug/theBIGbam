@@ -1,9 +1,10 @@
 import argparse
+import os
 import sqlite3
 import traceback
 
 from bokeh.layouts import column, row
-from bokeh.models import Div
+from bokeh.models import Div, InlineStyleSheet
 from bokeh.models.widgets import Select, CheckboxGroup, CheckboxButtonGroup, Button
 
 # Import the plotting function from the repo
@@ -41,7 +42,7 @@ def build_controls(conn):
             module_widgets.append(None)
 
         # use CheckboxButtonGroup for selecting individual variables
-        vars_buttons = CheckboxButtonGroup(labels=variables_checkbox, active=[])
+        vars_buttons = CheckboxButtonGroup(labels=variables_checkbox, active=[], orientation='vertical', width=350, width_policy = "fixed", max_width = 350)
         variables_widgets.append(vars_buttons)
 
     apply_button = Button(label="Apply", button_type="primary")
@@ -55,9 +56,15 @@ def build_controls(conn):
     }
     return widgets
 
-def modify_doc_factory(db_path, max_visible_width=1800, subplot_size=130):
+def modify_doc_factory(db_path):
     """Return a modify_doc(doc) function to be used by Bokeh server application."""
-    instructions = Div(text="<b>Select elements to plot then click Apply:</b>")
+    # Load the CSS
+    css_path = os.path.join(os.path.dirname(__file__), "static", "bokeh_styles.css")
+    with open(css_path) as f:
+        css_text = f.read()
+    stylesheet = InlineStyleSheet(css=css_text)
+
+    instructions = Div(text="<b>Select elements to plot and click Apply:</b>")
 
     conn = sqlite3.connect(db_path)
     widgets = build_controls(conn)
@@ -74,10 +81,14 @@ def modify_doc_factory(db_path, max_visible_width=1800, subplot_size=130):
         controls_children.append(var_widget)
 
     controls_children.append(widgets['apply_button'])
-    controls_column = column(*controls_children, width=350)
+    controls_column = column(*controls_children, width=350, sizing_mode="stretch_height")
+    controls_column.css_classes = ["left-col"]
 
-    main_placeholder = column(Div(text="<i>No plot yet. Select options and click Apply.</i>"))
-    layout = row(controls_column, main_placeholder)
+    main_placeholder = column(Div(text="<i>No plot yet. Select options and click Apply.</i>"), sizing_mode="stretch_both")
+
+    # Wrap everything in a Flex container
+    layout = row(controls_column, main_placeholder, sizing_mode="stretch_both")
+    layout.stylesheets = [stylesheet]
 
     ### Attach callbacks
     def make_module_callback(i, mc, vb):
@@ -128,7 +139,7 @@ def modify_doc_factory(db_path, max_visible_width=1800, subplot_size=130):
 
             # Call plotting_data.generate_bokeh_plot to build the grid
             print(f"[start_bokeh_server] Generating plot for sample={sample}, contig={contig}, features={requested_features}")
-            grid = generate_bokeh_plot(db_path, requested_features, contig, sample, max_visible_width, subplot_size)
+            grid = generate_bokeh_plot(db_path, requested_features, contig, sample)
 
             # Replace main panel
             main_placeholder.children = [grid]

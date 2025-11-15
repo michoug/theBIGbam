@@ -27,9 +27,8 @@ class CustomTranslator(BiopythonTranslator):
         return feature.qualifiers.get("product", [])
     
 ### Plotting functions
-def make_bokeh_subplot(feature_dict, width, height, x_range):
+def make_bokeh_subplot(feature_dict, height, x_range):
     p = figure(
-        width=width,
         height=height,
         x_range=x_range,
         tools="xpan,xwheel_zoom,reset,save"
@@ -135,7 +134,7 @@ def get_feature_data(cur, feature, contig_id, sample_id):
     return feature_dict
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot(db_path, list_features, contig_name, sample_name, max_visible_width, subplot_size):
+def generate_bokeh_plot(db_path, list_features, contig_name, sample_name, subplot_size=130):
     # Connect to DB and gather contigs and samples
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -183,7 +182,6 @@ def generate_bokeh_plot(db_path, list_features, contig_name, sample_name, max_vi
     graphic_record = CustomTranslator().translate_record(sequence_records)
     # figure_width and figure_height for the arrow size
     annotation_fig = graphic_record.plot_with_bokeh(figure_width=30, figure_height=40)
-    annotation_fig.width = max_visible_width
     annotation_fig.height = subplot_size
 
     shared_xrange = Range1d(0, locus_size)
@@ -213,7 +211,7 @@ def generate_bokeh_plot(db_path, list_features, contig_name, sample_name, max_vi
             
         if all(len(vals["x"]) == 0 for vals in feature_dict.values()):
             continue
-        subplot_feature = make_bokeh_subplot(feature_dict, max_visible_width, subplot_size, shared_xrange)
+        subplot_feature = make_bokeh_subplot(feature_dict, subplot_size, shared_xrange)
         if subplot_feature is not None:
             subplots.append(subplot_feature)
 
@@ -221,14 +219,14 @@ def generate_bokeh_plot(db_path, list_features, contig_name, sample_name, max_vi
 
     # --- Combine all figures in a single grid with one shared toolbar ---
     all_plots = [annotation_fig] + subplots
-    grid = gridplot([[p] for p in all_plots], merge_tools=True)
+    grid = gridplot([[p] for p in all_plots], merge_tools=True, sizing_mode='stretch_width')
 
     return grid
 
-def save_html_plot(db_path, list_features, contig_name, sample_name, max_visible_width, subplot_size, output_filename):
+def save_html_plot(db_path, list_features, contig_name, sample_name, subplot_size, output_filename):
     # --- Save interactive HTML plot ---
     output_file(filename = output_filename)
-    grid = generate_bokeh_plot(db_path, list_features, contig_name, sample_name, max_visible_width, subplot_size)
+    grid = generate_bokeh_plot(db_path, list_features, contig_name, sample_name, subplot_size)
     save(grid)
 
 ### Parsing features
@@ -310,7 +308,6 @@ def main():
     parser.add_argument("--sample", required=True, help="Name of the sample to plot")
     parser.add_argument("--html", required=True, default="MGFeaturesViewer.html", help="Name for output html files. A bokeh server will be started if not provided")
     parser.add_argument("--color", required=False, help="Color system for the sequence annotations (options allowed 'pharokka' or 'other')")
-    parser.add_argument("--plot_width", required=False, default=1800, help="Width of the plot (in pixels)")
     parser.add_argument("--subplot_height", required=False, default=130, help="Height of each subplot (in pixels)")
     args = parser.parse_args()
 
@@ -324,12 +321,11 @@ def main():
     # Optional plotting parameters
     global ANNOTATION_TOOL
     ANNOTATION_TOOL = args.color if args.color else "other"
-    max_visible_width = int(args.plot_width)
     subplot_size = int(args.subplot_height)
 
     # Reading values from database and plotting
     print(f"Saving static HTML to {output_filename}...", flush=True)
-    save_html_plot(db_path, list_features, contig_name, sample_name, max_visible_width, subplot_size, output_filename)
+    save_html_plot(db_path, list_features, contig_name, sample_name, subplot_size, output_filename)
     
 if __name__ == "__main__":
     main()
