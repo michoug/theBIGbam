@@ -4,8 +4,8 @@ import sqlite3
 import traceback
 
 from bokeh.layouts import column, row
-from bokeh.models import Div, InlineStyleSheet, Tooltip, Toggle
-from bokeh.models.widgets import Select, CheckboxGroup, HelpButton, Button, RadioButtonGroup
+from bokeh.models import Div, InlineStyleSheet, Tooltip
+from bokeh.models.widgets import Select, CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup
 
 # Import the plotting function from the repo
 from plotting_data import generate_bokeh_plot
@@ -32,7 +32,9 @@ def build_controls(conn):
     module_widgets = []
     variables_widgets = []
     helps_widgets = []
+    module_names = []
     for module in modules:
+        module_names.append(module)
         cur.execute("SELECT DISTINCT Subplot, Help FROM Variable WHERE Module=?", (module,))
         records = cur.fetchall()
         variables_checkbox = [r[0] for r in records]
@@ -44,36 +46,27 @@ def build_controls(conn):
         else:
             module_widgets.append(None)
 
-        # use CheckboxButtonGroup for selecting individual variables
-        checkboxes = []
-        helps = []
-        for label, help_text in zip(variables_checkbox, helps_checkbox):
-            checkbox = Toggle(label=label, active=False, sizing_mode="stretch_width", height=30)
-            checkboxes.append(checkbox)
+        # Consolidate help texts for the module into a single HelpButton attached to module title
+        combined_help = "\n".join([f"{lbl}: {ht}" for lbl, ht in zip(variables_checkbox, helps_checkbox) if ht and ht.strip() != ""])
+        if combined_help:
+            tooltip = Tooltip(content=combined_help, position="right")
+            help_button = HelpButton(tooltip=tooltip, width=26, height=26, align="center")
+            help_button.css_classes = ["help-btn-tight"]
+        else:
+            help_button = None
+        helps_widgets.append(help_button)
 
-            if help_text != "":
-                tooltip = Tooltip(
-                    content=f"{help_text}",
-                    position="right"
-                )
-                help_button = HelpButton(tooltip=tooltip, width=30, height=30)
-                helps.append(help_button)
-            else:
-                helps.append(None)
-
-        # Combine into a column
-        variables_widgets.append(checkboxes)
-        helps_widgets.append(helps)
-
-    apply_button = Button(label="Apply", button_type="primary", align="center")
+        # use a CheckboxButtonGroup for selecting individual variables in this module
+        cbg = CheckboxButtonGroup(labels=variables_checkbox, active=[], sizing_mode="stretch_width", orientation="vertical")
+        variables_widgets.append(cbg)
 
     widgets = {
         'sample_select': sample_select,
         'contig_select': contig_select,
+        'module_names': module_names,
         'module_widgets': module_widgets,
-        'variables_widgets': variables_widgets,
         'helps_widgets': helps_widgets,
-        'apply_button': apply_button
+        'variables_widgets': variables_widgets
     }
     return widgets
 
@@ -93,31 +86,197 @@ def modify_doc_factory(db_path):
     conn = sqlite3.connect(db_path)
     widgets = build_controls(conn)
 
+    # Header placeholders (populated below) so view-change callback can toggle them
+    header_with_checkbox = []
+    header_with_title = []
+
+    # Build presence mappings: sample -> contigs and contig -> samples
+    presence_cur = conn.cursor()
+    presence_cur.execute("""
+    SELECT Contig.Contig_name, Sample.Sample_name FROM Presences
+      JOIN Contig ON Presences.Contig_id = Contig.Contig_id
+      JOIN Sample ON Presences.Sample_id = Sample.Sample_id
+    """)
+    sample_to_contigs = {}
+    contig_to_samples = {}
+    for contig_name, sample_name in presence_cur.fetchall():
+        sample_to_contigs.setdefault(sample_name, set()).add(contig_name)
+        contig_to_samples.setdefault(contig_name, set()).add(sample_name)
+
+    # Keep original full lists so we can restore when filters are off
+    orig_contigs = list(widgets['contig_select'].options)
+    orig_samples = list(widgets['sample_select'].options)
+
     contigs_title = Div(text="<b>Contig</b>")
     filter_contigs = CheckboxGroup(labels=["Only show contigs present with selected sample"], active=[])
 
     samples_title = Div(text="<b>Sample</b>")
     filter_samples = CheckboxGroup(labels=["Only show samples present with selected contig"], active=[])
 
+    # Helper functions to refresh options based on filters
+    def refresh_contig_options():
+        if 0 in filter_contigs.active and views.active == 0:
+            sel_sample = widgets['sample_select'].value
+            allowed = sample_to_contigs.get(sel_sample, set())
+            options = [c for c in orig_contigs if c in allowed]
+        else:
+            options = list(orig_contigs)
+
+        widgets['contig_select'].options = options
+        if widgets['contig_select'].value not in options:
+            widgets['contig_select'].value = options[0] if options else ""
+
+    def refresh_sample_options():
+        if 0 in filter_samples.active and views.active == 0:
+            sel_contig = widgets['contig_select'].value
+            allowed = contig_to_samples.get(sel_contig, set())
+            options = [s for s in orig_samples if s in allowed]
+        else:
+            options = list(orig_samples)
+
+        widgets['sample_select'].options = options
+        if widgets['sample_select'].value not in options:
+            widgets['sample_select'].value = options[0] if options else ""
+
+    # Global lock for toggles when enforcing single-variable mode
+    global_toggle_lock = {'locked': False}
+
+    # Enforce single-variable selection when in "All samples" view
+    def make_global_variable_callback(cbg):
+        def callback(attr, old, new):
+            if global_toggle_lock['locked']:
+                return
+            # Only enforce in All samples mode and when some index was selected
+            if views.active == 1 and new:
+                # pick the last selected index
+                sel_index = new[-1]
+                global_toggle_lock['locked'] = True
+                for other in widgets['variables_widgets']:
+                    if other is cbg:
+                        # ensure current cbg only has sel_index
+                        other.active = [sel_index]
+                    else:
+                        other.active = []
+                global_toggle_lock['locked'] = False
+        return callback
+
+    # Attach global variable callbacks to all CheckboxButtonGroups
+    for cbg in widgets['variables_widgets']:
+        cbg.on_change('active', make_global_variable_callback(cbg))
+
+    # Views (One sample / All samples) callback: show/hide sample-related controls
+    def on_view_change(attr, old, new):
+        # new == 1 means All samples
+        is_all = (new == 1)
+        widgets['sample_select'].visible = not is_all
+        samples_title.visible = not is_all
+        # hide/deactivate presence filters when All samples
+        if is_all:
+            # deactivate and hide the "only show contigs present with selected sample" checkbox
+            filter_contigs.active = []
+            filter_contigs.visible = False
+            # hide sample filter as well
+            filter_samples.active = []
+            filter_samples.visible = False
+            # hide module checkboxes but keep module titles
+            for mw in widgets['module_widgets']:
+                if mw is not None:
+                    mw.visible = False
+                    mw.active = []
+            # Clear all variable toggles when switching to All-samples view
+            for cbg in widgets['variables_widgets']:
+                cbg.active = []
+        else:
+            filter_contigs.visible = True
+            filter_samples.visible = True
+            # show module checkboxes again
+            for mw in widgets['module_widgets']:
+                if mw is not None:
+                    mw.visible = True
+                    mw.active = mw.active
+        # When switching mode, refresh options to ensure consistency
+        # Toggle header visibility: show checkbox-header in One-sample, title-header in All-samples
+        for i, mw in enumerate(widgets['module_widgets']):
+            hdr_cb = header_with_checkbox[i] if i < len(header_with_checkbox) else None
+            hdr_title = header_with_title[i] if i < len(header_with_title) else None
+            if mw is None:
+                # single-variable module: ensure title header visible
+                if hdr_cb is not None:
+                    hdr_cb.visible = False
+                if hdr_title is not None:
+                    hdr_title.visible = True
+            else:
+                # module with checkbox: toggle which header is visible
+                if is_all:
+                    if hdr_cb is not None:
+                        hdr_cb.visible = False
+                    if hdr_title is not None:
+                        hdr_title.visible = True
+                else:
+                    if hdr_cb is not None:
+                        hdr_cb.visible = True
+                    if hdr_title is not None:
+                        hdr_title.visible = False
+        # When switching mode, refresh options to ensure consistency
+        refresh_contig_options()
+        refresh_sample_options()
+
+    views.on_change('active', on_view_change)
+
+    # Wire up select/filter interactions
+    widgets['sample_select'].on_change('value', lambda attr, old, new: refresh_contig_options())
+    widgets['contig_select'].on_change('value', lambda attr, old, new: refresh_sample_options())
+    filter_contigs.on_change('active', lambda attr, old, new: refresh_contig_options())
+    filter_samples.on_change('active', lambda attr, old, new: refresh_sample_options())
+
     variables_title = Div(text="<b>Variables</b>")
     controls_children = [instructions, views_title, views, contigs_title, widgets['contig_select'], filter_contigs, samples_title, widgets['sample_select'], filter_samples, variables_title]
     
-    # Append variable selectors
+    # Append variable selectors. For modules that have a module-checkbox widget we
+    # show either the checkbox (One-sample) or the plain module title (All-samples).
+    header_with_checkbox = []
+    header_with_title = []
     for i, module_widget in enumerate(widgets['module_widgets']):
+        module_name = widgets['module_names'][i]
+        module_title_div = Div(text=f"{module_name}")
+
+        help_btn = widgets['helps_widgets'][i]
+
+        # Build two header variants: one with the checkbox (shows module name as label)
+        # and one with the plain title (used when checkbox is hidden). Both may include the help button.
         if module_widget is not None:
-            controls_children.append(module_widget)
-
-        # Get the variable widget block (no layout inside)
-        checkboxes = widgets['variables_widgets'][i]
-        helps = widgets['helps_widgets'][i]
-
-        for cb, hb in zip(checkboxes, helps):
-            if hb is not None:
-                controls_children.append(row(cb, hb, sizing_mode="stretch_width"))
+            if help_btn is not None:
+                hdr_cb = row(module_widget, help_btn, sizing_mode="stretch_width")
+                hdr_title = row(module_title_div, help_btn, sizing_mode="stretch_width")
             else:
-                controls_children.append(cb)
+                hdr_cb = module_widget
+                hdr_title = module_title_div
 
-    controls_children.append(widgets['apply_button'])
+            # Default: show the checkbox header, hide the plain title header
+            hdr_cb.visible = True
+            hdr_title.visible = False
+            controls_children.append(hdr_cb)
+            controls_children.append(hdr_title)
+        else:
+            # No module checkbox exists: show plain title (with help if available)
+            if help_btn is not None:
+                hdr = row(module_title_div, help_btn, sizing_mode="stretch_width"
+                          )
+            else:
+                hdr = module_title_div
+            hdr.visible = True
+            controls_children.append(hdr)
+
+        header_with_checkbox.append(hdr_cb if module_widget is not None else None)
+        header_with_title.append(hdr_title if module_widget is not None else hdr)
+
+        # Add the module's CheckboxButtonGroup for variables
+        cbg = widgets['variables_widgets'][i]
+        controls_children.append(cbg)
+
+    apply_button = Button(label="Apply", button_type="primary", align="center")
+    controls_children.append(apply_button)
+
     controls_column = column(*controls_children, width=350, sizing_mode="stretch_height", spacing=0)
     controls_column.css_classes = ["left-col"]
 
@@ -135,16 +294,17 @@ def modify_doc_factory(db_path):
         toggles = widgets['variables_widgets'][i]
         lock = {"locked": False}  # per-module lock
 
-        # Module → toggles
+        # Module → toggles (CheckboxButtonGroup)
         def make_module_callback(mc, toggles, lock):
             def callback(attr, old, new):
-                # Only act if this change comes from user
                 if lock.get("locked", False):
                     return
                 lock["locked"] = True
                 module_on = 0 in mc.active
-                for t in toggles:
-                    t.active = module_on
+                if module_on:
+                    toggles.active = list(range(len(toggles.labels)))
+                else:
+                    toggles.active = []
                 lock["locked"] = False
             return callback
 
@@ -155,20 +315,18 @@ def modify_doc_factory(db_path):
             def callback(attr, old, new):
                 if lock.get("locked", False):
                     return
-                # Count toggles that are ON
-                total = len(toggles)
-                active_count = sum(1 for t in toggles if t.active)
+                total = len(toggles.labels)
+                active_count = len(toggles.active)
 
                 lock["locked"] = True
-                if active_count == total:
-                    mc.active = [0]  # all selected → module ON
+                if active_count == total and total > 0:
+                    mc.active = [0]
                 else:
-                    mc.active = []   # not all selected → module OFF
+                    mc.active = []
                 lock["locked"] = False
             return callback
 
-        for t in toggles:
-            t.on_change("active", make_variable_callback(mc, toggles, lock))
+        toggles.on_change("active", make_variable_callback(mc, toggles, lock))
 
     def apply_clicked():
         try:
@@ -177,10 +335,10 @@ def modify_doc_factory(db_path):
 
             # Build requested_features list
             requested_features = []
-            for cb_list in widgets['variables_widgets']:
-                for cb in cb_list:
-                    if cb.active:  # means checkbox is checked
-                        requested_features.append(cb.label)
+            for cbg in widgets['variables_widgets']:
+                # cbg.active is a list of indices
+                for idx in cbg.active:
+                    requested_features.append(cbg.labels[idx])
 
             print(f"[start_bokeh_server] Generating plot for sample={sample}, contig={contig}, features={requested_features}")
             grid = generate_bokeh_plot(conn, requested_features, contig, sample)
@@ -191,7 +349,7 @@ def modify_doc_factory(db_path):
             tb = traceback.format_exc()
             main_placeholder.children = [Div(text=f"<pre>Error building plot:\n{tb}</pre>")]
 
-    widgets['apply_button'].on_click(lambda: apply_clicked())
+    apply_button.on_click(lambda: apply_clicked())
 
     def modify_doc(doc):
         doc.add_root(layout)

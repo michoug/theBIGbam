@@ -207,8 +207,6 @@ def generate_bokeh_plot(conn, list_features, contig_name, sample_name, subplot_s
         if subplot_feature is not None:
             subplots.append(subplot_feature)
 
-    conn.close()
-
     # --- Combine all figures in a single grid with one shared toolbar ---
     all_plots = [annotation_fig] + subplots
     grid = gridplot([[p] for p in all_plots], merge_tools=True, sizing_mode='stretch_width')
@@ -221,6 +219,7 @@ def save_html_plot(db_path, list_features, contig_name, sample_name, subplot_siz
     conn = sqlite3.connect(db_path)
     grid = generate_bokeh_plot(conn, list_features, contig_name, sample_name, subplot_size)
     save(grid)
+    conn.close()
 
 ### Parsing features
 def parse_requested_features(list_features):
