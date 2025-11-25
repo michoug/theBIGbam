@@ -1,0 +1,39 @@
+[package]
+name = "mgfeatureviewer_calc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# BAM/SAM reading
+rust-htslib = "0.51"
+
+# Parquet/Arrow output
+arrow = { version = "53", features = ["prettyprint"] }
+parquet = { version = "53", features = ["arrow", "zstd"] }
+
+# Parallelism
+rayon = "1.10"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# GenBank parsing - use newer version
+gb-io = "0.9"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Progress and logging
+indicatif = "0.17"
+
+# Path handling
+walkdir = "2"
+
+# SQLite for metadata.db
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

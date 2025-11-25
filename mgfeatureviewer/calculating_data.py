@@ -4,12 +4,31 @@ from multiprocessing import Pool, cpu_count
 from numba import njit
 import numpy as np
 import pysam
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 import time
 from functools import wraps
 from collections import defaultdict
 import sqlite3
 import subprocess
+
+# Feature type mapping (replaces Variable table lookup during computation)
+FEATURE_TYPES = {
+    "coverage": "curve",
+    "coverage_reduced": "curve",
+    "reads_starts": "bars",
+    "reads_ends": "bars",
+    "tau": "bars",
+    "read_lengths": "curve",
+    "insert_sizes": "curve",
+    "bad_orientations": "bars",
+    "left_clippings": "bars",
+    "right_clippings": "bars",
+    "insertions": "bars",
+    "deletions": "bars",
+    "mismatches": "bars",
+}
 
 ### Measuring time spent in each function
 function_times = defaultdict(float)
@@ -141,24 +160,18 @@ def add_presence(conn, contig_id, sample_id, coverage_percentage):
     cur.execute("INSERT INTO Presences (Contig_id, Sample_id, Coverage_percentage) VALUES (?, ?, ?)", (contig_id, sample_id, coverage_percentage))
     conn.commit()
 
-def compress_and_write_features(feature, feature_values, db_conn, sample_id, contig_id, ref_length, step, z_thresh, deriv_thresh, max_points):
-    # Read variable metadata from DB instead of constants
-    cur = db_conn.cursor()
-
-    cur.execute("SELECT Type, Feature_table_name FROM Variable WHERE Variable_name=?", (feature,))
-    row = cur.fetchone()
-    type_picked, feature_table = row
+def compress_and_return_features(feature, feature_values, contig_name, ref_length, step, z_thresh, deriv_thresh, max_points):
+    """Compress feature values and return as list of tuples for Parquet."""
+    type_picked = FEATURE_TYPES[feature]
 
     # Compress the signal to limit points
     feature_compressed = compress_signal(type_picked, feature_values, ref_length, step, z_thresh, deriv_thresh, max_points)
 
     xs = feature_compressed.get("x", [])
     ys = feature_compressed.get("y", [])
-    to_insert = [(contig_id, sample_id, int(x), float(y)) for x, y in zip(xs, ys)]
 
-    if to_insert:
-        cur.executemany(f"INSERT INTO {feature_table} (Contig_id, Sample_id, Position, Value) VALUES (?, ?, ?, ?)", to_insert)
-        db_conn.commit()
+    # Return list of (contig_name, feature, position, value) tuples
+    return [(contig_name, feature, int(x), float(y)) for x, y in zip(xs, ys)]
 
 ### Functions of coverage module
 @njit
@@ -179,12 +192,12 @@ def calculate_coverage_numba(coverage, starts, ends, ref_length):
                 coverage[j] += 1
 
 @track_time
-def get_feature_coverage(ref_starts, ref_ends, ref_length, db_conn, sample_id, contig_id, step, z_thresh, deriv_thresh, max_points):
+def get_feature_coverage(ref_starts, ref_ends, ref_length, contig_name, step, z_thresh, deriv_thresh, max_points):
     coverage = np.zeros(ref_length, dtype=np.uint64)
     calculate_coverage_numba(coverage, ref_starts, ref_ends, ref_length)
 
-    # Save into DB
-    compress_and_write_features("coverage", coverage, db_conn, sample_id, contig_id, ref_length, step, z_thresh, deriv_thresh, max_points)
+    # Return compressed feature data
+    return compress_and_return_features("coverage", coverage, contig_name, ref_length, step, z_thresh, deriv_thresh, max_points)
 
 ### Functions of phagetermini module
 def starts_with_match(cigar, md, start):
@@ -224,6 +237,30 @@ def calculate_reads_starts_and_ends(start, end, is_reverse, temporary_dict, ref_
         temporary_dict["start_plus"][start] += 1
         temporary_dict["end_plus"][end] += 1
 
+@njit
+def calculate_reads_starts_and_ends_numba(start, end, is_reverse, coverage_reduced, start_plus, start_minus, end_plus, end_minus, ref_length):
+    """Numba-optimized version with direct array access."""
+    start_mod = start % ref_length
+    end_mod = end % ref_length
+
+    # Update coverage
+    if start_mod <= end_mod:
+        for j in range(start_mod, end_mod + 1):
+            coverage_reduced[j] += 1
+    else:
+        for j in range(start_mod, ref_length):
+            coverage_reduced[j] += 1
+        for j in range(0, end_mod + 1):
+            coverage_reduced[j] += 1
+
+    # Update strand-specific starts/ends
+    if is_reverse:
+        start_minus[start_mod] += 1
+        end_minus[end_mod] += 1
+    else:
+        start_plus[start_mod] += 1
+        end_plus[end_mod] += 1
+
 def compute_final_starts_ends_and_tau(feature_dict, temporary_dict, sequencing_type, ref_length):
     feature_dict["coverage_reduced"] = temporary_dict["coverage_reduced"]
     if sequencing_type == "short-paired" or sequencing_type == "short-single":
@@ -239,32 +276,45 @@ def compute_final_starts_ends_and_tau(feature_dict, temporary_dict, sequencing_t
     feature_dict["tau"] = tau
 
 @track_time
-def get_features_phagetermini(ref_starts, ref_ends, is_reverse, cigars, md_list, sequencing_type, ref_length, 
-                              db_conn, sample_id, contig_id, step, z_thresh, deriv_thresh, max_points):
+def get_features_phagetermini(ref_starts, ref_ends, is_reverse, cigars, md_list, sequencing_type, ref_length,
+                              contig_name, step, z_thresh, deriv_thresh, max_points):
     features = ["coverage_reduced", "reads_starts", "reads_ends", "tau"]
     temporary_features = ["coverage_reduced", "start_plus", "start_minus", "end_plus", "end_minus"]
 
     feature_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in features}
     temporary_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in temporary_features}
 
+    # Pre-resolve sequencing type check (avoid string comparison in loop)
+    is_long = sequencing_type == "long"
+
+    # Extract direct array references (avoid dict lookup in loop)
+    coverage_reduced = temporary_dict["coverage_reduced"]
+    start_plus = temporary_dict["start_plus"]
+    start_minus = temporary_dict["start_minus"]
+    end_plus = temporary_dict["end_plus"]
+    end_minus = temporary_dict["end_minus"]
+
+    n_reads = len(ref_starts)
     # Iterate through preprocessed reads
-    for i in range(len(ref_starts)):
+    for i in range(n_reads):
         cigar = cigars[i]
         md = md_list[i]
 
         # Check if read starts with a match (and ends with a match for long reads)
-        if starts_with_match(cigar, md, start=True) and (sequencing_type != "long" or starts_with_match(cigar, md, start=False)):
-            start = ref_starts[i]
-            end = ref_ends[i]
-            is_reverse_flag = is_reverse[i]
-            calculate_reads_starts_and_ends(start, end, is_reverse_flag, temporary_dict, ref_length)
+        if starts_with_match(cigar, md, start=True) and (not is_long or starts_with_match(cigar, md, start=False)):
+            calculate_reads_starts_and_ends_numba(
+                ref_starts[i], ref_ends[i], is_reverse[i],
+                coverage_reduced, start_plus, start_minus, end_plus, end_minus, ref_length
+            )
 
     # Compute tau
     compute_final_starts_ends_and_tau(feature_dict, temporary_dict, sequencing_type, ref_length)
 
-    # Save features into DB
+    # Return compressed feature data
+    result = []
     for feature in features:
-        compress_and_write_features(feature, feature_dict[feature], db_conn, sample_id, contig_id, ref_length, step, z_thresh, deriv_thresh, max_points)
+        result.extend(compress_and_return_features(feature, feature_dict[feature], contig_name, ref_length, step, z_thresh, deriv_thresh, max_points))
+    return result
 
 ### Functions of assemblycheck module
 @njit
@@ -275,6 +325,14 @@ def add_read_lengths_numba(sum_read_lengths, counts_read_lengths, positions, rea
         counts_read_lengths[pos] += 1
 
 @njit
+def add_read_lengths_range_numba(sum_read_lengths, counts_read_lengths, start, end, read_len, ref_length):
+    """Optimized version that iterates over range instead of requiring pre-built array."""
+    for pos in range(start, end):
+        p = pos % ref_length
+        sum_read_lengths[p] += read_len
+        counts_read_lengths[p] += 1
+
+@njit
 def add_insert_sizes_numba(sum_insert_sizes, counts_insert_sizes, bad_orientations, positions, insert_len, is_read1, proper_pair, insert_flag, bad_flag, ref_length):
     for i in range(positions.size):
         pos = positions[i] % ref_length
@@ -283,6 +341,19 @@ def add_insert_sizes_numba(sum_insert_sizes, counts_insert_sizes, bad_orientatio
             counts_insert_sizes[pos] += 1
         if bad_flag and not proper_pair:
             bad_orientations[pos] += 1
+
+@njit
+def add_insert_sizes_range_numba(sum_insert_sizes, counts_insert_sizes, bad_orientations,
+                                  start, end, insert_len, is_read1, proper_pair,
+                                  insert_flag, bad_flag, ref_length):
+    """Optimized version that iterates over range instead of requiring pre-built array."""
+    for pos in range(start, end):
+        p = pos % ref_length
+        if insert_flag and is_read1 and insert_len > 0:
+            sum_insert_sizes[p] += insert_len
+            counts_insert_sizes[p] += 1
+        if bad_flag and not proper_pair:
+            bad_orientations[p] += 1
 
 @njit
 def add_indels_numba(deletions, insertions, cigartuples, ref_start, ref_length):
@@ -332,16 +403,20 @@ def compute_final_lengths(sum_lengths, count_lengths):
     return arr.astype(np.float32)
 
 @track_time
-def get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_lengths, is_read1, is_proper_pair, 
-                               cigars, has_md, md_list, md_lengths, sequencing_type, ref_length, 
-                               db_conn, sample_id, contig_id, step, z_thresh, deriv_thresh, max_points):
+def get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_lengths, is_read1, is_proper_pair,
+                               cigars, has_md, md_list, md_lengths, sequencing_type, ref_length,
+                               contig_name, step, z_thresh, deriv_thresh, max_points):
     features = []
     temporary_features = []
 
-    if sequencing_type == "long":
+    # Pre-resolve sequencing type checks (avoid string comparison in loop)
+    is_long = sequencing_type == "long"
+    is_paired = sequencing_type == "short-paired"
+
+    if is_long:
         features.append("read_lengths")
         temporary_features.extend(["sum_read_lengths", "count_read_lengths"])
-    if sequencing_type == "short-paired":
+    if is_paired:
         features.extend(["insert_sizes", "bad_orientations"])
         temporary_features.extend(["sum_insert_sizes", "count_insert_sizes", "bad_orientation"])
     features.extend(["left_clippings", "right_clippings", "insertions", "deletions", "mismatches"])
@@ -349,128 +424,193 @@ def get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_len
     feature_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in features}
     temporary_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in temporary_features}
 
+    # Pre-resolve feature flags (avoid repeated string lookups in loop)
+    has_left_clip = "left_clippings" in features
+    has_right_clip = "right_clippings" in features
+    has_mismatches = "mismatches" in features
+
+    # Get direct array references (avoid dict lookup in loop)
+    left_clippings = feature_dict.get("left_clippings")
+    right_clippings = feature_dict.get("right_clippings")
+    insertions_arr = feature_dict.get("insertions")
+    deletions_arr = feature_dict.get("deletions")
+    mismatches_arr = feature_dict.get("mismatches")
+    bad_orientations = feature_dict.get("bad_orientations")
+
+    sum_read_lengths = temporary_dict.get("sum_read_lengths")
+    count_read_lengths = temporary_dict.get("count_read_lengths")
+    sum_insert_sizes = temporary_dict.get("sum_insert_sizes")
+    count_insert_sizes = temporary_dict.get("count_insert_sizes")
+
     n_reads = ref_starts.size
     for i in range(n_reads):
-        # --- Long reads ---
-        if sequencing_type == "long":
-            positions = np.arange(ref_starts[i], ref_ends[i], dtype=np.int32) % ref_length
-            add_read_lengths_numba(temporary_dict["sum_read_lengths"], temporary_dict["count_read_lengths"],
-                                   positions, query_lengths[i], ref_length)
+        start_i = ref_starts[i]
+        end_i = ref_ends[i]
 
-        # --- Short-paired reads ---
-        if sequencing_type == "short-paired":
-            positions = np.arange(ref_starts[i], ref_ends[i], dtype=np.int32) % ref_length
-            insert_len = template_lengths[i]
-            insert_flag = 1 if "insert_sizes" in features else 0
-            bad_flag = 1 if "bad_orientations" in features else 0
-            add_insert_sizes_numba(temporary_dict["sum_insert_sizes"], temporary_dict["count_insert_sizes"],
-                                   feature_dict.get("bad_orientations", None),
-                                   positions, insert_len, is_read1[i], is_proper_pair[i], insert_flag, bad_flag, ref_length)
+        # --- Long reads: use range-based numba (avoids np.arange allocation) ---
+        if is_long:
+            add_read_lengths_range_numba(sum_read_lengths, count_read_lengths,
+                                         start_i, end_i, query_lengths[i], ref_length)
+
+        # --- Short-paired reads: use range-based numba ---
+        if is_paired:
+            add_insert_sizes_range_numba(sum_insert_sizes, count_insert_sizes, bad_orientations,
+                                         start_i, end_i, template_lengths[i], is_read1[i], is_proper_pair[i],
+                                         True, True, ref_length)
 
         # --- Clippings ---
-        if cigars[i].size > 0:
-            first_op, _ = cigars[i][0]
-            last_op, _ = cigars[i][-1]
-            if "left_clippings" in features and first_op in (4,5):
-                feature_dict["left_clippings"][ref_starts[i] % ref_length] += 1
-            if "right_clippings" in features and last_op in (4,5):
-                feature_dict["right_clippings"][(ref_ends[i]-1) % ref_length] += 1
+        cigar = cigars[i]
+        if cigar.size > 0:
+            first_op = cigar[0, 0]
+            last_op = cigar[-1, 0]
+            if has_left_clip and (first_op == 4 or first_op == 5):
+                left_clippings[start_i % ref_length] += 1
+            if has_right_clip and (last_op == 4 or last_op == 5):
+                right_clippings[(end_i - 1) % ref_length] += 1
 
         # --- Indels ---
-        deletions = feature_dict["deletions"] if "deletions" in features else None
-        insertions = feature_dict["insertions"] if "insertions" in features else None
-        add_indels_numba(deletions, insertions, cigars[i], ref_starts[i], ref_length)
+        add_indels_numba(deletions_arr, insertions_arr, cigar, start_i, ref_length)
 
         # --- Mismatches ---
-        if "mismatches" in features and has_md[i]:
-            add_mismatches_numba_from_md(feature_dict["mismatches"], md_list[i], md_lengths[i], ref_starts[i], ref_length)
+        if has_mismatches and has_md[i]:
+            add_mismatches_numba_from_md(mismatches_arr, md_list[i], md_lengths[i], start_i, ref_length)
 
     # --- Finalize lengths ---
-    if sequencing_type == "long":
+    if is_long:
         feature_dict["read_lengths"] = compute_final_lengths(temporary_dict["sum_read_lengths"], temporary_dict["count_read_lengths"])
-    if sequencing_type == "short-paired":
+    if is_paired:
         feature_dict["insert_sizes"] = compute_final_lengths(temporary_dict["sum_insert_sizes"], temporary_dict["count_insert_sizes"])
 
-    # --- Save features into DB ---
+    # --- Return compressed feature data ---
+    result = []
     for feature in features:
-        compress_and_write_features(feature, feature_dict[feature], db_conn, sample_id, contig_id, ref_length, step, z_thresh, deriv_thresh, max_points)
+        result.extend(compress_and_return_features(feature, feature_dict[feature], contig_name, ref_length, step, z_thresh, deriv_thresh, max_points))
+    return result
 
 ### Calculating features per contig per sample
 @track_time
-def preprocess_reads(reads_mapped, modules):
-    ref_starts, ref_ends = [], []
-    query_lengths, template_lengths = [], []
-    is_read1, is_proper_pair, is_paired, is_reverse = [], [], [], []
-    cigars, has_md, md_list, md_lengths = [], [], [], []
+def preprocess_reads(reads_mapped, modules, sequencing_type):
+    # Determine which attributes we actually need based on modules and sequencing type
+    # This reduces pysam attribute accesses (each is a C/Python boundary crossing)
+    need_md = bool({"phagetermini", "assemblycheck"}.intersection(modules))
+    need_cigars = bool({"phagetermini", "assemblycheck"}.intersection(modules))
+    need_reverse = "phagetermini" in modules
+    need_query_len = "assemblycheck" in modules and sequencing_type == "long"
+    need_paired_attrs = "assemblycheck" in modules and sequencing_type == "short-paired"
 
-    need_md = {"phagetermini", "assemblycheck"}.intersection(modules)
+    # Use dynamically growing arrays - single pass through reads
+    INITIAL_CAP = 8192
+    GROWTH = 2
+
+    capacity = INITIAL_CAP
+    n = 0
+
+    ref_starts = np.empty(capacity, dtype=np.int32)
+    ref_ends = np.empty(capacity, dtype=np.int32)
+
+    # Only allocate what's needed
+    query_lengths = np.empty(capacity, dtype=np.int32) if need_query_len else None
+    template_lengths = np.empty(capacity, dtype=np.int32) if need_paired_attrs else None
+    is_read1 = np.empty(capacity, dtype=np.bool_) if need_paired_attrs else None
+    is_proper_pair = np.empty(capacity, dtype=np.bool_) if need_paired_attrs else None
+    is_paired = np.empty(capacity, dtype=np.bool_) if need_paired_attrs else None
+    is_reverse = np.empty(capacity, dtype=np.bool_) if need_reverse else None
+    cigars = [] if need_cigars else None
+    has_md = np.empty(capacity, dtype=np.bool_) if need_md else None
+    md_list = [] if need_md else None
+    md_lengths = np.empty(capacity, dtype=np.int32) if need_md else None
+
+    # Single pass through reads
     for read in reads_mapped:
         if read.is_unmapped:
             continue
 
-        ref_starts.append(read.reference_start)
-        ref_ends.append(read.reference_end)
-        query_lengths.append(read.query_length)
-        template_lengths.append(abs(read.template_length))
-        is_read1.append(read.is_read1)
-        is_proper_pair.append(read.is_proper_pair)
-        is_paired.append(read.is_paired)
-        is_reverse.append(read.is_reverse)
+        # Grow arrays if needed
+        if n >= capacity:
+            capacity *= GROWTH
+            ref_starts = np.resize(ref_starts, capacity)
+            ref_ends = np.resize(ref_ends, capacity)
+            if need_query_len:
+                query_lengths = np.resize(query_lengths, capacity)
+            if need_paired_attrs:
+                template_lengths = np.resize(template_lengths, capacity)
+                is_read1 = np.resize(is_read1, capacity)
+                is_proper_pair = np.resize(is_proper_pair, capacity)
+                is_paired = np.resize(is_paired, capacity)
+            if need_reverse:
+                is_reverse = np.resize(is_reverse, capacity)
+            if need_md:
+                has_md = np.resize(has_md, capacity)
+                md_lengths = np.resize(md_lengths, capacity)
 
-        # CIGAR as array of ops/lengths
-        cigars.append(np.array(read.cigartuples, dtype=np.int32) if read.cigartuples else np.zeros((0,2), dtype=np.int32))
+        # Always needed
+        ref_starts[n] = read.reference_start
+        ref_ends[n] = read.reference_end
 
-        # Only store MD tags if mismatches will be computed
+        # Conditional extractions (skip pysam attribute access if not needed)
+        if need_query_len:
+            query_lengths[n] = read.query_length
+        if need_paired_attrs:
+            template_lengths[n] = abs(read.template_length)
+            is_read1[n] = read.is_read1
+            is_proper_pair[n] = read.is_proper_pair
+            is_paired[n] = read.is_paired
+        if need_reverse:
+            is_reverse[n] = read.is_reverse
+        if need_cigars:
+            cigars.append(np.array(read.cigartuples, dtype=np.int32) if read.cigartuples else np.zeros((0, 2), dtype=np.int32))
         if need_md:
             if read.has_tag("MD"):
                 md_bytes = np.frombuffer(read.get_tag("MD").encode("ascii"), dtype=np.uint8)
                 md_list.append(md_bytes)
-                md_lengths.append(len(md_bytes))
-                has_md.append(True)
+                md_lengths[n] = len(md_bytes)
+                has_md[n] = True
             else:
                 md_list.append(np.zeros(0, dtype=np.uint8))
-                md_lengths.append(0)
-                has_md.append(False)
+                md_lengths[n] = 0
+                has_md[n] = False
 
-    # Convert all lists to numpy arrays
-    ref_starts = np.array(ref_starts, dtype=np.int32)
-    ref_ends = np.array(ref_ends, dtype=np.int32)
-    query_lengths = np.array(query_lengths, dtype=np.int32)
-    template_lengths = np.array(template_lengths, dtype=np.int32)
-    is_read1 = np.array(is_read1, dtype=np.bool_)
-    is_proper_pair = np.array(is_proper_pair, dtype=np.bool_)
-    is_paired = np.array(is_paired, dtype=np.bool_)
-    is_reverse = np.array(is_reverse, dtype=np.bool_)
-    # Keep `cigars` as a Python list of numpy arrays instead of an
-    # object-dtype numpy array. Passing elements extracted from an
-    # object array into numba-decorated functions causes numba to see
-    # non-precise object types (array(pyobject,...)) and fail typing.
-    # A list preserves the concrete numpy array elements when indexed.
-    cigars = cigars
-    has_md = np.array(has_md, dtype=np.bool_)
-    md_lengths = np.array(md_lengths, dtype=np.int32)
-    # Similarly, keep `md_list` as a list of numpy uint8 arrays so numba
-    # functions that receive `md_list[i]` get a concrete array type.
-    md_list = md_list
+        n += 1
+
+    # Trim to actual size (or return empty arrays)
+    empty_i32 = np.array([], dtype=np.int32)
+    empty_bool = np.array([], dtype=np.bool_)
+
+    if n == 0:
+        return (empty_i32, empty_i32, empty_i32, empty_i32,
+                empty_bool, empty_bool, empty_bool, empty_bool,
+                [], empty_bool, [], empty_i32)
+
+    ref_starts = ref_starts[:n]
+    ref_ends = ref_ends[:n]
+    query_lengths = query_lengths[:n] if need_query_len else empty_i32
+    template_lengths = template_lengths[:n] if need_paired_attrs else empty_i32
+    is_read1 = is_read1[:n] if need_paired_attrs else empty_bool
+    is_proper_pair = is_proper_pair[:n] if need_paired_attrs else empty_bool
+    is_paired = is_paired[:n] if need_paired_attrs else empty_bool
+    is_reverse = is_reverse[:n] if need_reverse else empty_bool
+    cigars = cigars if need_cigars else []
+    has_md = has_md[:n] if need_md else empty_bool
+    md_list = md_list if need_md else []
+    md_lengths = md_lengths[:n] if need_md else empty_i32
 
     return (ref_starts, ref_ends, query_lengths, template_lengths, is_read1, is_proper_pair, is_paired, is_reverse, cigars, has_md, md_list, md_lengths)
 
 @track_time
-def calculating_features_per_contig_per_sample(module_list, bam_file, sequencing_type, ref_name, locus_size, db_conn, sample_id, contig_id, 
+def calculating_features_per_contig_per_sample(module_list, bam_file, sequencing_type, ref_name, locus_size,
                                                min_coverage, step, z_thresh, deriv_thresh, max_points):
+    """Calculate features for one contig, return (feature_data, presence_data) or (None, None)."""
     ### Save relevant info from bam file
     reads_mapped = bam_file.fetch(ref_name)
     (ref_starts, ref_ends, query_lengths, template_lengths,
      is_read1, is_proper_pair, is_paired, is_reverse,
-     cigars, has_md, md_list, md_lengths) = preprocess_reads(reads_mapped, module_list)
-    
+     cigars, has_md, md_list, md_lengths) = preprocess_reads(reads_mapped, module_list, sequencing_type)
+
     ### Coverage check: ensure more than min_coverage% of the reference is covered by at least one read
     if len(ref_starts) == 0:
-        # If no reads fail coverage threshold
-        return None
-    
+        return None, None
+
     # Mark covered regions
-    # np.minimum / np.maximum keep indexes inside bounds
     covered = np.zeros(locus_size, dtype=bool)
     start_clipped = np.maximum(ref_starts, 0)
     end_clipped = np.minimum(ref_ends, locus_size)
@@ -481,61 +621,115 @@ def calculating_features_per_contig_per_sample(module_list, bam_file, sequencing
     coverage_pct = (covered_bp / locus_size) * 100
 
     if coverage_pct < min_coverage:
-        # If not enough coverage skip this contig
-        return None
-    
-    # Add presence record
-    add_presence(db_conn, contig_id, sample_id, coverage_pct)
+        return None, None
+
+    # Presence record (contig_name, coverage_pct)
+    presence = (ref_name, coverage_pct)
+
+    # Accumulate feature data
+    features = []
 
     ### Calculate all features
     if {"coverage", "assemblycheck"}.intersection(module_list):
-        get_feature_coverage(ref_starts, ref_ends, locus_size, db_conn, sample_id, contig_id, step, z_thresh, deriv_thresh, max_points)
+        features.extend(get_feature_coverage(ref_starts, ref_ends, locus_size, ref_name, step, z_thresh, deriv_thresh, max_points))
     if "phagetermini" in module_list:
-        get_features_phagetermini(ref_starts, ref_ends, is_reverse, cigars, md_list, sequencing_type, locus_size, 
-                                  db_conn, sample_id, contig_id, step, z_thresh, deriv_thresh, max_points)
+        features.extend(get_features_phagetermini(ref_starts, ref_ends, is_reverse, cigars, md_list, sequencing_type, locus_size,
+                                                  ref_name, step, z_thresh, deriv_thresh, max_points))
     if "assemblycheck" in module_list:
-        get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_lengths, is_read1, is_proper_pair, cigars, has_md, md_list, md_lengths, 
-                                   sequencing_type, locus_size, db_conn, sample_id, contig_id, step, z_thresh, deriv_thresh, max_points)
+        features.extend(get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_lengths, is_read1, is_proper_pair, cigars, has_md, md_list, md_lengths,
+                                                   sequencing_type, locus_size, ref_name, step, z_thresh, deriv_thresh, max_points))
+
+    return features, presence
 
 ### Distributing the calculation for all the contigs in the bam file
 @track_time
-def calculating_features_per_sample(module_list, mapping_file, db_conn, min_coverage, step, z_thresh, deriv_thresh, max_points):
+def calculating_features_per_sample(module_list, mapping_file, min_coverage, step, z_thresh, deriv_thresh, max_points):
+    """Calculate all features for one sample, return (all_features, all_presences, sample_name)."""
     bam_file = pysam.AlignmentFile(mapping_file, "rb")
     references = bam_file.references
     lengths = [l // 2 for l in bam_file.lengths]  # need to divide by 2 because each contig was doubled for mapping to deal with circularity
 
-    # Save sample and contig names into DB
     sample_name = os.path.basename(mapping_file).replace(".bam", "")
     sequencing_type = find_sequencing_type_from_bam(mapping_file)
 
-    sample_id = add_sample(db_conn, sample_name)
+    all_features = []
+    all_presences = []
+
     for ref, length in zip(references, lengths):
-        contig_id = get_contig_id(db_conn, ref)
-        calculating_features_per_contig_per_sample(module_list, bam_file, sequencing_type, ref, length, db_conn, sample_id, contig_id, 
-                                                   min_coverage, step, z_thresh, deriv_thresh, max_points)
+        features, presence = calculating_features_per_contig_per_sample(
+            module_list, bam_file, sequencing_type, ref, length,
+            min_coverage, step, z_thresh, deriv_thresh, max_points
+        )
+        if features is not None:
+            all_features.extend(features)
+            all_presences.append(presence)
+
     bam_file.close()
+    return all_features, all_presences, sample_name
 
 ### Distributing the calculation for all the bam files (samples)
-def _process_single_sample(list_modules, bam_file, db_path, min_coverage, step, z_thresh, deriv_thresh, max_points):
-    # Each worker opens its own DB connection
-    conn = sqlite3.connect(db_path)
-    try:
-        calculating_features_per_sample(list_modules, bam_file, conn, min_coverage, step, z_thresh, deriv_thresh, max_points)
-    finally:
-        conn.close()
+def write_sample_parquet(features, presences, sample_name, output_dir):
+    """Write feature and presence data to Parquet files for one sample."""
+    # Write features Parquet
+    if features:
+        contig_names = [f[0] for f in features]
+        feature_names = [f[1] for f in features]
+        positions = [f[2] for f in features]
+        values = [f[3] for f in features]
+
+        features_table = pa.table({
+            'contig_name': pa.array(contig_names, type=pa.string()),
+            'feature': pa.array(feature_names, type=pa.string()),
+            'position': pa.array(positions, type=pa.int32()),
+            'value': pa.array(values, type=pa.float32()),
+        })
+
+        features_path = os.path.join(output_dir, 'features', f'{sample_name}.parquet')
+        pq.write_table(features_table, features_path, compression='zstd')
+
+    # Write presences Parquet
+    if presences:
+        contig_names = [p[0] for p in presences]
+        coverage_pcts = [p[1] for p in presences]
+
+        presences_table = pa.table({
+            'contig_name': pa.array(contig_names, type=pa.string()),
+            'coverage_pct': pa.array(coverage_pcts, type=pa.float32()),
+        })
+
+        presences_path = os.path.join(output_dir, 'presences', f'{sample_name}.parquet')
+        pq.write_table(presences_table, presences_path, compression='zstd')
+
+def _process_single_sample(list_modules, bam_file, output_dir, min_coverage, step, z_thresh, deriv_thresh, max_points):
+    """Process one sample: compute features and write Parquet files."""
+    all_features, all_presences, sample_name = calculating_features_per_sample(
+        list_modules, bam_file, min_coverage, step, z_thresh, deriv_thresh, max_points
+    )
+
+    # Write to Parquet (each worker writes its own files - no contention)
+    write_sample_parquet(all_features, all_presences, sample_name, output_dir)
 
     # Temporary debugging
     print_timing_summary(bam_file)
 
-def calculating_all_features_parallel(list_modules, bam_files, db_path, min_coverage, step, z_thresh, deriv_thresh, max_points, n_sample_cores=None):
+def calculating_all_features_parallel(list_modules, bam_files, output_dir, min_coverage, step, z_thresh, deriv_thresh, max_points, n_sample_cores=None):
     if n_sample_cores is None:
         n_sample_cores = max(1, cpu_count() - 1)
     print(f"Using {n_sample_cores} cores to process {len(bam_files)} samples in parallel...", flush=True)
 
-    args_list = [(list_modules, bam, db_path, min_coverage, step, z_thresh, deriv_thresh, max_points) for bam in bam_files]
+    # Create output directories
+    os.makedirs(os.path.join(output_dir, 'features'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'presences'), exist_ok=True)
 
+    # Sort BAM files by size (largest first) for better load balancing
+    # Large files start early, small files fill gaps at the end
+    bam_files_sorted = sorted(bam_files, key=lambda f: os.path.getsize(f), reverse=True)
+
+    args_list = [(list_modules, bam, output_dir, min_coverage, step, z_thresh, deriv_thresh, max_points) for bam in bam_files_sorted]
+
+    # chunksize=1 ensures workers grab next task immediately when done
     with Pool(processes=n_sample_cores) as pool:
-        pool.starmap(_process_single_sample, args_list)
+        list(pool.starmap(_process_single_sample, args_list, chunksize=1))
     print("Finished all samples.", flush=True)
 
 ### Main function helpers (shared-args)
@@ -544,7 +738,7 @@ def add_calculate_args(parser):
     parser.add_argument("-g", "--genbank", required=True, help="Path to genbank file of all investigated contigs")
     parser.add_argument("-b", "--bam_files", required=True, help="Path to bam file or directory containing mapping files (BAM format)")
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
-    parser.add_argument("-d", "--db", required=True, help="Path to sqlite database file to store results")
+    parser.add_argument("-o", "--output", required=True, help="Output directory for results (metadata.db + Parquet files)")
     parser.add_argument("-a", "--annotation_tool", default="", help="Optional: to color the contigs specify the annotation tool used (options allowed: pharokka)")
     parser.add_argument("--min_coverage", type=int, default=50, help="Minimum alignment-length coverage proportion for contig inclusion")
     parser.add_argument("--step", type=int, default=50, help="Step size for compression (keep every Nth point in addition to the outliers)")
@@ -605,17 +799,14 @@ def run_calculate_args(args):
 
     n_cores = int(args.threads)
 
-    # Running generate_database.py to create database
-    db_path = args.db
+    # Setup output directory
+    output_dir = args.output
+    if os.path.exists(output_dir):
+        sys.exit(f"ERROR: Output directory '{output_dir}' already exists. Please provide a new path to avoid overwriting.")
+    os.makedirs(output_dir)
 
-    directory, filename = os.path.split(db_path)
-    if not filename or not filename.endswith(".db"):
-        sys.exit(f"ERROR: Invalid database path '{db_path}'. Must provide a file ending in '.db'.")
-    if directory and not os.path.isdir(directory):
-        sys.exit(f"ERROR: Directory '{directory}' does not exist. Please create it or choose a valid path.")
-    if os.path.exists(db_path):
-        sys.exit(f"ERROR: Database file '{db_path}' already exists. Please provide a new path to avoid overwriting.")
-
+    # Create metadata database
+    db_path = os.path.join(output_dir, "metadata.db")
     subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "generate_database.py"), db_path], check=True)
 
     # Saving genbank info into database
@@ -659,7 +850,12 @@ def run_calculate_args(args):
     print(f"Saved {contig_count} contigs and {feature_count} annotations into database", flush=True)
 
     print("Calculating values for all requested features from mapping files...", flush=True)
-    calculating_all_features_parallel(requested_modules, bam_files, db_path, min_coverage, step, z_thresh, deriv_thresh, max_points, n_cores)
+    calculating_all_features_parallel(requested_modules, bam_files, output_dir, min_coverage, step, z_thresh, deriv_thresh, max_points, n_cores)
+
+    print(f"\nOutput written to: {output_dir}/", flush=True)
+    print(f"  - metadata.db (contig/sample metadata)", flush=True)
+    print(f"  - features/*.parquet (feature data)", flush=True)
+    print(f"  - presences/*.parquet (presence/absence data)", flush=True)
 
 def main():
     print("Parsing arguments...", flush=True)

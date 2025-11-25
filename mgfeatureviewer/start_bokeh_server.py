@@ -11,6 +11,7 @@ from bokeh.models.plots import GridPlot
 # Import the plotting function from the repo
 from .plotting_data_per_sample import generate_bokeh_plot_per_sample
 from .plotting_data_all_samples import generate_bokeh_plot_all_samples
+from .data_accessor import DataAccessor
 
 def build_controls(conn):
     """Query DB and return widgets and helper mappings."""
@@ -72,7 +73,12 @@ def build_controls(conn):
     return widgets
 
 def modify_doc_factory(db_path):
-    """Return a modify_doc(doc) function to be used by Bokeh server application."""
+    """Return a modify_doc(doc) function to be used by Bokeh server application.
+
+    Args:
+        db_path: Path to either a directory (Rust output with metadata.db + parquet files)
+                 or a .db file (Python output with Feature_* tables)
+    """
     # Load the CSS
     css_path = os.path.join(os.path.dirname(__file__), "..", "static", "bokeh_styles.css")
     with open(css_path) as f:
@@ -84,7 +90,9 @@ def modify_doc_factory(db_path):
     views_title = Div(text="<b>View</b>")
     views = RadioButtonGroup(labels=["One sample", "All samples"], active=0, sizing_mode="stretch_width")
 
-    conn = sqlite3.connect(db_path)
+    # Create DataAccessor - handles both directory (Rust) and .db file (Python) formats
+    accessor = DataAccessor(db_path)
+    conn = accessor.get_sqlite_connection()
     widgets = build_controls(conn)
 
     # Header placeholders (populated below) so view-change callback can toggle them
@@ -390,7 +398,7 @@ def modify_doc_factory(db_path):
                     raise ValueError("When in 'All samples' view you must select one variable to plot.")
 
                 print(f"[start_bokeh_server] Generating plot for all samples with variable={selected_var}, contig={contig}")
-                grid = generate_bokeh_plot_all_samples(conn, selected_var, contig, xstart=xstart, xend=xend)
+                grid = generate_bokeh_plot_all_samples(conn, selected_var, contig, xstart=xstart, xend=xend, accessor=accessor)
             else:
                 # One-sample view: collect possibly-many requested features and call per-sample plot
                 requested_features = []
@@ -399,7 +407,7 @@ def modify_doc_factory(db_path):
                         requested_features.append(cbg.labels[idx])
 
                 print(f"[start_bokeh_server] Generating plot for sample={sample}, contig={contig}, features={requested_features}")
-                grid = generate_bokeh_plot_per_sample(conn, requested_features, contig, sample, xstart=xstart, xend=xend)
+                grid = generate_bokeh_plot_per_sample(conn, requested_features, contig, sample, xstart=xstart, xend=xend, accessor=accessor)
 
             main_placeholder.children = [grid]
 

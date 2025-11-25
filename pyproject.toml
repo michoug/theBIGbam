@@ -17,7 +17,10 @@ dependencies = [
     "pysam>=0.20",
     "numpy>=1.24",
     "numba>=0.56",
-    "dna-features-viewer>=1.0"
+    "dna-features-viewer>=1.0",
+    "viztracer>=0.16",
+    "pyarrow>=14.0",
+    "duckdb>=0.9",
 ]
 
 [project.scripts]
