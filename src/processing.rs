@@ -1,13 +1,16 @@
 //! Shared processing logic for both CLI and Python bindings.
 
 use anyhow::Result;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use rust_htslib::bam::{IndexedReader, Read as BamRead};
 use rust_htslib::htslib;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
 use walkdir::WalkDir;
 
 use crate::bam_reader::{detect_sequencing_type, process_reads_for_contig};
@@ -249,23 +252,71 @@ pub fn run_all_samples(
     eprintln!("### Processing {} samples with {} threads", bam_files.len(), config.threads);
     eprintln!("Modules: {}\n", modules.join(", "));
 
-    // Create progress bar
-    let pb = ProgressBar::new(bam_files.len() as u64);
-    pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
+    // Create multi-progress with two bars
+    let mp = MultiProgress::new();
+
+    let process_pb = mp.add(ProgressBar::new(bam_files.len() as u64));
+    process_pb.set_style(
+        ProgressStyle::with_template("{spinner:.green} Processing:  [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} {msg}")
             .unwrap()
             .progress_chars("=>-"),
     );
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    process_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let merge_pb = mp.add(ProgressBar::new(bam_files.len() as u64));
+    merge_pb.set_style(
+        ProgressStyle::with_template("{spinner:.yellow} Writing:     [{elapsed_precise}] [{bar:40.yellow/red}] {pos}/{len} {msg}")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+    merge_pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let merge_pb = Arc::new(merge_pb);
 
     let start_time = std::time::Instant::now();
     let completed_count = AtomicUsize::new(0);
+    let failed_count = AtomicUsize::new(0);
     let total = bam_files.len();
 
-    // Process samples in parallel - each writes to its own temp DB
-    let results: Vec<Result<(String, PathBuf, f64)>> = bam_files
+    // Create channel for background merging - samples are merged as they complete
+    let (merge_tx, merge_rx) = mpsc::channel::<PathBuf>();
+
+    // Clone data needed by merge thread
+    let merge_db_path = db_path.to_path_buf();
+    let merge_contigs = contigs.clone();
+    let merge_temp_dir = temp_dir.clone();
+    let merge_pb_clone = Arc::clone(&merge_pb);
+
+    // Spawn background merge thread
+    let merge_handle = thread::spawn(move || {
+        let mut merged = 0usize;
+        for temp_db_path in merge_rx {
+            let sample_name = temp_db_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            if merge_temp_db_into_main(&merge_db_path, &temp_db_path, &merge_contigs).is_err() {
+                merge_pb_clone.set_message(format!("ERR: {}", sample_name));
+            } else {
+                merge_pb_clone.set_message(format!("{}", sample_name));
+            }
+            // Clean up temp DB
+            let _ = fs::remove_file(&temp_db_path);
+            merged += 1;
+            merge_pb_clone.inc(1);
+        }
+        // Clean up temp directory
+        let _ = fs::remove_dir(&merge_temp_dir);
+        merge_pb_clone.finish_with_message("Done");
+        merged
+    });
+
+    // Process samples in parallel - each writes to its own temp DB and sends to merge thread
+    bam_files
         .par_iter()
-        .map(|bam_path| {
+        .for_each(|bam_path| {
             let sample_start = std::time::Instant::now();
 
             let result = process_sample(bam_path, &contigs, modules, config);
@@ -274,73 +325,70 @@ pub fn run_all_samples(
                 Ok((features, presences, sample_name)) => {
                     // Create temp DB for this sample
                     let temp_db_path = temp_dir.join(format!("{}.db", sample_name));
-                    let temp_conn = create_temp_sample_db(&temp_db_path)?;
+                    let temp_conn = match create_temp_sample_db(&temp_db_path) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            failed_count.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                    };
 
                     // Write features and presences to temp DB
                     if !features.is_empty() {
-                        write_features_to_temp_db(&temp_conn, &features)?;
+                        if write_features_to_temp_db(&temp_conn, &features).is_err() {
+                            failed_count.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
                     }
                     if !presences.is_empty() {
-                        write_presences_to_temp_db(&temp_conn, &sample_name, &presences)?;
+                        if write_presences_to_temp_db(&temp_conn, &sample_name, &presences).is_err() {
+                            failed_count.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
                     }
 
                     // Close temp DB connection
                     drop(temp_conn);
 
+                    // Send to merge thread (non-blocking)
+                    let _ = merge_tx.send(temp_db_path);
+
                     let sample_time = sample_start.elapsed().as_secs_f64();
                     let done = completed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                    pb.set_message(format!("[{}/{}] {} ({:.2}s)", done, total, sample_name, sample_time));
-                    pb.inc(1);
-                    Ok((sample_name, temp_db_path, sample_time))
+                    process_pb.set_message(format!("[{}/{}] {} ({:.2}s)", done, total, sample_name, sample_time));
+                    process_pb.inc(1);
                 }
-                Err(e) => {
+                Err(_) => {
                     let sample_time = sample_start.elapsed().as_secs_f64();
                     let done = completed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                    pb.set_message(format!("[{}/{}] ERR ({:.2}s)", done, total, sample_time));
-                    pb.inc(1);
-                    Err(e)
+                    failed_count.fetch_add(1, Ordering::SeqCst);
+                    process_pb.set_message(format!("[{}/{}] ERR ({:.2}s)", done, total, sample_time));
+                    process_pb.inc(1);
                 }
             }
-        })
-        .collect();
+        });
 
-    pb.finish_with_message("Done");
+    process_pb.finish_with_message("Done");
 
-    // Merge all temp DBs into main DB sequentially (avoids lock contention)
-    eprintln!("Merging sample data into database...");
-    let merge_pb = ProgressBar::new(results.len() as u64);
-    merge_pb.set_style(
-        ProgressStyle::with_template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} merging...")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
+    // Close channel to signal merge thread to finish
+    drop(merge_tx);
 
-    for result in &results {
-        if let Ok((_, temp_db_path, _)) = result {
-            merge_temp_db_into_main(&db_path, temp_db_path, &contigs)?;
-            // Clean up temp DB
-            let _ = fs::remove_file(temp_db_path);
-        }
-        merge_pb.inc(1);
-    }
-    merge_pb.finish_with_message("Done");
-
-    // Clean up temp directory
-    let _ = fs::remove_dir(&temp_dir);
+    // Wait for merge thread to complete
+    let _merged = merge_handle.join().expect("Merge thread panicked");
 
     // Finalize database (checkpoint WAL)
-    finalize_db(&db_path)?;
+    finalize_db(db_path)?;
 
     let elapsed = start_time.elapsed();
-    let successful = results.iter().filter(|r| r.is_ok()).count();
-    let failed = results.len() - successful;
+    let failed = failed_count.load(Ordering::SeqCst);
+    let successful = total - failed;
 
     // Print summary
     eprintln!();
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     eprintln!("### Complete");
     eprintln!();
-    eprintln!("  Samples processed: {}/{}", successful, results.len());
+    eprintln!("  Samples processed: {}/{}", successful, total);
     eprintln!("  Total time:        {:.2}s", elapsed.as_secs_f64());
     eprintln!();
     eprintln!("  Output: {:?}", output_db);

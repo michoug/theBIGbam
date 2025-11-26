@@ -10,7 +10,6 @@
 //! - `features.rs`   - Feature calculations (coverage, phagetermini, assemblycheck)
 //! - `compress.rs`   - Signal compression for storage
 //! - `db.rs`         - SQLite database operations
-//! - `parquet.rs`    - Parquet file writing
 //! - `genbank.rs`    - GenBank file parsing
 //! - `processing.rs` - Shared processing logic for CLI and Python bindings
 //!
@@ -34,14 +33,12 @@
 //! outliers, so it may keep slightly more positions. **All values at common positions are
 //! identical** - Rust just preserves more data points as originally intended.
 //!
-//! ## Verification
+//! ## Output
 //!
-//! Run `python compare_values_only.py <sqlite_db> <parquet_dir>` to verify outputs match:
-//! - All 11 features tested across all samples
-//! - 100% exact match at common positions (0 difference)
-//! - Metadata tables match exactly
-//!
-//! See also: `PYTHON_COMPARISON.md` for side-by-side code examples.
+//! Produces a single SQLite database (.db) with:
+//! - Metadata tables (contigs, annotations, etc.)
+//! - Feature_* tables for each computed variable (e.g., Feature_coverage, Feature_reads_starts)
+//! - Presence table tracking sample-contig coverage
 
 use anyhow::Result;
 use clap::Parser;
@@ -69,7 +66,7 @@ struct Args {
     #[arg(short = 'm', long)]
     modules: String,
 
-    /// Output directory
+    /// Output database file (.db)
     #[arg(short = 'o', long)]
     output: PathBuf,
 
@@ -101,9 +98,9 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Check output directory doesn't exist
+    // Check output file doesn't exist
     if args.output.exists() {
-        anyhow::bail!("Output directory already exists: {:?}", args.output);
+        anyhow::bail!("Output file already exists: {:?}", args.output);
     }
 
     // Parse modules
