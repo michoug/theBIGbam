@@ -6,7 +6,18 @@ from bokeh.plotting import output_file, save
 from .plotting_data_per_sample import get_contig_info, get_feature_data, make_bokeh_subplot, make_bokeh_genemap
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130):
+def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130, accessor=None):
+    """Generate a Bokeh plot showing all samples for a single variable.
+
+    Args:
+        conn: SQLite connection (used for metadata queries)
+        variable: Variable/feature to plot
+        contig_name: Name of the contig to plot
+        xstart: Optional x-axis start position
+        xend: Optional x-axis end position
+        subplot_size: Height of each subplot in pixels
+        accessor: Optional DataAccessor for parquet mode
+    """
     cur = conn.cursor()
 
     # Get contig characteristics
@@ -19,7 +30,7 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
     if xstart is not None and xend is not None:
         shared_xrange.start = xstart
         shared_xrange.end = xend
-    
+
     annotation_fig = make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool, subplot_size, shared_xrange)
 
     # Get list of samples
@@ -33,7 +44,8 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
     # Requested features are variables like 'coverage', 'reads_starts', etc.
     subplots = []
     for sample_id, sample_name in zip(sample_ids, sample_names):
-        list_feature_dict = get_feature_data(cur, variable, contig_id, sample_id)
+        list_feature_dict = get_feature_data(cur, variable, contig_id, sample_id,
+                                             accessor=accessor, contig_name=contig_name, sample_name=sample_name)
         if all(len(vals["x"]) == 0 for vals in list_feature_dict):
             continue
 

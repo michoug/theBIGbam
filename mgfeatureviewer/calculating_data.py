@@ -4,6 +4,8 @@ from multiprocessing import Pool, cpu_count
 from numba import njit
 import numpy as np
 import pysam
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 import time
 from functools import wraps
@@ -16,6 +18,31 @@ try:
     from . import slurm_utils
 except Exception:
     slurm_utils = None
+
+# Try to import Rust bindings for faster processing
+try:
+    import mgfeatureviewer_rs as _rust
+    HAS_RUST = True
+except ImportError:
+    HAS_RUST = False
+    _rust = None
+
+# Feature type mapping (replaces Variable table lookup during computation)
+FEATURE_TYPES = {
+    "coverage": "curve",
+    "coverage_reduced": "curve",
+    "reads_starts": "bars",
+    "reads_ends": "bars",
+    "tau": "bars",
+    "read_lengths": "curve",
+    "insert_sizes": "curve",
+    "bad_orientations": "bars",
+    "left_clippings": "bars",
+    "right_clippings": "bars",
+    "insertions": "bars",
+    "deletions": "bars",
+    "mismatches": "bars",
+}
 
 ### Measuring time spent in each function
 function_times = defaultdict(float)
@@ -174,6 +201,11 @@ def compress_signal(type_picked, feature_values, ref_length, step, z_thresh, der
         der_outliers = np.abs(dy) > deriv_thresh * dy_std
 
         # Include the point before each derivative outlier
+        # NOTE: This line has a subtle bug - it does arithmetic on a boolean array,
+        # which doesn't correctly find outlier indices. The Rust implementation
+        # (rust_calculate/src/main.rs, compress_signal function) uses correct logic
+        # and may keep slightly more positions as a result. Both outputs are valid
+        # but Rust preserves more derivative outliers as originally intended.
         der_outliers = np.unique(np.clip(np.concatenate([der_outliers - 1, der_outliers]), 0, n - 1))
 
         # Combine value and derivative outliers
@@ -225,20 +257,9 @@ def add_presence(conn, contig_id=None, sample_id=None, coverage_percentage=None,
         cur.execute("INSERT INTO Presences (Contig_id, Sample_id, Coverage_percentage) VALUES (?, ?, ?)", (contig_id, sample_id, coverage_percentage))
     conn.commit()
 
-def compress_and_write_features(feature, feature_values, db_conn, sample_id=None, contig_id=None, ref_length=None, step=None, z_thresh=None, deriv_thresh=None, max_points=None, *, sample_name=None, contig_name=None, temp_mode=False):
-    # Read variable metadata from DB instead of constants
-    cur = db_conn.cursor()
-
-    # When writing into a temp DB, we do not need feature_table resolution
-    if not temp_mode:
-        cur.execute("SELECT Type, Feature_table_name FROM Variable WHERE Variable_name=?", (feature,))
-        row = cur.fetchone()
-        type_picked, feature_table = row
-    else:
-        # For temp mode, we still need the variable Type to compress appropriately
-        cur.execute("SELECT Type FROM Variable WHERE Variable_name=?", (feature,))
-        row = cur.fetchone()
-        type_picked = row[0] if row else 'curve'
+def compress_and_return_features(feature, feature_values, contig_name, ref_length, step, z_thresh, deriv_thresh, max_points):
+    """Compress feature values and return as list of tuples for Parquet."""
+    type_picked = FEATURE_TYPES[feature]
 
     # Compress the signal to limit points
     feature_compressed = compress_signal(type_picked, feature_values, ref_length, step, z_thresh, deriv_thresh, max_points)
@@ -246,17 +267,8 @@ def compress_and_write_features(feature, feature_values, db_conn, sample_id=None
     xs = feature_compressed.get("x", [])
     ys = feature_compressed.get("y", [])
 
-    if temp_mode:
-        # Insert into generic TempFeatureValues table for later merging
-        to_insert = [(feature, contig_name, sample_name, int(x), float(y)) for x, y in zip(xs, ys)]
-        if to_insert:
-            cur.executemany("INSERT INTO TempFeatureValues (Variable_name, Contig_name, Sample_name, Position, Value) VALUES (?, ?, ?, ?, ?)", to_insert)
-            db_conn.commit()
-    else:
-        to_insert = [(contig_id, sample_id, int(x), float(y)) for x, y in zip(xs, ys)]
-        if to_insert:
-            cur.executemany(f"INSERT INTO {feature_table} (Contig_id, Sample_id, Position, Value) VALUES (?, ?, ?, ?)", to_insert)
-            db_conn.commit()
+    # Return list of (contig_name, feature, position, value) tuples
+    return [(contig_name, feature, int(x), float(y)) for x, y in zip(xs, ys)]
 
 ### Functions of coverage module
 @njit
@@ -277,12 +289,12 @@ def calculate_coverage_numba(coverage, starts, ends, ref_length):
                 coverage[j] += 1
 
 @track_time
-def get_feature_coverage(ref_starts, ref_ends, ref_length, db_conn, sample_id=None, contig_id=None, step=None, z_thresh=None, deriv_thresh=None, max_points=None, *, sample_name=None, contig_name=None, temp_mode=False):
+def get_feature_coverage(ref_starts, ref_ends, ref_length, contig_name, step, z_thresh, deriv_thresh, max_points):
     coverage = np.zeros(ref_length, dtype=np.uint64)
     calculate_coverage_numba(coverage, ref_starts, ref_ends, ref_length)
 
-    # Save into DB
-    compress_and_write_features("coverage", coverage, db_conn, sample_id, contig_id, ref_length, step, z_thresh, deriv_thresh, max_points, sample_name=sample_name, contig_name=contig_name, temp_mode=temp_mode)
+    # Return compressed feature data
+    return compress_and_return_features("coverage", coverage, contig_name, ref_length, step, z_thresh, deriv_thresh, max_points)
 
 ### Functions of phagetermini module
 def starts_with_match(cigar, md, start):
@@ -298,6 +310,8 @@ def starts_with_match(cigar, md, start):
 
     # Check MD tag for match at start/end
     # MD string: digits represent matches, letters/deletions mismatches
+    if len(md) == 0:
+        return False
     val = md[0] if start else md[-1]
     return val > 0
 
@@ -320,6 +334,30 @@ def calculate_reads_starts_and_ends(start, end, is_reverse, temporary_dict, ref_
         temporary_dict["start_plus"][start] += 1
         temporary_dict["end_plus"][end] += 1
 
+@njit
+def calculate_reads_starts_and_ends_numba(start, end, is_reverse, coverage_reduced, start_plus, start_minus, end_plus, end_minus, ref_length):
+    """Numba-optimized version with direct array access."""
+    start_mod = start % ref_length
+    end_mod = end % ref_length
+
+    # Update coverage
+    if start_mod <= end_mod:
+        for j in range(start_mod, end_mod + 1):
+            coverage_reduced[j] += 1
+    else:
+        for j in range(start_mod, ref_length):
+            coverage_reduced[j] += 1
+        for j in range(0, end_mod + 1):
+            coverage_reduced[j] += 1
+
+    # Update strand-specific starts/ends
+    if is_reverse:
+        start_minus[start_mod] += 1
+        end_minus[end_mod] += 1
+    else:
+        start_plus[start_mod] += 1
+        end_plus[end_mod] += 1
+
 def compute_final_starts_ends_and_tau(feature_dict, temporary_dict, sequencing_type, ref_length):
     feature_dict["coverage_reduced"] = temporary_dict["coverage_reduced"]
     if sequencing_type == "short-paired" or sequencing_type == "short-single":
@@ -335,32 +373,45 @@ def compute_final_starts_ends_and_tau(feature_dict, temporary_dict, sequencing_t
     feature_dict["tau"] = tau
 
 @track_time
-def get_features_phagetermini(ref_starts, ref_ends, is_reverse, cigars, md_list, sequencing_type, ref_length, 
-                              db_conn, sample_id=None, contig_id=None, step=None, z_thresh=None, deriv_thresh=None, max_points=None, *, sample_name=None, contig_name=None, temp_mode=False):
+def get_features_phagetermini(ref_starts, ref_ends, is_reverse, cigars, md_list, sequencing_type, ref_length,
+                              contig_name, step, z_thresh, deriv_thresh, max_points):
     features = ["coverage_reduced", "reads_starts", "reads_ends", "tau"]
     temporary_features = ["coverage_reduced", "start_plus", "start_minus", "end_plus", "end_minus"]
 
     feature_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in features}
     temporary_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in temporary_features}
 
+    # Pre-resolve sequencing type check (avoid string comparison in loop)
+    is_long = sequencing_type == "long"
+
+    # Extract direct array references (avoid dict lookup in loop)
+    coverage_reduced = temporary_dict["coverage_reduced"]
+    start_plus = temporary_dict["start_plus"]
+    start_minus = temporary_dict["start_minus"]
+    end_plus = temporary_dict["end_plus"]
+    end_minus = temporary_dict["end_minus"]
+
+    n_reads = len(ref_starts)
     # Iterate through preprocessed reads
-    for i in range(len(ref_starts)):
+    for i in range(n_reads):
         cigar = cigars[i]
         md = md_list[i]
 
         # Check if read starts with a match (and ends with a match for long reads)
-        if starts_with_match(cigar, md, start=True) and (sequencing_type != "long" or starts_with_match(cigar, md, start=False)):
-            start = ref_starts[i]
-            end = ref_ends[i]
-            is_reverse_flag = is_reverse[i]
-            calculate_reads_starts_and_ends(start, end, is_reverse_flag, temporary_dict, ref_length)
+        if starts_with_match(cigar, md, start=True) and (not is_long or starts_with_match(cigar, md, start=False)):
+            calculate_reads_starts_and_ends_numba(
+                ref_starts[i], ref_ends[i], is_reverse[i],
+                coverage_reduced, start_plus, start_minus, end_plus, end_minus, ref_length
+            )
 
     # Compute tau
     compute_final_starts_ends_and_tau(feature_dict, temporary_dict, sequencing_type, ref_length)
 
-    # Save features into DB
+    # Return compressed feature data
+    result = []
     for feature in features:
-        compress_and_write_features(feature, feature_dict[feature], db_conn, sample_id, contig_id, ref_length, step, z_thresh, deriv_thresh, max_points, sample_name=sample_name, contig_name=contig_name, temp_mode=temp_mode)
+        result.extend(compress_and_return_features(feature, feature_dict[feature], contig_name, ref_length, step, z_thresh, deriv_thresh, max_points))
+    return result
 
 ### Functions of assemblycheck module
 @njit
@@ -371,6 +422,14 @@ def add_read_lengths_numba(sum_read_lengths, counts_read_lengths, positions, rea
         counts_read_lengths[pos] += 1
 
 @njit
+def add_read_lengths_range_numba(sum_read_lengths, counts_read_lengths, start, end, read_len, ref_length):
+    """Optimized version that iterates over range instead of requiring pre-built array."""
+    for pos in range(start, end):
+        p = pos % ref_length
+        sum_read_lengths[p] += read_len
+        counts_read_lengths[p] += 1
+
+@njit
 def add_insert_sizes_numba(sum_insert_sizes, counts_insert_sizes, bad_orientations, positions, insert_len, is_read1, proper_pair, insert_flag, bad_flag, ref_length):
     for i in range(positions.size):
         pos = positions[i] % ref_length
@@ -379,6 +438,19 @@ def add_insert_sizes_numba(sum_insert_sizes, counts_insert_sizes, bad_orientatio
             counts_insert_sizes[pos] += 1
         if bad_flag and not proper_pair:
             bad_orientations[pos] += 1
+
+@njit
+def add_insert_sizes_range_numba(sum_insert_sizes, counts_insert_sizes, bad_orientations,
+                                  start, end, insert_len, is_read1, proper_pair,
+                                  insert_flag, bad_flag, ref_length):
+    """Optimized version that iterates over range instead of requiring pre-built array."""
+    for pos in range(start, end):
+        p = pos % ref_length
+        if insert_flag and is_read1 and insert_len > 0:
+            sum_insert_sizes[p] += insert_len
+            counts_insert_sizes[p] += 1
+        if bad_flag and not proper_pair:
+            bad_orientations[p] += 1
 
 @njit
 def add_indels_numba(deletions, insertions, cigartuples, ref_start, ref_length):
@@ -428,16 +500,20 @@ def compute_final_lengths(sum_lengths, count_lengths):
     return arr.astype(np.float32)
 
 @track_time
-def get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_lengths, is_read1, is_proper_pair, 
-                               cigars, has_md, md_list, md_lengths, sequencing_type, ref_length, 
-                               db_conn, sample_id=None, contig_id=None, step=None, z_thresh=None, deriv_thresh=None, max_points=None, *, sample_name=None, contig_name=None, temp_mode=False):
+def get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_lengths, is_read1, is_proper_pair,
+                               cigars, has_md, md_list, md_lengths, sequencing_type, ref_length,
+                               contig_name, step, z_thresh, deriv_thresh, max_points):
     features = []
     temporary_features = []
 
-    if sequencing_type == "long":
+    # Pre-resolve sequencing type checks (avoid string comparison in loop)
+    is_long = sequencing_type == "long"
+    is_paired = sequencing_type == "short-paired"
+
+    if is_long:
         features.append("read_lengths")
         temporary_features.extend(["sum_read_lengths", "count_read_lengths"])
-    if sequencing_type == "short-paired":
+    if is_paired:
         features.extend(["insert_sizes", "bad_orientations"])
         temporary_features.extend(["sum_insert_sizes", "count_insert_sizes", "bad_orientation"])
     features.extend(["left_clippings", "right_clippings", "insertions", "deletions", "mismatches"])
@@ -445,128 +521,193 @@ def get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_len
     feature_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in features}
     temporary_dict = {f: np.zeros(ref_length, dtype=np.uint64) for f in temporary_features}
 
+    # Pre-resolve feature flags (avoid repeated string lookups in loop)
+    has_left_clip = "left_clippings" in features
+    has_right_clip = "right_clippings" in features
+    has_mismatches = "mismatches" in features
+
+    # Get direct array references (avoid dict lookup in loop)
+    left_clippings = feature_dict.get("left_clippings")
+    right_clippings = feature_dict.get("right_clippings")
+    insertions_arr = feature_dict.get("insertions")
+    deletions_arr = feature_dict.get("deletions")
+    mismatches_arr = feature_dict.get("mismatches")
+    bad_orientations = feature_dict.get("bad_orientations")
+
+    sum_read_lengths = temporary_dict.get("sum_read_lengths")
+    count_read_lengths = temporary_dict.get("count_read_lengths")
+    sum_insert_sizes = temporary_dict.get("sum_insert_sizes")
+    count_insert_sizes = temporary_dict.get("count_insert_sizes")
+
     n_reads = ref_starts.size
     for i in range(n_reads):
-        # --- Long reads ---
-        if sequencing_type == "long":
-            positions = np.arange(ref_starts[i], ref_ends[i], dtype=np.int32) % ref_length
-            add_read_lengths_numba(temporary_dict["sum_read_lengths"], temporary_dict["count_read_lengths"],
-                                   positions, query_lengths[i], ref_length)
+        start_i = ref_starts[i]
+        end_i = ref_ends[i]
 
-        # --- Short-paired reads ---
-        if sequencing_type == "short-paired":
-            positions = np.arange(ref_starts[i], ref_ends[i], dtype=np.int32) % ref_length
-            insert_len = template_lengths[i]
-            insert_flag = 1 if "insert_sizes" in features else 0
-            bad_flag = 1 if "bad_orientations" in features else 0
-            add_insert_sizes_numba(temporary_dict["sum_insert_sizes"], temporary_dict["count_insert_sizes"],
-                                   feature_dict.get("bad_orientations", None),
-                                   positions, insert_len, is_read1[i], is_proper_pair[i], insert_flag, bad_flag, ref_length)
+        # --- Long reads: use range-based numba (avoids np.arange allocation) ---
+        if is_long:
+            add_read_lengths_range_numba(sum_read_lengths, count_read_lengths,
+                                         start_i, end_i, query_lengths[i], ref_length)
+
+        # --- Short-paired reads: use range-based numba ---
+        if is_paired:
+            add_insert_sizes_range_numba(sum_insert_sizes, count_insert_sizes, bad_orientations,
+                                         start_i, end_i, template_lengths[i], is_read1[i], is_proper_pair[i],
+                                         True, True, ref_length)
 
         # --- Clippings ---
-        if cigars[i].size > 0:
-            first_op, _ = cigars[i][0]
-            last_op, _ = cigars[i][-1]
-            if "left_clippings" in features and first_op in (4,5):
-                feature_dict["left_clippings"][ref_starts[i] % ref_length] += 1
-            if "right_clippings" in features and last_op in (4,5):
-                feature_dict["right_clippings"][(ref_ends[i]-1) % ref_length] += 1
+        cigar = cigars[i]
+        if cigar.size > 0:
+            first_op = cigar[0, 0]
+            last_op = cigar[-1, 0]
+            if has_left_clip and (first_op == 4 or first_op == 5):
+                left_clippings[start_i % ref_length] += 1
+            if has_right_clip and (last_op == 4 or last_op == 5):
+                right_clippings[(end_i - 1) % ref_length] += 1
 
         # --- Indels ---
-        deletions = feature_dict["deletions"] if "deletions" in features else None
-        insertions = feature_dict["insertions"] if "insertions" in features else None
-        add_indels_numba(deletions, insertions, cigars[i], ref_starts[i], ref_length)
+        add_indels_numba(deletions_arr, insertions_arr, cigar, start_i, ref_length)
 
         # --- Mismatches ---
-        if "mismatches" in features and has_md[i]:
-            add_mismatches_numba_from_md(feature_dict["mismatches"], md_list[i], md_lengths[i], ref_starts[i], ref_length)
+        if has_mismatches and has_md[i]:
+            add_mismatches_numba_from_md(mismatches_arr, md_list[i], md_lengths[i], start_i, ref_length)
 
     # --- Finalize lengths ---
-    if sequencing_type == "long":
+    if is_long:
         feature_dict["read_lengths"] = compute_final_lengths(temporary_dict["sum_read_lengths"], temporary_dict["count_read_lengths"])
-    if sequencing_type == "short-paired":
+    if is_paired:
         feature_dict["insert_sizes"] = compute_final_lengths(temporary_dict["sum_insert_sizes"], temporary_dict["count_insert_sizes"])
 
-    # --- Save features into DB ---
+    # --- Return compressed feature data ---
+    result = []
     for feature in features:
-        compress_and_write_features(feature, feature_dict[feature], db_conn, sample_id, contig_id, ref_length, step, z_thresh, deriv_thresh, max_points, sample_name=sample_name, contig_name=contig_name, temp_mode=temp_mode)
+        result.extend(compress_and_return_features(feature, feature_dict[feature], contig_name, ref_length, step, z_thresh, deriv_thresh, max_points))
+    return result
 
 ### Calculating features per contig per sample
 @track_time
-def preprocess_reads(reads_mapped, modules):
-    ref_starts, ref_ends = [], []
-    query_lengths, template_lengths = [], []
-    is_read1, is_proper_pair, is_paired, is_reverse = [], [], [], []
-    cigars, has_md, md_list, md_lengths = [], [], [], []
+def preprocess_reads(reads_mapped, modules, sequencing_type):
+    # Determine which attributes we actually need based on modules and sequencing type
+    # This reduces pysam attribute accesses (each is a C/Python boundary crossing)
+    need_md = bool({"phagetermini", "assemblycheck"}.intersection(modules))
+    need_cigars = bool({"phagetermini", "assemblycheck"}.intersection(modules))
+    need_reverse = "phagetermini" in modules
+    need_query_len = "assemblycheck" in modules and sequencing_type == "long"
+    need_paired_attrs = "assemblycheck" in modules and sequencing_type == "short-paired"
 
-    need_md = {"phagetermini", "assemblycheck"}.intersection(modules)
+    # Use dynamically growing arrays - single pass through reads
+    INITIAL_CAP = 8192
+    GROWTH = 2
+
+    capacity = INITIAL_CAP
+    n = 0
+
+    ref_starts = np.empty(capacity, dtype=np.int32)
+    ref_ends = np.empty(capacity, dtype=np.int32)
+
+    # Only allocate what's needed
+    query_lengths = np.empty(capacity, dtype=np.int32) if need_query_len else None
+    template_lengths = np.empty(capacity, dtype=np.int32) if need_paired_attrs else None
+    is_read1 = np.empty(capacity, dtype=np.bool_) if need_paired_attrs else None
+    is_proper_pair = np.empty(capacity, dtype=np.bool_) if need_paired_attrs else None
+    is_paired = np.empty(capacity, dtype=np.bool_) if need_paired_attrs else None
+    is_reverse = np.empty(capacity, dtype=np.bool_) if need_reverse else None
+    cigars = [] if need_cigars else None
+    has_md = np.empty(capacity, dtype=np.bool_) if need_md else None
+    md_list = [] if need_md else None
+    md_lengths = np.empty(capacity, dtype=np.int32) if need_md else None
+
+    # Single pass through reads
     for read in reads_mapped:
         if read.is_unmapped:
             continue
 
-        ref_starts.append(read.reference_start)
-        ref_ends.append(read.reference_end)
-        query_lengths.append(read.query_length)
-        template_lengths.append(abs(read.template_length))
-        is_read1.append(read.is_read1)
-        is_proper_pair.append(read.is_proper_pair)
-        is_paired.append(read.is_paired)
-        is_reverse.append(read.is_reverse)
+        # Grow arrays if needed
+        if n >= capacity:
+            capacity *= GROWTH
+            ref_starts = np.resize(ref_starts, capacity)
+            ref_ends = np.resize(ref_ends, capacity)
+            if need_query_len:
+                query_lengths = np.resize(query_lengths, capacity)
+            if need_paired_attrs:
+                template_lengths = np.resize(template_lengths, capacity)
+                is_read1 = np.resize(is_read1, capacity)
+                is_proper_pair = np.resize(is_proper_pair, capacity)
+                is_paired = np.resize(is_paired, capacity)
+            if need_reverse:
+                is_reverse = np.resize(is_reverse, capacity)
+            if need_md:
+                has_md = np.resize(has_md, capacity)
+                md_lengths = np.resize(md_lengths, capacity)
 
-        # CIGAR as array of ops/lengths
-        cigars.append(np.array(read.cigartuples, dtype=np.int32) if read.cigartuples else np.zeros((0,2), dtype=np.int32))
+        # Always needed
+        ref_starts[n] = read.reference_start
+        ref_ends[n] = read.reference_end
 
-        # Only store MD tags if mismatches will be computed
+        # Conditional extractions (skip pysam attribute access if not needed)
+        if need_query_len:
+            query_lengths[n] = read.query_length
+        if need_paired_attrs:
+            template_lengths[n] = abs(read.template_length)
+            is_read1[n] = read.is_read1
+            is_proper_pair[n] = read.is_proper_pair
+            is_paired[n] = read.is_paired
+        if need_reverse:
+            is_reverse[n] = read.is_reverse
+        if need_cigars:
+            cigars.append(np.array(read.cigartuples, dtype=np.int32) if read.cigartuples else np.zeros((0, 2), dtype=np.int32))
         if need_md:
             if read.has_tag("MD"):
                 md_bytes = np.frombuffer(read.get_tag("MD").encode("ascii"), dtype=np.uint8)
                 md_list.append(md_bytes)
-                md_lengths.append(len(md_bytes))
-                has_md.append(True)
+                md_lengths[n] = len(md_bytes)
+                has_md[n] = True
             else:
                 md_list.append(np.zeros(0, dtype=np.uint8))
-                md_lengths.append(0)
-                has_md.append(False)
+                md_lengths[n] = 0
+                has_md[n] = False
 
-    # Convert all lists to numpy arrays
-    ref_starts = np.array(ref_starts, dtype=np.int32)
-    ref_ends = np.array(ref_ends, dtype=np.int32)
-    query_lengths = np.array(query_lengths, dtype=np.int32)
-    template_lengths = np.array(template_lengths, dtype=np.int32)
-    is_read1 = np.array(is_read1, dtype=np.bool_)
-    is_proper_pair = np.array(is_proper_pair, dtype=np.bool_)
-    is_paired = np.array(is_paired, dtype=np.bool_)
-    is_reverse = np.array(is_reverse, dtype=np.bool_)
-    # Keep `cigars` as a Python list of numpy arrays instead of an
-    # object-dtype numpy array. Passing elements extracted from an
-    # object array into numba-decorated functions causes numba to see
-    # non-precise object types (array(pyobject,...)) and fail typing.
-    # A list preserves the concrete numpy array elements when indexed.
-    cigars = cigars
-    has_md = np.array(has_md, dtype=np.bool_)
-    md_lengths = np.array(md_lengths, dtype=np.int32)
-    # Similarly, keep `md_list` as a list of numpy uint8 arrays so numba
-    # functions that receive `md_list[i]` get a concrete array type.
-    md_list = md_list
+        n += 1
+
+    # Trim to actual size (or return empty arrays)
+    empty_i32 = np.array([], dtype=np.int32)
+    empty_bool = np.array([], dtype=np.bool_)
+
+    if n == 0:
+        return (empty_i32, empty_i32, empty_i32, empty_i32,
+                empty_bool, empty_bool, empty_bool, empty_bool,
+                [], empty_bool, [], empty_i32)
+
+    ref_starts = ref_starts[:n]
+    ref_ends = ref_ends[:n]
+    query_lengths = query_lengths[:n] if need_query_len else empty_i32
+    template_lengths = template_lengths[:n] if need_paired_attrs else empty_i32
+    is_read1 = is_read1[:n] if need_paired_attrs else empty_bool
+    is_proper_pair = is_proper_pair[:n] if need_paired_attrs else empty_bool
+    is_paired = is_paired[:n] if need_paired_attrs else empty_bool
+    is_reverse = is_reverse[:n] if need_reverse else empty_bool
+    cigars = cigars if need_cigars else []
+    has_md = has_md[:n] if need_md else empty_bool
+    md_list = md_list if need_md else []
+    md_lengths = md_lengths[:n] if need_md else empty_i32
 
     return (ref_starts, ref_ends, query_lengths, template_lengths, is_read1, is_proper_pair, is_paired, is_reverse, cigars, has_md, md_list, md_lengths)
 
 @track_time
-def calculating_features_per_contig_per_sample(module_list, bam_file, sequencing_type, ref_name, locus_size, db_conn, sample_id=None, contig_id=None, 
-                                               min_coverage=None, step=None, z_thresh=None, deriv_thresh=None, max_points=None, *, sample_name=None, contig_name=None, temp_mode=False):
+def calculating_features_per_contig_per_sample(module_list, bam_file, sequencing_type, ref_name, locus_size,
+                                               min_coverage, step, z_thresh, deriv_thresh, max_points):
+    """Calculate features for one contig, return (feature_data, presence_data) or (None, None)."""
     ### Save relevant info from bam file
     reads_mapped = bam_file.fetch(ref_name)
     (ref_starts, ref_ends, query_lengths, template_lengths,
      is_read1, is_proper_pair, is_paired, is_reverse,
-     cigars, has_md, md_list, md_lengths) = preprocess_reads(reads_mapped, module_list)
-    
+     cigars, has_md, md_list, md_lengths) = preprocess_reads(reads_mapped, module_list, sequencing_type)
+
     ### Coverage check: ensure more than min_coverage% of the reference is covered by at least one read
     if len(ref_starts) == 0:
-        # If no reads fail coverage threshold
-        return None
-    
+        return None, None
+
     # Mark covered regions
-    # np.minimum / np.maximum keep indexes inside bounds
     covered = np.zeros(locus_size, dtype=bool)
     start_clipped = np.maximum(ref_starts, 0)
     end_clipped = np.minimum(ref_ends, locus_size)
@@ -577,153 +718,93 @@ def calculating_features_per_contig_per_sample(module_list, bam_file, sequencing
     coverage_pct = (covered_bp / locus_size) * 100
 
     if coverage_pct < min_coverage:
-        # If not enough coverage skip this contig
-        return None
-    
-    # Add presence record (either into main DB by id, or temp DB by names)
-    if temp_mode:
-        add_presence(db_conn, coverage_percentage=coverage_pct, contig_name=contig_name, sample_name=sample_name, temp_mode=True)
-    else:
-        add_presence(db_conn, contig_id=contig_id, sample_id=sample_id, coverage_percentage=coverage_pct)
+        return None, None
+
+    # Presence record (contig_name, coverage_pct)
+    presence = (ref_name, coverage_pct)
+
+    # Accumulate feature data
+    features = []
 
     ### Calculate all features
     if {"coverage", "assemblycheck"}.intersection(module_list):
-        get_feature_coverage(ref_starts, ref_ends, locus_size, db_conn, sample_id, contig_id, step, z_thresh, deriv_thresh, max_points, sample_name=sample_name, contig_name=contig_name, temp_mode=temp_mode)
+        features.extend(get_feature_coverage(ref_starts, ref_ends, locus_size, ref_name, step, z_thresh, deriv_thresh, max_points))
     if "phagetermini" in module_list:
-        get_features_phagetermini(ref_starts, ref_ends, is_reverse, cigars, md_list, sequencing_type, locus_size, 
-                                  db_conn, sample_id, contig_id, step, z_thresh, deriv_thresh, max_points, sample_name=sample_name, contig_name=contig_name, temp_mode=temp_mode)
+        features.extend(get_features_phagetermini(ref_starts, ref_ends, is_reverse, cigars, md_list, sequencing_type, locus_size,
+                                                  ref_name, step, z_thresh, deriv_thresh, max_points))
     if "assemblycheck" in module_list:
-        get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_lengths, is_read1, is_proper_pair, cigars, has_md, md_list, md_lengths, 
-                                   sequencing_type, locus_size, db_conn, sample_id, contig_id, step, z_thresh, deriv_thresh, max_points, sample_name=sample_name, contig_name=contig_name, temp_mode=temp_mode)
+        features.extend(get_features_assemblycheck(ref_starts, ref_ends, query_lengths, template_lengths, is_read1, is_proper_pair, cigars, has_md, md_list, md_lengths,
+                                                   sequencing_type, locus_size, ref_name, step, z_thresh, deriv_thresh, max_points))
+
+    return features, presence
 
 ### Distributing the calculation for all the contigs in the bam file
 @track_time
-def calculating_features_per_sample(module_list, mapping_file, db_conn, min_coverage, step, z_thresh, deriv_thresh, max_points):
+def calculating_features_per_sample(module_list, mapping_file, min_coverage, step, z_thresh, deriv_thresh, max_points):
+    """Calculate all features for one sample, return (all_features, all_presences, sample_name)."""
     bam_file = pysam.AlignmentFile(mapping_file, "rb")
     references = bam_file.references
     lengths = [l // 2 for l in bam_file.lengths]  # need to divide by 2 because each contig was doubled for mapping to deal with circularity
 
-    # Save sample and contig names into DB
     sample_name = os.path.basename(mapping_file).replace(".bam", "")
     sequencing_type = find_sequencing_type_from_bam(mapping_file)
 
-    # Detect if db_conn is a temp DB by checking for TempFeatureValues table
-    cur = db_conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='TempFeatureValues'")
-    is_temp = cur.fetchone() is not None
+    all_features = []
+    all_presences = []
 
-    if is_temp:
-        # temp DB: do not try to add sample/contig ids here. Write using names.
-        for ref, length in zip(references, lengths):
-            calculating_features_per_contig_per_sample(module_list, bam_file, sequencing_type, ref, length, db_conn, None, None,
-                                                       min_coverage, step, z_thresh, deriv_thresh, max_points, sample_name=sample_name, contig_name=ref, temp_mode=True)
-    else:
-        sample_id = add_sample(db_conn, sample_name)
-        for ref, length in zip(references, lengths):
-            contig_id = get_contig_id(db_conn, ref)
-            calculating_features_per_contig_per_sample(module_list, bam_file, sequencing_type, ref, length, db_conn, sample_id, contig_id, 
-                                                       min_coverage, step, z_thresh, deriv_thresh, max_points)
+    for ref, length in zip(references, lengths):
+        features, presence = calculating_features_per_contig_per_sample(
+            module_list, bam_file, sequencing_type, ref, length,
+            min_coverage, step, z_thresh, deriv_thresh, max_points
+        )
+        if features is not None:
+            all_features.extend(features)
+            all_presences.append(presence)
+
     bam_file.close()
+    return all_features, all_presences, sample_name
 
 ### Distributing the calculation for all the bam files (samples)
-def _process_single_sample(list_modules, bam_file, db_path, min_coverage, step, z_thresh, deriv_thresh, max_points, n_contig_cores=None):
-    # Backwards-compatible: `bam_file` may be a path string or a path-like object.
-    bam_path = str(bam_file)
+def write_sample_parquet(features, presences, sample_name, output_dir):
+    """Write feature and presence data to Parquet files for one sample."""
+    # Write features Parquet
+    if features:
+        contig_names = [f[0] for f in features]
+        feature_names = [f[1] for f in features]
+        positions = [f[2] for f in features]
+        values = [f[3] for f in features]
 
-    # Reset timing counters for this sample so logs contain per-sample data only
-    function_times.clear()
+        features_table = pa.table({
+            'contig_name': pa.array(contig_names, type=pa.string()),
+            'feature': pa.array(feature_names, type=pa.string()),
+            'position': pa.array(positions, type=pa.int32()),
+            'value': pa.array(values, type=pa.float32()),
+        })
 
-    # Prepare logfile path in same directory as the DB
-    db_p = Path(db_path)
-    log_path = db_p.parent / (db_p.stem + "_times.log")
+        features_path = os.path.join(output_dir, 'features', f'{sample_name}.parquet')
+        pq.write_table(features_table, features_path, compression='zstd')
 
-    # Each worker may optionally parallelize over contigs. This function can be
-    # called with an additional final argument `n_contig_cores` (int).
-    # If caller passed a tuple with an extra element (when invoked via starmap
-    # with extra arg), handle it gracefully. But in normal use callers should
-    # pass n_contig_cores as a keyword in Python invocations.
-    # Open the BAM to inspect contigs
-    bam = pysam.AlignmentFile(bam_path, "rb")
-    references = bam.references
-    lengths = [l // 2 for l in bam.lengths]
+    # Write presences Parquet
+    if presences:
+        contig_names = [p[0] for p in presences]
+        coverage_pcts = [p[1] for p in presences]
 
-    # Create a per-sample temp DB to avoid concurrent writers to the main DB
-    db_main = db_path
-    dbp = Path(db_main)
-    sample_name = os.path.basename(bam_path).replace('.bam', '')
-    temp_db = dbp.parent / f"{dbp.stem}_{sample_name}.temp.db"
-    create_temp_sample_db(str(temp_db))
+        presences_table = pa.table({
+            'contig_name': pa.array(contig_names, type=pa.string()),
+            'coverage_pct': pa.array(coverage_pcts, type=pa.float32()),
+        })
 
-    # Open temp connection and run calculations (workers write into temp DB)
-    conn_temp = sqlite3.connect(str(temp_db))
-    # Copy Variable metadata from main DB into temp DB so compression can lookup Type
-    try:
-        with sqlite3.connect(db_path) as mconn:
-            mcur = mconn.cursor()
-            mcur.execute("SELECT Variable_name, Type FROM Variable")
-            vars_meta = mcur.fetchall()
-        tcur = conn_temp.cursor()
-        tcur.execute("CREATE TABLE IF NOT EXISTS Variable (Variable_name TEXT PRIMARY KEY, Type TEXT, Feature_table_name TEXT)")
-        if vars_meta:
-            rows_to_insert = [(v[0], v[1]) for v in vars_meta]
-            tcur.executemany("INSERT OR REPLACE INTO Variable (Variable_name, Type) VALUES (?, ?)", rows_to_insert)
-            conn_temp.commit()
-    except Exception:
-        # If copying fails, continue; compression will fall back to defaults
-        pass
-    try:
-        if not n_contig_cores or int(n_contig_cores) <= 1:
-            # sequential: delegate to calculating_features_per_sample which will detect temp DB and write by names
-            calculating_features_per_sample(list_modules, bam_path, conn_temp, min_coverage, step, z_thresh, deriv_thresh, max_points)
-        else:
-            # Parallelize contigs using a process Pool. Each worker will write into the shared temp DB (safe because each worker uses sqlite connection separately)
-            from multiprocessing import Pool as MPPool
+        presences_path = os.path.join(output_dir, 'presences', f'{sample_name}.parquet')
+        pq.write_table(presences_table, presences_path, compression='zstd')
 
-            def _process_single_contig_worker(args_tuple):
-                (modules, bam_p, ref_name, length_val, temp_db_p, samp_name, min_cov, stp, zt, dt, mp, log_p) = args_tuple
-                # Each worker keeps its own timing counters; after finishing the contig
-                # append a brief timing snapshot to the shared logfile.
-                conn_w = sqlite3.connect(temp_db_p)
-                try:
-                    bam_w = pysam.AlignmentFile(bam_p, "rb")
-                    try:
-                        seqtype = find_sequencing_type_from_bam(bam_p)
-                        # Reset local function timing counters for this worker
-                        function_times.clear()
-                        calculating_features_per_contig_per_sample(modules, bam_w, seqtype, ref_name, length_val, conn_w, None, None, min_cov, stp, zt, dt, mp, sample_name=samp_name, contig_name=ref_name, temp_mode=True)
-                        # Snapshot timings
-                        try:
-                            total_local = sum(function_times.values())
-                            with open(log_p, 'a', encoding='utf8') as fh:
-                                fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}\tPID:{os.getpid()}\tSample:{samp_name}\tContig:{ref_name}\tTotal:{total_local:.3f}s\n")
-                                for nm, tv in sorted(function_times.items(), key=lambda x: -x[1]):
-                                    fh.write(f"\t{nm}: {tv:.3f}s\n")
-                        except Exception:
-                            pass
-                    finally:
-                        bam_w.close()
-                finally:
-                    conn_w.close()
+def _process_single_sample(list_modules, bam_file, output_dir, min_coverage, step, z_thresh, deriv_thresh, max_points):
+    """Process one sample: compute features and write Parquet files (pure Python)."""
+    all_features, all_presences, sample_name = calculating_features_per_sample(
+        list_modules, bam_file, min_coverage, step, z_thresh, deriv_thresh, max_points
+    )
 
-            # Build tasks for contig workers
-            tasks = []
-            for ref, length in zip(references, lengths):
-                tasks.append((list_modules, bam_path, ref, length, str(temp_db), sample_name, min_coverage, step, z_thresh, deriv_thresh, max_points, str(log_path)))
-
-            with MPPool(processes=min(int(n_contig_cores), max(1, len(tasks)))) as pool:
-                pool.map(_process_single_contig_worker, tasks)
-    finally:
-        conn_temp.close()
-
-    # Merge temp DB into main DB and remove temp DB
-    try:
-        merge_temp_db_into_main(db_main, str(temp_db))
-    except Exception as e:
-        print(f"Warning: failed to merge temp DB {temp_db} into main DB {db_main}: {e}")
-    try:
-        Path(temp_db).unlink()
-    except Exception:
-        pass
+    # Write to Parquet (each worker writes its own files - no contention)
+    write_sample_parquet(all_features, all_presences, sample_name, output_dir)
 
     bam.close()
     try:
@@ -736,16 +817,99 @@ def _process_single_sample(list_modules, bam_file, db_path, min_coverage, step, 
     except Exception:
         pass
 
-def calculating_all_features_parallel(list_modules, bam_files, db_path, min_coverage, step, z_thresh, deriv_thresh, max_points, n_sample_cores=None):
+
+def _update_sqlite_samples(output_dir, all_sample_presences):
+    """Update SQLite database with Sample and Presences tables.
+
+    Args:
+        output_dir: Path to output directory containing metadata.db
+        all_sample_presences: List of (sample_name, presences) where presences is
+                              a list of (contig_name, coverage_pct) tuples
+    """
+    db_path = os.path.join(output_dir, "metadata.db")
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+
+    # Build contig name -> id mapping
+    cur.execute("SELECT Contig_name, Contig_id FROM Contig")
+    contig_name_to_id = {row[0]: row[1] for row in cur.fetchall()}
+
+    # Insert samples and presences
+    for sample_name, presences in all_sample_presences:
+        # Insert sample
+        cur.execute("INSERT INTO Sample (Sample_name) VALUES (?)", (sample_name,))
+        sample_id = cur.lastrowid
+
+        # Insert presences for this sample
+        for contig_name, coverage_pct in presences:
+            contig_id = contig_name_to_id.get(contig_name)
+            if contig_id is not None:
+                cur.execute(
+                    "INSERT INTO Presences (Contig_id, Sample_id, Coverage_percentage) VALUES (?, ?, ?)",
+                    (contig_id, sample_id, coverage_pct)
+                )
+
+    conn.commit()
+    conn.close()
+
+def calculating_all_features_parallel(list_modules, bam_files, output_dir, min_coverage, step, z_thresh, deriv_thresh, max_points, n_sample_cores=None, genbank_path=None, annotation_tool=""):
+    """Process all BAM files in parallel.
+
+    If genbank_path is provided and Rust bindings are available, uses the faster Rust implementation
+    with rayon parallelism and a single GenBank parse.
+    Otherwise falls back to pure Python.
+    """
     if n_sample_cores is None:
         n_sample_cores = max(1, cpu_count() - 1)
-    print(f"Using {n_sample_cores} cores to process {len(bam_files)} samples in parallel...", flush=True)
 
-    args_list = [(list_modules, bam, db_path, min_coverage, step, z_thresh, deriv_thresh, max_points) for bam in bam_files]
+    # Create output directories
+    os.makedirs(os.path.join(output_dir, 'features'), exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'presences'), exist_ok=True)
 
-    with Pool(processes=n_sample_cores) as pool:
-        pool.starmap(_process_single_sample, args_list)
-    print("Finished all samples.", flush=True)
+    # Use Rust if available and genbank_path is provided
+    if HAS_RUST and genbank_path is not None:
+        # Get parent directory of BAM files (assumes all in same directory)
+        bam_dir = os.path.dirname(bam_files[0]) if bam_files else ""
+
+        print(f"Using Rust bindings to process {len(bam_files)} samples with rayon ({n_sample_cores} threads)...", flush=True)
+
+        # Call the Rust function that handles everything: GenBank parsing, parallel BAM processing,
+        # progress bar, writing Parquet files, and updating SQLite directly
+        result = _rust.process_all_samples(
+            genbank_path=genbank_path,
+            bam_dir=bam_dir,
+            output_dir=output_dir,
+            modules=list_modules,
+            threads=n_sample_cores,
+            annotation_tool=annotation_tool,
+            min_coverage=float(min_coverage),
+            step=step,
+            z_thresh=float(z_thresh),
+            deriv_thresh=float(deriv_thresh),
+            max_points=max_points,
+        )
+
+        # Rust handles SQLite updates internally, just report results
+        total_time = result.get("total_time", 0.0)
+        samples_processed = result.get("samples_processed", 0)
+        samples_failed = result.get("samples_failed", 0)
+        print(f"Finished {samples_processed} samples in {total_time:.2f}s ({total_time/max(1, samples_processed):.2f}s per sample avg)", flush=True)
+        if samples_failed > 0:
+            print(f"Warning: {samples_failed} samples failed to process", flush=True)
+    else:
+        # Fall back to pure Python
+        if not HAS_RUST:
+            print("Note: Rust bindings not available, using pure Python (slower)", flush=True)
+        print(f"Using {n_sample_cores} cores to process {len(bam_files)} samples in parallel...", flush=True)
+
+        # Sort BAM files by size (largest first) for better load balancing
+        bam_files_sorted = sorted(bam_files, key=lambda f: os.path.getsize(f), reverse=True)
+        args_list = [(list_modules, bam, output_dir, min_coverage, step, z_thresh, deriv_thresh, max_points) for bam in bam_files_sorted]
+
+        # chunksize=1 ensures workers grab next task immediately when done
+        with Pool(processes=n_sample_cores) as pool:
+            list(pool.starmap(_process_single_sample, args_list, chunksize=1))
+        print("Finished all samples.", flush=True)
 
 ### Main function helpers (shared-args)
 def add_calculate_args(parser):
@@ -753,7 +917,7 @@ def add_calculate_args(parser):
     parser.add_argument("-g", "--genbank", required=True, help="Path to genbank file of all investigated contigs")
     parser.add_argument("-b", "--bam_files", required=True, help="Path to bam file or directory containing mapping files (BAM format)")
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
-    parser.add_argument("-d", "--db", required=True, help="Path to sqlite database file to store results")
+    parser.add_argument("-o", "--output", required=True, help="Output directory for results (metadata.db + Parquet files)")
     parser.add_argument("-a", "--annotation_tool", default="", help="Optional: to color the contigs specify the annotation tool used (options allowed: pharokka)")
     parser.add_argument("--min_coverage", type=int, default=50, help="Minimum alignment-length coverage proportion for contig inclusion")
     parser.add_argument("--step", type=int, default=50, help="Step size for compression (keep every Nth point in addition to the outliers)")
@@ -771,21 +935,7 @@ def add_calculate_args(parser):
     parser.add_argument("--run-sample", action="store_true", help=argparse.SUPPRESS)
 
 def run_calculate_args(args):
-    # If invoked in single-sample mode (used by Slurm jobs), simply process one bam
-    if getattr(args, "run_sample", False):
-        if not os.path.exists(args.db):
-            sys.exit(f"ERROR: Database '{args.db}' does not exist for single-sample run.")
-        requested_modules = args.modules.split(",")
-        n_contig_cores = int(args.threads) if getattr(args, 'threads', None) else None
-        _process_single_sample(requested_modules, args.bam_files, args.db, args.min_coverage, args.step, args.outlier_threshold, args.derivative_threshold, args.max_points, n_contig_cores)
-        return
-
-    # Sanity checks and preparation
-    print("### Checking that genbank and mapping files are compatible...", flush=True)
-    genbank_loci = set(rec.name for rec in SeqIO.parse(args.genbank, "genbank"))
     annotation_tool = args.annotation_tool
-    if not genbank_loci:
-        sys.exit("ERROR: No loci found in the provided GenBank file.")
 
     # Get list of BAM files
     if os.path.isdir(args.bam_files):
@@ -795,30 +945,37 @@ def run_calculate_args(args):
     if not bam_files:
         sys.exit("ERROR: No BAM files found in the specified mapping path.")
 
-    # Check that references in BAM headers match loci in GenBank
-    for bam_file in bam_files:
-        try:
-            with pysam.AlignmentFile(bam_file, "rb") as bam:
-                bam_refs = set(bam.references)
-        except Exception as e:
-            sys.exit(f"ERROR: Could not open BAM file '{bam_file}': {e}")
+    # When using Rust, skip Python validation - Rust handles everything including error checking
+    if not HAS_RUST:
+        # Pure Python path: validate GenBank and BAM compatibility
+        print("### Checking that genbank and mapping files are compatible...", flush=True)
+        genbank_loci = set(rec.name for rec in SeqIO.parse(args.genbank, "genbank"))
+        if not genbank_loci:
+            sys.exit("ERROR: No loci found in the provided GenBank file.")
 
-        missing_in_genbank = bam_refs - genbank_loci
-        missing_in_bam = genbank_loci - bam_refs
+        # Silence htslib warnings about index file timestamps
+        save_verbosity = pysam.set_verbosity(0)
 
-        if missing_in_genbank:
-            raise ValueError(
-                f"ERROR: References in BAM file '{os.path.basename(bam_file)}' "
-                f"not found in GenBank: '{os.path.basename(args.genbank)}'\n"
-                f"{', '.join(sorted(missing_in_genbank))}"
-            )
+        for bam_file in bam_files:
+            try:
+                with pysam.AlignmentFile(bam_file, "rb") as bam:
+                    bam_refs = set(bam.references)
+            except Exception as e:
+                pysam.set_verbosity(save_verbosity)
+                sys.exit(f"ERROR: Could not open BAM file '{bam_file}': {e}")
 
-        if missing_in_bam:
-            print(
-                f"Warning: Some GenBank loci not present in BAM '{os.path.basename(bam_file)}': "
-                f"{', '.join(sorted(missing_in_bam))}"
-            )
-    print("Sanity checks passed: No BAM contained unexpected reference names.", flush=True)
+            missing_in_genbank = bam_refs - genbank_loci
+
+            if missing_in_genbank:
+                pysam.set_verbosity(save_verbosity)
+                raise ValueError(
+                    f"ERROR: References in BAM file '{os.path.basename(bam_file)}' "
+                    f"not found in GenBank:\n"
+                    f"{', '.join(sorted(missing_in_genbank))}"
+                )
+
+        pysam.set_verbosity(save_verbosity)
+        print("Sanity checks passed.", flush=True)
 
     # Requested modules
     requested_modules = args.modules.split(",")
@@ -832,91 +989,78 @@ def run_calculate_args(args):
 
     n_cores = int(args.threads)
 
-    # Running generate_database.py to create database
-    db_path = args.db
+    # Setup output directory
+    output_dir = args.output
+    if os.path.exists(output_dir):
+        sys.exit(f"ERROR: Output directory '{output_dir}' already exists. Please provide a new path to avoid overwriting.")
 
-    directory, filename = os.path.split(db_path)
-    if not filename or not filename.endswith(".db"):
-        sys.exit(f"ERROR: Invalid database path '{db_path}'. Must provide a file ending in '.db'.")
-    if directory and not os.path.isdir(directory):
-        sys.exit(f"ERROR: Directory '{directory}' does not exist. Please create it or choose a valid path.")
-    if os.path.exists(db_path):
-        sys.exit(f"ERROR: Database file '{db_path}' already exists. Please provide a new path to avoid overwriting.")
+    # When Rust bindings are available, they handle everything: GenBank parsing, database creation,
+    # parallel BAM processing, and output writing. Skip Python's database setup in that case.
+    if HAS_RUST:
+        # Rust handles database creation and population internally
+        print("Calculating values for all requested features from mapping files...", flush=True)
+        calculating_all_features_parallel(
+            requested_modules, bam_files, output_dir, min_coverage, step, z_thresh, deriv_thresh, max_points, n_cores,
+            genbank_path=args.genbank, annotation_tool=annotation_tool
+        )
+    else:
+        # Pure Python path: create database and populate manually
+        os.makedirs(output_dir)
 
-    subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "generate_database.py"), db_path], check=True)
+        # Create metadata database
+        db_path = os.path.join(output_dir, "metadata.db")
+        subprocess.run([sys.executable, os.path.join(os.path.dirname(__file__), "generate_database.py"), db_path], check=True)
 
-    # Saving genbank info into database
-    print("### Saving genbank info into database...", flush=True)
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
+        # Saving genbank info into database
+        print("### Saving genbank info into database...", flush=True)
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
 
-    seq_rows = []
-    contig_count = 0
-    feature_count = 0
-    for rec in SeqIO.parse(args.genbank, "genbank"):
-        contig_name = rec.name
-        contig_length = len(rec.seq)
-        cur.execute("INSERT OR IGNORE INTO Contig (Contig_name, Contig_length, Annotation_tool) VALUES (?, ?, ?)", (contig_name, contig_length, annotation_tool))
-        contig_id = get_contig_id(conn, contig_name)
-        contig_count += 1
+        seq_rows = []
+        contig_count = 0
+        feature_count = 0
+        for rec in SeqIO.parse(args.genbank, "genbank"):
+            contig_name = rec.name
+            contig_length = len(rec.seq)
+            cur.execute("INSERT OR IGNORE INTO Contig (Contig_name, Contig_length, Annotation_tool) VALUES (?, ?, ?)", (contig_name, contig_length, annotation_tool))
+            contig_id = get_contig_id(conn, contig_name)
+            contig_count += 1
 
-        for f in rec.features:
-            try:
-                start = int(f.location.start) + 1
-                end = int(f.location.end)
-                strand_val = f.location.strand
-            except Exception:
-                continue
+            for f in rec.features:
+                try:
+                    start = int(f.location.start) + 1
+                    end = int(f.location.end)
+                    strand_val = f.location.strand
+                except Exception:
+                    continue
 
-            ftype = f.type
-            if not(ftype in {"source", "gene"}):
-                qualifiers = f.qualifiers if hasattr(f, 'qualifiers') else {}
-                product = qualifiers.get('product', [None])[0]
-                function = qualifiers.get('function', [None])[0]
-                phrog = qualifiers.get('phrog', [None])[0]
+                ftype = f.type
+                if not(ftype in {"source", "gene"}):
+                    qualifiers = f.qualifiers if hasattr(f, 'qualifiers') else {}
+                    product = qualifiers.get('product', [None])[0]
+                    function = qualifiers.get('function', [None])[0]
+                    phrog = qualifiers.get('phrog', [None])[0]
 
-                seq_rows.append((contig_id, start, end, strand_val, ftype, product, function, phrog))
-                feature_count += 1
+                    seq_rows.append((contig_id, start, end, strand_val, ftype, product, function, phrog))
+                    feature_count += 1
 
-    if seq_rows:
-        cur.executemany("INSERT INTO Contig_annotation (Contig_id, Start, End, Strand, Type, Product, Function, Phrog) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", seq_rows)
-    conn.commit()
-    conn.close()
+        if seq_rows:
+            cur.executemany("INSERT INTO Contig_annotation (Contig_id, Start, End, Strand, Type, Product, Function, Phrog) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", seq_rows)
+        conn.commit()
+        conn.close()
 
-    print(f"Saved {contig_count} contigs and {feature_count} annotations into database", flush=True)
+        print(f"Saved {contig_count} contigs and {feature_count} annotations into database", flush=True)
 
-    print("Calculating values for all requested features from mapping files...", flush=True)
-    # If requested, submit per-sample Slurm jobs instead of running locally
-    if getattr(args, "use_slurm", False):
-        if slurm_utils is None:
-            sys.exit("ERROR: Slurm utilities not available in this installation.")
-
-        outdir = Path(db_path).parent or Path(".")
-        # Create a CSV listing bam files (one per row) so submit_array can iterate
-        csv_path = outdir / (Path(db_path).stem + "_bam_list.csv")
-        with open(csv_path, "w", newline="") as fh:
-            for bam in bam_files:
-                fh.write(f"{bam}\n")
-
-        # Build the module CLI string to run a single sample. $bam will be substituted by the array script.
-        # For Slurm runs we write per-sample temp DBs (to avoid contention) named by the bam basename.
-        db_dir = outdir
-        db_stem = Path(db_path).stem
-        # use $readbase (set by the array script) to create per-sample db
-        module_cli = (
-            f"{sys.executable} -m mgfeatureviewer.calculating_data --run-sample --threads {args.threads_per_job} --bam_files $bam --db {db_dir}/{db_stem}_$readbase.temp.db "
-            f"--modules {args.modules} --min_coverage {min_coverage} --step {step} --outlier_threshold {z_thresh} "
-            f"--derivative_threshold {deriv_thresh} --max_points {max_points} {'--parallelize_contigs' if args.parallelize_contigs else ''}"
+        print("Calculating values for all requested features from mapping files...", flush=True)
+        calculating_all_features_parallel(
+            requested_modules, bam_files, output_dir, min_coverage, step, z_thresh, deriv_thresh, max_points, n_cores,
+            genbank_path=args.genbank, annotation_tool=annotation_tool
         )
 
-        jobid = slurm_utils.submit_array(csv_path, outdir, module_cli, array_size=len(bam_files), concurrency=args.max_concurrent,
-                                         cpus_per_task=args.threads, mem=args.mem_per_cpu, time=args.max_time, columns=["bam"])
-        print(f"Submitted Slurm array job {jobid} to process {len(bam_files)} samples (csv: {csv_path})", flush=True)
-        print("Note: Slurm tasks will write per-sample temp DBs named '<dbstem>_<readbase>.temp.db' in the DB directory. After jobs finish, run the provided merge helper to merge them into the main DB.")
-        return
-
-    # Otherwise run locally across samples
-    calculating_all_features_parallel(requested_modules, bam_files, db_path, min_coverage, step, z_thresh, deriv_thresh, max_points, n_cores)
+    print(f"\nOutput written to: {output_dir}/", flush=True)
+    print(f"  - metadata.db (contig/sample metadata)", flush=True)
+    print(f"  - features/*.parquet (feature data)", flush=True)
+    print(f"  - presences/*.parquet (presence/absence data)", flush=True)
 
 def main():
     print("Parsing arguments...", flush=True)

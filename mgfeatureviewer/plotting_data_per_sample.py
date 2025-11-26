@@ -8,6 +8,7 @@ from bokeh.plotting import output_file, save, figure
 from dna_features_viewer import BiopythonTranslator
 
 from . import colors_for_genbank
+from .data_accessor import DataAccessor
 
 ### Custom translator for coloring and labeling features (with DNAFeaturesViewer python library)
 class CustomTranslator(BiopythonTranslator):
@@ -167,7 +168,23 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None):
     return p
 
 ### Function to get features of one variable
-def get_feature_data(cur, feature, contig_id, sample_id):
+def get_feature_data(cur, feature, contig_id, sample_id, accessor=None, contig_name=None, sample_name=None):
+    """Get feature data for plotting.
+
+    Args:
+        cur: SQLite cursor (used for SQLite-only mode or metadata queries)
+        feature: Feature name to query
+        contig_id: Contig ID
+        sample_id: Sample ID
+        accessor: Optional DataAccessor for parquet mode
+        contig_name: Contig name (required for parquet mode)
+        sample_name: Sample name (required for parquet mode)
+    """
+    # If accessor provided, use it (supports both SQLite and Parquet)
+    if accessor is not None:
+        return accessor.get_feature_data(feature, contig_id, sample_id, contig_name, sample_name)
+
+    # Legacy SQLite-only mode
     list_feature_dict = []
 
     # Query Variable table to get rendering info and feature table name
@@ -197,7 +214,19 @@ def get_feature_data(cur, feature, contig_id, sample_id):
     return list_feature_dict
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=130):
+def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=130, accessor=None):
+    """Generate a Bokeh plot for a single sample.
+
+    Args:
+        conn: SQLite connection (used for metadata queries)
+        list_features: List of features to plot
+        contig_name: Name of the contig to plot
+        sample_name: Name of the sample to plot
+        xstart: Optional x-axis start position
+        xend: Optional x-axis end position
+        subplot_size: Height of each subplot in pixels
+        accessor: Optional DataAccessor for parquet mode
+    """
     cur = conn.cursor()
 
     # Get contig characteristics
@@ -231,7 +260,8 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
     requested_features = parse_requested_features(list_features)
 
     for feature in requested_features:
-        list_feature_dict = get_feature_data(cur, feature, contig_id, sample_id)
+        list_feature_dict = get_feature_data(cur, feature, contig_id, sample_id,
+                                             accessor=accessor, contig_name=contig_name, sample_name=sample_name)
         if all(len(vals["x"]) == 0 for vals in list_feature_dict):
             continue
 
