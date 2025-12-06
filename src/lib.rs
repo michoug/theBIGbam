@@ -33,7 +33,7 @@ pub mod types;
 pub use bam_reader::{detect_sequencing_type, process_contig_streaming};
 pub use cigar::{Cigar, CigarElement, CigarOp, MdTag};
 pub use circular::CircularArray;
-pub use compress::{compress_signal, compress_signal_with_reference};
+pub use compress::compress_signal_with_reference;
 pub use features::{process_read, FeatureArrays, ModuleFlags};
 pub use genbank::parse_genbank;
 pub use processing::{process_sample, run_all_samples, ProcessConfig, ProcessResult};

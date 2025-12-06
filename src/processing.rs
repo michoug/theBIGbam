@@ -21,7 +21,7 @@ use std::sync::Mutex;
 use walkdir::WalkDir;
 
 use crate::bam_reader::{detect_sequencing_type, process_contig_streaming};
-use crate::compress::{compress_signal, compress_signal_with_reference};
+use crate::compress::compress_signal_with_reference;
 use crate::db::{
     create_metadata_db, create_temp_sample_db, finalize_db, merge_temp_db_into_main,
     write_features_to_temp_db, write_presences_to_temp_db,
@@ -29,8 +29,7 @@ use crate::db::{
 use crate::features::{FeatureArrays, ModuleFlags};
 use crate::genbank::parse_genbank;
 use crate::types::{
-    get_plot_type, ContigInfo, FeaturePoint, PresenceData, ASSEMBLYCHECK_FEATURES,
-    PHAGETERMINI_FEATURES,
+    get_plot_type, ContigInfo, FeaturePoint, PlotType, PresenceData, ASSEMBLYCHECK_FEATURES
 };
 
 /// Configuration for processing.
@@ -128,26 +127,59 @@ fn add_features_from_arrays(
         
         // reads_starts and reads_ends (bars, use coverage_reduced as reference)
         let reads_starts: Vec<f64> = arrays.reads_starts.iter().map(|&x| x as f64).collect();
-        add_compressed_feature_with_reference(&reads_starts, Some(&coverage_reduced_f64), "reads_starts", contig_name, config, output);
+        let reads_starts_runs = compress_signal_with_reference(&reads_starts, Some(&coverage_reduced_f64), PlotType::Bars, config.compress_ratio);
         
         let reads_ends: Vec<f64> = arrays.reads_ends.iter().map(|&x| x as f64).collect();
-        add_compressed_feature_with_reference(&reads_ends, Some(&coverage_reduced_f64), "reads_ends", contig_name, config, output);
+        let reads_ends_runs = compress_signal_with_reference(&reads_ends, Some(&coverage_reduced_f64), PlotType::Bars, config.compress_ratio);
 
-        // Tau (bars, use coverage_reduced as reference)
-        let tau: Vec<f64> = arrays
-            .coverage_reduced
-            .iter()
-            .zip(&arrays.reads_starts)
-            .zip(&arrays.reads_ends)
-            .map(|((&c, &s), &e)| {
-                if c > 0 {
-                    (s + e) as f64 / c as f64
-                } else {
-                    0.0
+        // Add reads_starts and reads_ends to output
+        output.extend(reads_starts_runs.iter().map(|run| FeaturePoint {
+            contig_name: contig_name.to_string(),
+            feature: "reads_starts".to_string(),
+            start_pos: run.start_pos,
+            end_pos: run.end_pos,
+            value: run.value,
+        }));
+        
+        output.extend(reads_ends_runs.iter().map(|run| FeaturePoint {
+            contig_name: contig_name.to_string(),
+            feature: "reads_ends".to_string(),
+            start_pos: run.start_pos,
+            end_pos: run.end_pos,
+            value: run.value,
+        }));
+
+        // Tau: calculate tau values directly for positions where reads_starts or reads_ends were saved
+        // Merge the runs from both features and calculate tau for those positions
+        for run in reads_starts_runs.iter().chain(reads_ends_runs.iter()) {
+            // Calculate average tau value for this run
+            let mut tau_sum = 0.0;
+            let mut count = 0;
+            
+            for pos in run.start_pos..=run.end_pos {
+                let idx = (pos - 1) as usize; // Convert from 1-indexed to 0-indexed
+                if idx < arrays.coverage_reduced.len() {
+                    let c = arrays.coverage_reduced[idx];
+                    let s = arrays.reads_starts[idx];
+                    let e = arrays.reads_ends[idx];
+                    if c > 0 {
+                        tau_sum += (s + e) as f64 / c as f64;
+                        count += 1;
+                    }
                 }
-            })
-            .collect();
-        add_compressed_feature_with_reference(&tau, Some(&coverage_reduced_f64), "tau", contig_name, config, output);
+            }
+            
+            if count > 0 {
+                let tau_value = tau_sum / count as f64;
+                output.push(FeaturePoint {
+                    contig_name: contig_name.to_string(),
+                    feature: "tau".to_string(),
+                    start_pos: run.start_pos,
+                    end_pos: run.end_pos,
+                    value: tau_value as f32,
+                });
+            }
+        }
     }
 
     // Assemblycheck features (all bars, use main coverage as reference)
@@ -202,6 +234,7 @@ fn add_features_from_arrays(
 }
 
 /// Process one BAM file using streaming (single-pass, optimized).
+/// Parallelizes at the contig level for samples with many contigs.
 pub fn process_sample(
     bam_path: &Path,
     contigs: &[ContigInfo],
@@ -217,47 +250,60 @@ pub fn process_sample(
     let seq_type = detect_sequencing_type(bam_path)?;
     let flags = ModuleFlags::from_modules(modules);
 
-    let mut bam = IndexedReader::from_path(bam_path)
+    // Get number of reference sequences using temporary reader
+    let temp_bam = IndexedReader::from_path(bam_path)
         .with_context(|| format!("Failed to open indexed BAM: {}", bam_path.display()))?;
-    // 4 decompression threads: benchmarked optimal for parallel BAM processing (7% faster than 2)
-    bam.set_threads(4.min(config.threads.max(2)))?;
+    let n_refs = temp_bam.header().target_count();
+    drop(temp_bam);
 
+    // Process contigs in parallel - each gets its own BAM reader
+    // This is critical for samples with many contigs (e.g., 50,000 contigs with 1 sample)
+    let results: Vec<_> = (0..n_refs)
+        .into_par_iter()
+        .filter_map(|tid| {
+            // Each thread gets its own BAM reader
+            let mut bam = IndexedReader::from_path(bam_path).ok()?;
+            // Use 1 decompression thread per reader to avoid I/O contention
+            // Total decompression threads = config.threads (one per parallel contig)
+            bam.set_threads(1).ok()?;
+
+            // Extract header info before mutable borrow
+            let ref_name = std::str::from_utf8(bam.header().tid2name(tid)).ok()?.to_string();
+            let bam_length = bam.header().target_len(tid).unwrap_or(0) as usize;
+            let ref_length = bam_length / 2;
+
+            // Skip if contig not in GenBank list
+            let contig = contigs.iter().find(|c| c.name == ref_name)?;
+
+            // Process contig using streaming - single pass over reads
+            let arrays = process_contig_streaming(&mut bam, &ref_name, ref_length, seq_type, flags).ok()??;
+
+            // Check coverage percentage
+            let coverage_pct = arrays.coverage_percentage();
+            if coverage_pct < config.min_coverage {
+                return None;
+            }
+
+            let presence = PresenceData {
+                contig_name: contig.name.clone(),
+                coverage_pct: coverage_pct as f32,
+            };
+
+            // Calculate features for this contig
+            let mut features = Vec::new();
+            add_features_from_arrays(&arrays, &contig.name, config, flags, seq_type, &mut features);
+
+            Some((features, presence))
+        })
+        .collect();
+
+    // Merge results from all contigs
     let mut all_features = Vec::new();
     let mut all_presences = Vec::new();
-
-    let header = bam.header().clone();
-    let n_refs = header.target_count();
-
-    for tid in 0..n_refs {
-        let ref_name = std::str::from_utf8(header.tid2name(tid)).unwrap_or("");
-        let bam_length = header.target_len(tid).unwrap_or(0) as usize;
-        let ref_length = bam_length / 2;
-
-        // Skip if contig not in GenBank list
-        let contig = match contigs.iter().find(|c| c.name == ref_name) {
-            Some(c) => c,
-            None => continue,
-        };
-
-        // Process contig using streaming - single pass over reads
-        let arrays = match process_contig_streaming(&mut bam, ref_name, ref_length, seq_type, flags)? {
-            Some(a) => a,
-            None => continue,
-        };
-
-        // Check coverage percentage
-        let coverage_pct = arrays.coverage_percentage();
-        if coverage_pct < config.min_coverage {
-            continue;
-        }
-
-        all_presences.push(PresenceData {
-            contig_name: contig.name.clone(),
-            coverage_pct: coverage_pct as f32,
-        });
-
-        // Add features from arrays
-        add_features_from_arrays(&arrays, &contig.name, config, flags, seq_type, &mut all_features);
+    
+    for (features, presence) in results {
+        all_features.extend(features);
+        all_presences.push(presence);
     }
 
     Ok((all_features, all_presences, sample_name))

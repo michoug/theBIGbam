@@ -100,20 +100,28 @@ class DataAccessor:
             x_coords = []
             y_coords = []
             for first_pos, last_pos, value in data_rows:
-                # For visualization, create points at start and end of each run
-                if first_pos == last_pos:
-                    # Singleton point (spike)
-                    x_coords.append(first_pos)
-                    y_coords.append(value)
+                if type_picked == "bars":
+                    # For bars: expand to all positions in the run
+                    # (vbar draws one bar per x-coordinate)
+                    for pos in range(first_pos, last_pos + 1):
+                        x_coords.append(pos)
+                        y_coords.append(value)
                 else:
-                    # Run: add start and end points
-                    x_coords.extend([first_pos, last_pos])
-                    y_coords.extend([value, value])
+                    # For curves: only need start and end points
+                    # (line rendering will connect them)
+                    if first_pos == last_pos:
+                        x_coords.append(first_pos)
+                        y_coords.append(value)
+                    else:
+                        x_coords.extend([first_pos, last_pos])
+                        y_coords.extend([value, value])
             
             feature_dict["x"] = x_coords
             feature_dict["y"] = y_coords
 
-            list_feature_dict.append(feature_dict)
+            # Only append if we have actual data points
+            if x_coords:
+                list_feature_dict.append(feature_dict)
 
         return list_feature_dict
 

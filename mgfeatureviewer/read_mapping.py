@@ -66,7 +66,7 @@ def map_with_minimap2(threads: int, assembly_file: Path, sequencing_type: str, r
             preset = "sr"
 
         minimap2_cmd = [
-            "minimap2", "-ax", preset, "--secondary=no", "-t", str(threads), str(work_assembly), str(read1)
+            "minimap2", "-ax", preset, "-t", str(threads), str(work_assembly), str(read1)
         ]
         if read2:
             minimap2_cmd.append(str(read2))

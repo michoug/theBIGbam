@@ -74,3 +74,7 @@ As a result:
 - Both implementations keep approximately the same number of positions
 - The specific positions kept around derivative outliers differ slightly
 - Values at shared positions are identical
+
+Curve: Self-referential compression
+Bars: Coverage-relative compression (filters insignificant values)
+RatioBars: Saves points where component data exists (for tau)

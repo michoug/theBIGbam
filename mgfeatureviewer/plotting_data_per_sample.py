@@ -85,6 +85,10 @@ def make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool,
     return annotation_fig
 
 def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None):
+    # Sanity check: ensure we have data to plot
+    if not feature_dict or all(len(vals["x"]) == 0 for vals in feature_dict):
+        return None
+    
     p = figure(
         height=height,
         x_range=x_range,
@@ -94,6 +98,11 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None):
     for data_feature in feature_dict:
         xx = data_feature["x"]
         yy = data_feature["y"]
+        
+        # Warn if dataset is very large (can cause browser issues)
+        if len(xx) > 100000:
+            print(f"Warning: Large dataset ({len(xx)} points) may cause browser rendering issues. Consider using a smaller region or higher compression ratio.", flush=True)
+        
         type_picked = data_feature["type"]
         color = data_feature["color"]
         alpha = data_feature["alpha"]
@@ -212,20 +221,28 @@ def get_feature_data(cur, feature, contig_id, sample_id, accessor=None, contig_n
         x_coords = []
         y_coords = []
         for first_pos, last_pos, value in rows:
-            # For visualization, create points at start and end of each run
-            # This preserves the run structure while allowing proper line/bar rendering
-            if first_pos == last_pos:
-                # Singleton point (spike)
-                x_coords.append(first_pos)
-                y_coords.append(value)
+            if type_picked == "bars":
+                # For bars: expand to all positions in the run
+                # (vbar draws one bar per x-coordinate)
+                for pos in range(first_pos, last_pos + 1):
+                    x_coords.append(pos)
+                    y_coords.append(value)
             else:
-                # Run: add start and end points
-                x_coords.extend([first_pos, last_pos])
-                y_coords.extend([value, value])
+                # For curves: only need start and end points
+                # (line rendering will connect them)
+                if first_pos == last_pos:
+                    x_coords.append(first_pos)
+                    y_coords.append(value)
+                else:
+                    x_coords.extend([first_pos, last_pos])
+                    y_coords.extend([value, value])
         
         feature_dict["x"] = x_coords
         feature_dict["y"] = y_coords
-        list_feature_dict.append(feature_dict)
+        
+        # Only append if we have actual data points
+        if x_coords:
+            list_feature_dict.append(feature_dict)
 
     return list_feature_dict
 
@@ -274,20 +291,53 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
     # Requested features are variables like 'coverage', 'reads_starts', etc.
     subplots = []
     requested_features = parse_requested_features(list_features)
+    
+    print(f"DEBUG: Requested features after parsing: {requested_features}", flush=True)
 
     for feature in requested_features:
-        list_feature_dict = get_feature_data(cur, feature, contig_id, sample_id,
-                                             accessor=accessor, contig_name=contig_name, sample_name=sample_name)
-        if all(len(vals["x"]) == 0 for vals in list_feature_dict):
-            continue
+        try:
+            print(f"DEBUG: Processing feature '{feature}'...", flush=True)
+            list_feature_dict = get_feature_data(cur, feature, contig_id, sample_id,
+                                                 accessor=accessor, contig_name=contig_name, sample_name=sample_name)
+            print(f"DEBUG: Feature '{feature}' returned {len(list_feature_dict)} feature dicts", flush=True)
+            for i, fd in enumerate(list_feature_dict):
+                print(f"DEBUG:   Dict {i}: x has {len(fd['x'])} points, y has {len(fd['y'])} points", flush=True)
+            
+            if not list_feature_dict or all(len(vals["x"]) == 0 for vals in list_feature_dict):
+                print(f"Warning: No data found for feature '{feature}' in sample '{sample_name}', contig '{contig_name}'", flush=True)
+                continue
 
-        subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange)
-        if subplot_feature is not None:
-            subplots.append(subplot_feature)
+            subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange)
+            if subplot_feature is not None:
+                subplots.append(subplot_feature)
+                print(f"DEBUG: Feature '{feature}' subplot created successfully", flush=True)
+            else:
+                print(f"DEBUG: Feature '{feature}' make_bokeh_subplot returned None", flush=True)
+        except Exception as e:
+            print(f"Error processing feature '{feature}': {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    print(f"DEBUG: Total subplots created: {len(subplots)}", flush=True)
 
     # --- Combine all figures in a single grid with one shared toolbar ---
-    all_plots = [annotation_fig] + subplots
-    grid = gridplot([[p] for p in all_plots], merge_tools=True, sizing_mode='stretch_width')
+    # If no subplots with data, just show annotation
+    print(f"DEBUG: Creating grid with annotation + {len(subplots)} subplots", flush=True)
+    if not subplots:
+        print(f"Warning: No data available for any requested features in sample '{sample_name}', contig '{contig_name}'", flush=True)
+        grid = gridplot([[annotation_fig]], merge_tools=True, sizing_mode='stretch_width')
+    else:
+        all_plots = [annotation_fig] + subplots
+        print(f"DEBUG: all_plots list has {len(all_plots)} plots", flush=True)
+        try:
+            grid = gridplot([[p] for p in all_plots], merge_tools=True, sizing_mode='stretch_width')
+            print(f"DEBUG: Grid created successfully", flush=True)
+        except Exception as e:
+            print(f"ERROR creating gridplot: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
 
     return grid
 
