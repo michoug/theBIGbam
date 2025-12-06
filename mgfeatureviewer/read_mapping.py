@@ -107,7 +107,6 @@ def add_mapping_all_args(parser):
     parser.add_argument('--assembly', help='Assembly file to use for all rows (overrides CSV field)')
     parser.add_argument('--circular', action='store_true', help='Treat assemblies as circular (double sequences)')
     parser.add_argument('--output-dir', required=True, help='Directory to create and place outputs (must NOT exist)')
-    parser.add_argument('--threads', type=int, default=4, help='Threads to pass to minimap2/samtools')
     # Slurm options
     parser.add_argument('--threads', type=int, default=4, help='CPUs per Slurm job')
     parser.add_argument('--use-slurm', action='store_true', help='Dispatch mapping jobs via Slurm (sbatch)')

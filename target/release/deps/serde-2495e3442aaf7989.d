@@ -1,0 +1,14 @@
+/mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/deps/serde-2495e3442aaf7989.d: /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/build/serde-a4cc697fb058cf73/out/private.rs
+
+/mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/deps/libserde-2495e3442aaf7989.rlib: /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/build/serde-a4cc697fb058cf73/out/private.rs
+
+/mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/deps/libserde-2495e3442aaf7989.rmeta: /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/build/serde-a4cc697fb058cf73/out/private.rs
+
+/home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/build/serde-a4cc697fb058cf73/out/private.rs:
+
+# env-dep:OUT_DIR=/mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/build/serde-a4cc697fb058cf73/out

@@ -913,7 +913,6 @@ def calculating_all_features_parallel(list_modules, bam_files, output_dir, min_c
 
 ### Main function helpers (shared-args)
 def add_calculate_args(parser):
-    parser.add_argument("-t", "--threads", required=True, help="Number of threads available")
     parser.add_argument("-g", "--genbank", required=True, help="Path to genbank file of all investigated contigs")
     parser.add_argument("-b", "--bam_files", required=True, help="Path to bam file or directory containing mapping files (BAM format)")
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
@@ -925,7 +924,7 @@ def add_calculate_args(parser):
     parser.add_argument("--derivative_threshold", type=int, default=3, help="Points were the derivative is beyond mean+std*N are kept as outliers")
     parser.add_argument("--max_points", type=int, default=10000, help="Maximum number of points kept during compression")
     # Slurm integration (optional)
-    parser.add_argument("--threads", type=int, default=4, help="Number of threads to request per Slurm job (cpus-per-task)")
+    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of threads to request per Slurm job (cpus-per-task)")
     parser.add_argument("--use-slurm", action="store_true", help="Submit per-sample jobs via Slurm (sbatch) instead of running locally")
     parser.add_argument("--max-concurrent", type=int, default=20, help="Maximum concurrent Slurm array tasks")
     parser.add_argument("--max-time", type=str, default="02:00:00", help="Time limit per Slurm job (HH:MM:SS)")

@@ -159,7 +159,6 @@ def main(argv=None):
                 circular=bool(getattr(args, 'circular', False)),
                 output_dir=map_outdir,
                 threads=int(getattr(args, 'threads_per_job', 4)),
-                threads=int(getattr(args, 'threads_per_job', 4)),
                 use_slurm=bool(getattr(args, 'use_slurm', False)),
                 max_concurrent=int(getattr(args, 'max_concurrent', 20)),
                 max_time=getattr(args, 'max_time', '02:00:00'),
@@ -191,7 +190,6 @@ def main(argv=None):
 
             # Calculation namespace: point to the annotation file and the mapping BAM directory
             calc_ns = argparse.Namespace(
-                threads=int(getattr(args, 'threads_per_job', 4)),
                 genbank=anno_target,
                 bam_files=map_outdir,
                 modules=args.modules,

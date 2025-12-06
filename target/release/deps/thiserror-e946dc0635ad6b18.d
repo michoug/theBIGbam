@@ -1,0 +1,14 @@
+/mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/deps/thiserror-e946dc0635ad6b18.d: /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/lib.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/aserror.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/display.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/var.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/private.rs /mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/build/thiserror-2c1d5e3f24029ffb/out/private.rs
+
+/mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/deps/libthiserror-e946dc0635ad6b18.rlib: /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/lib.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/aserror.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/display.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/var.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/private.rs /mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/build/thiserror-2c1d5e3f24029ffb/out/private.rs
+
+/mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/deps/libthiserror-e946dc0635ad6b18.rmeta: /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/lib.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/aserror.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/display.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/var.rs /home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/private.rs /mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/build/thiserror-2c1d5e3f24029ffb/out/private.rs
+
+/home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/lib.rs:
+/home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/aserror.rs:
+/home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/display.rs:
+/home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/var.rs:
+/home/boutroux/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.17/src/private.rs:
+/mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/build/thiserror-2c1d5e3f24029ffb/out/private.rs:
+
+# env-dep:OUT_DIR=/mnt/c/Users/boutroux/Documents/githubs/MGFeatureViewer/target/release/build/thiserror-2c1d5e3f24029ffb/out

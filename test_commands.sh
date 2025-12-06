@@ -67,3 +67,6 @@ mgfeatureviewer annotate-assemblies --threads 4 --csv ${INPUT_DIR}/mapping_rows.
 # For AKIRA database
 mgfeatureviewer calculate -t 32 -g examples/inputs/AKIRA/pharokka.gbk -b examples/inputs/AKIRA/bams_filtered -m coverage,phagetermini,assemblycheck -o examples/outputs/AKIRA/db  # This is now a path to a folder instead of a SQLite filename
 mgfeatureviewer serve --db examples/outputs/AKIRA/AKIRA/db --port 5006  # Use the new folder path
+
+uv run mgfeatureviewer calculate -t 6 -g examples/inputs/NOMIS/pharokka.gbk -b examples/inputs/NOMIS -m coverage,phagetermini,assemblycheck -o examples/outputs/NOMIS/db
+uv run mgfeatureviewer serve --db examples/outputs/NOMIS/db --port 5006
