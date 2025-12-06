@@ -67,7 +67,7 @@ use std::thread;
 use walkdir::WalkDir;
 
 use crate::bam_reader::{detect_sequencing_type, process_contig_streaming};
-use crate::compress::compress_signal;
+use crate::compress::{compress_signal, compress_signal_with_reference};
 use crate::db::{
     create_metadata_db, create_temp_sample_db, finalize_db, merge_temp_db_into_main,
     write_features_to_temp_db, write_presences_to_temp_db,
@@ -84,11 +84,8 @@ use crate::types::{
 pub struct ProcessConfig {
     pub threads: usize,
     pub min_coverage: f64,
-    pub step: usize,
-    pub z_thresh: f64,
-    pub deriv_thresh: f64,
-    pub max_points: usize,
-    pub python_compat: bool,
+    /// Relative tolerance for RLE compression (e.g., 0.1 = 10% change threshold)
+    pub compress_ratio: f64,
 }
 
 impl Default for ProcessConfig {
@@ -96,11 +93,7 @@ impl Default for ProcessConfig {
         Self {
             threads: 1,
             min_coverage: 50.0,
-            step: 50,
-            z_thresh: 3.0,
-            deriv_thresh: 3.0,
-            max_points: 10000,
-            python_compat: false,
+            compress_ratio: 0.1,  // 10% change threshold
         }
     }
 }
@@ -121,22 +114,30 @@ fn add_compressed_feature(
     config: &ProcessConfig,
     output: &mut Vec<FeaturePoint>,
 ) {
-    let plot_type = get_plot_type(feature);
-    let (xs, ys) = compress_signal(
-        values,
-        plot_type,
-        config.step,
-        config.z_thresh,
-        config.deriv_thresh,
-        config.max_points,
-        config.python_compat,
-    );
+    add_compressed_feature_with_reference(values, None, feature, contig_name, config, output);
+}
 
-    output.extend(xs.into_iter().zip(ys).map(|(x, y)| FeaturePoint {
+/// Compress and add feature points with optional coverage reference.
+///
+/// For bar plots, uses coverage as reference for context-aware compression.
+#[inline]
+fn add_compressed_feature_with_reference(
+    values: &[f64],
+    reference: Option<&[f64]>,
+    feature: &str,
+    contig_name: &str,
+    config: &ProcessConfig,
+    output: &mut Vec<FeaturePoint>,
+) {
+    let plot_type = get_plot_type(feature);
+    let runs = compress_signal_with_reference(values, reference, plot_type, config.compress_ratio);
+
+    output.extend(runs.into_iter().map(|run| FeaturePoint {
         contig_name: contig_name.to_string(),
         feature: feature.to_string(),
-        position: x,
-        value: y,
+        start_pos: run.start_pos,
+        end_pos: run.end_pos,
+        value: run.value,
     }));
 }
 
@@ -149,26 +150,28 @@ fn add_features_from_arrays(
     seq_type: crate::types::SequencingType,
     output: &mut Vec<FeaturePoint>,
 ) {
-    // Coverage
+    // Coverage (always compress self-referentially)
+    let coverage_f64: Vec<f64> = arrays.coverage.iter().map(|&x| x as f64).collect();
     if flags.coverage {
-        let values: Vec<f64> = arrays.coverage.iter().map(|&x| x as f64).collect();
-        add_compressed_feature(&values, "coverage", contig_name, config, output);
+        add_compressed_feature(&coverage_f64, "coverage", contig_name, config, output);
     }
 
+    // Coverage_reduced for phagetermini (use as reference for phagetermini bar features)
+    let coverage_reduced_f64: Vec<f64> = arrays.coverage_reduced.iter().map(|&x| x as f64).collect();
+    
     // Phagetermini features
     if flags.phagetermini {
-        for &feature_name in PHAGETERMINI_FEATURES {
-            let data = match feature_name {
-                "coverage_reduced" => &arrays.coverage_reduced,
-                "reads_starts" => &arrays.reads_starts,
-                "reads_ends" => &arrays.reads_ends,
-                _ => continue,
-            };
-            let values: Vec<f64> = data.iter().map(|&x| x as f64).collect();
-            add_compressed_feature(&values, feature_name, contig_name, config, output);
-        }
+        // coverage_reduced (self-referential curve)
+        add_compressed_feature(&coverage_reduced_f64, "coverage_reduced", contig_name, config, output);
+        
+        // reads_starts and reads_ends (bars, use coverage_reduced as reference)
+        let reads_starts: Vec<f64> = arrays.reads_starts.iter().map(|&x| x as f64).collect();
+        add_compressed_feature_with_reference(&reads_starts, Some(&coverage_reduced_f64), "reads_starts", contig_name, config, output);
+        
+        let reads_ends: Vec<f64> = arrays.reads_ends.iter().map(|&x| x as f64).collect();
+        add_compressed_feature_with_reference(&reads_ends, Some(&coverage_reduced_f64), "reads_ends", contig_name, config, output);
 
-        // Tau (derived)
+        // Tau (bars, use coverage_reduced as reference)
         let tau: Vec<f64> = arrays
             .coverage_reduced
             .iter()
@@ -182,10 +185,10 @@ fn add_features_from_arrays(
                 }
             })
             .collect();
-        add_compressed_feature(&tau, "tau", contig_name, config, output);
+        add_compressed_feature_with_reference(&tau, Some(&coverage_reduced_f64), "tau", contig_name, config, output);
     }
 
-    // Assemblycheck features
+    // Assemblycheck features (all bars, use main coverage as reference)
     if flags.assemblycheck {
         for &feature_name in ASSEMBLYCHECK_FEATURES {
             let data = match feature_name {
@@ -198,10 +201,10 @@ fn add_features_from_arrays(
                 _ => continue,
             };
             let values: Vec<f64> = data.iter().map(|&x| x as f64).collect();
-            add_compressed_feature(&values, feature_name, contig_name, config, output);
+            add_compressed_feature_with_reference(&values, Some(&coverage_f64), feature_name, contig_name, config, output);
         }
 
-        // Read lengths (derived, for long reads)
+        // Read lengths (curve for long reads, self-referential)
         if seq_type.is_long() {
             let values: Vec<f64> = arrays
                 .sum_read_lengths
@@ -210,6 +213,17 @@ fn add_features_from_arrays(
                 .map(|(&s, &c)| if c > 0 { s as f64 / c as f64 } else { 0.0 })
                 .collect();
             add_compressed_feature(&values, "read_lengths", contig_name, config, output);
+        }
+
+        // Insert sizes (curve for paired reads, self-referential)  
+        if seq_type.is_short_paired() {
+            let values: Vec<f64> = arrays
+                .sum_insert_sizes
+                .iter()
+                .zip(&arrays.count_insert_sizes)
+                .map(|(&s, &c)| if c > 0 { s as f64 / c as f64 } else { 0.0 })
+                .collect();
+            add_compressed_feature(&values, "insert_sizes", contig_name, config, output);
         }
 
         // Insert sizes (derived, for short-paired)
@@ -295,6 +309,7 @@ pub fn run_all_samples(
     modules: &[String],
     annotation_tool: &str,
     config: &ProcessConfig,
+    create_indexes: bool,
 ) -> Result<ProcessResult> {
     unsafe {
         htslib::hts_set_log_level(htslib::htsLogLevel_HTS_LOG_ERROR);
@@ -324,7 +339,7 @@ pub fn run_all_samples(
 
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    create_metadata_db(output_db, &contigs, &annotations, !config.python_compat)?;
+    create_metadata_db(output_db, &contigs, &annotations, create_indexes)?;
 
     eprintln!(
         "### Processing {} samples with {} threads",

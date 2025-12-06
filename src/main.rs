@@ -76,25 +76,9 @@ struct Args {
     #[arg(long, default_value = "50")]
     min_coverage: f64,
 
-    /// Step size for compression
-    #[arg(long, default_value = "50")]
-    step: usize,
-
-    /// Z-score threshold for outliers
-    #[arg(long, default_value = "3.0")]
-    outlier_threshold: f64,
-
-    /// Derivative threshold for outliers
-    #[arg(long, default_value = "3.0")]
-    derivative_threshold: f64,
-
-    /// Maximum points after compression
-    #[arg(long, default_value = "10000")]
-    max_points: usize,
-
-    /// Use Python-compatible compression (replicates derivative outlier bug for comparison)
-    #[arg(long, default_value = "false")]
-    python_compat: bool,
+    /// Relative tolerance for RLE compression (e.g., 0.1 = 10% change threshold)
+    #[arg(long, default_value = "0.1")]
+    compress_ratio: f64,
 }
 
 fn main() -> Result<()> {
@@ -111,11 +95,7 @@ fn main() -> Result<()> {
     let config = ProcessConfig {
         threads: args.threads,
         min_coverage: args.min_coverage,
-        step: args.step,
-        z_thresh: args.outlier_threshold,
-        deriv_thresh: args.derivative_threshold,
-        max_points: args.max_points,
-        python_compat: args.python_compat,
+        compress_ratio: args.compress_ratio,
     };
 
     // Call the shared processing function
@@ -126,6 +106,7 @@ fn main() -> Result<()> {
         &modules,
         &args.annotation_tool,
         &config,
+        true,  // create_indexes
     )?;
 
     if result.samples_failed > 0 {

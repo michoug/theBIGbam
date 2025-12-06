@@ -30,8 +30,21 @@ class DataAccessor:
         else:
             # Single file format
             self.sqlite_path = self.db_path
+            if not self.sqlite_path.exists():
+                raise FileNotFoundError(f"Database file not found: {self.sqlite_path}")
 
-        self.sqlite_conn = sqlite3.connect(str(self.sqlite_path))
+        try:
+            self.sqlite_conn = sqlite3.connect(str(self.sqlite_path))
+            # Disable WAL mode for compatibility with WSL/Windows cross-filesystem access
+            # WAL mode creates -wal and -shm files that don't work well on mounted filesystems
+            cur = self.sqlite_conn.cursor()
+            cur.execute("PRAGMA journal_mode=DELETE")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            # Test connection with a simple query
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
+            cur.fetchone()
+        except sqlite3.Error as e:
+            raise RuntimeError(f"Failed to open database {self.sqlite_path}: {e}")
 
     def get_sqlite_connection(self) -> sqlite3.Connection:
         """Get the SQLite connection for metadata queries."""
@@ -75,15 +88,30 @@ class DataAccessor:
                 "y": []
             }
 
-            # Query Feature_* table directly
+            # Query Feature_* table directly (RLE format: First_position, Last_position, Value)
             cur.execute(
-                f"SELECT Position, Value FROM {feature_table} "
-                "WHERE Sample_id=? AND Contig_id=? ORDER BY Position",
+                f"SELECT First_position, Last_position, Value FROM {feature_table} "
+                "WHERE Sample_id=? AND Contig_id=? ORDER BY First_position",
                 (sample_id, contig_id)
             )
             data_rows = cur.fetchall()
-            feature_dict["x"] = [r[0] for r in data_rows]
-            feature_dict["y"] = [r[1] for r in data_rows]
+            
+            # Expand RLE runs into individual points for plotting
+            x_coords = []
+            y_coords = []
+            for first_pos, last_pos, value in data_rows:
+                # For visualization, create points at start and end of each run
+                if first_pos == last_pos:
+                    # Singleton point (spike)
+                    x_coords.append(first_pos)
+                    y_coords.append(value)
+                else:
+                    # Run: add start and end points
+                    x_coords.extend([first_pos, last_pos])
+                    y_coords.extend([value, value])
+            
+            feature_dict["x"] = x_coords
+            feature_dict["y"] = y_coords
 
             list_feature_dict.append(feature_dict)
 

@@ -250,7 +250,8 @@ fn create_variable_tables(conn: &Connection, create_indexes: bool) -> Result<()>
                     Feature_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     Contig_id INTEGER,
                     Sample_id INTEGER,
-                    Position INTEGER,
+                    First_position INTEGER,
+                    Last_position INTEGER,
                     Value REAL,
                     FOREIGN KEY(Contig_id) REFERENCES Contig(Contig_id),
                     FOREIGN KEY(Sample_id) REFERENCES Sample(Sample_id)
@@ -298,7 +299,8 @@ pub fn create_temp_sample_db(temp_db_path: &Path) -> Result<Connection> {
         "CREATE TABLE TempFeatures (
             Variable_name TEXT,
             Contig_name TEXT,
-            Position INTEGER,
+            First_position INTEGER,
+            Last_position INTEGER,
             Value REAL
         )",
         [],
@@ -314,11 +316,11 @@ pub fn write_features_to_temp_db(conn: &Connection, features: &[FeaturePoint]) -
         .context("Failed to begin feature transaction")?;
 
     let mut stmt = conn
-        .prepare("INSERT INTO TempFeatures (Variable_name, Contig_name, Position, Value) VALUES (?1, ?2, ?3, ?4)")
+        .prepare("INSERT INTO TempFeatures (Variable_name, Contig_name, First_position, Last_position, Value) VALUES (?1, ?2, ?3, ?4, ?5)")
         .context("Failed to prepare feature insert")?;
 
     for f in features {
-        stmt.execute(params![&f.feature, &f.contig_name, f.position, f.value])
+        stmt.execute(params![&f.feature, &f.contig_name, f.start_pos, f.end_pos, f.value])
             .context("Failed to insert feature")?;
     }
 
@@ -454,11 +456,11 @@ fn merge_features(
     for v in VARIABLES {
         let table_name = feature_table_name(v.name);
 
-        let features: Vec<(String, i32, f32)> = {
+        let features: Vec<(String, i32, i32, f32)> = {
             let mut stmt = conn.prepare(
-                "SELECT Contig_name, Position, Value FROM src.TempFeatures WHERE Variable_name = ?1",
+                "SELECT Contig_name, First_position, Last_position, Value FROM src.TempFeatures WHERE Variable_name = ?1",
             )?;
-            let rows = stmt.query_map([v.name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            let rows = stmt.query_map([v.name], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))?;
             rows.filter_map(|r| r.ok()).collect()
         };
 
@@ -467,13 +469,13 @@ fn merge_features(
         }
 
         let mut stmt = conn.prepare(&format!(
-            "INSERT INTO {} (Contig_id, Sample_id, Position, Value) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO {} (Contig_id, Sample_id, First_position, Last_position, Value) VALUES (?1, ?2, ?3, ?4, ?5)",
             table_name
         ))?;
 
-        for (contig_name, position, value) in features {
+        for (contig_name, first_pos, last_pos, value) in features {
             if let Some(&contig_id) = contig_name_to_id.get(&contig_name) {
-                stmt.execute(params![contig_id, sample_id, position, value])?;
+                stmt.execute(params![contig_id, sample_id, first_pos, last_pos, value])?;
             }
         }
     }

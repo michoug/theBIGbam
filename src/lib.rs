@@ -33,7 +33,7 @@ pub mod types;
 pub use bam_reader::{detect_sequencing_type, process_contig_streaming};
 pub use cigar::{Cigar, CigarElement, CigarOp, MdTag};
 pub use circular::CircularArray;
-pub use compress::compress_signal;
+pub use compress::{compress_signal, compress_signal_with_reference};
 pub use features::{process_read, FeatureArrays, ModuleFlags};
 pub use genbank::parse_genbank;
 pub use processing::{process_sample, run_all_samples, ProcessConfig, ProcessResult};
@@ -77,7 +77,7 @@ mod python {
     ///         - "samples_failed": int
     ///         - "total_time": float (seconds)
     #[pyfunction]
-    #[pyo3(signature = (genbank_path, bam_dir, output_db, modules, threads, annotation_tool="", min_coverage=50.0, step=50, z_thresh=3.0, deriv_thresh=3.0, max_points=10000, python_compat=false))]
+    #[pyo3(signature = (genbank_path, bam_dir, output_db, modules, threads, annotation_tool="", min_coverage=50.0, compress_ratio=0.1, create_indexes=true))]
     fn process_all_samples<'py>(
         py: Python<'py>,
         genbank_path: &str,
@@ -87,22 +87,15 @@ mod python {
         threads: usize,
         annotation_tool: &str,
         min_coverage: f64,
-        step: usize,
-        z_thresh: f64,
-        deriv_thresh: f64,
-        max_points: usize,
-        python_compat: bool,
+        compress_ratio: f64,
+        create_indexes: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         use crate::processing::{run_all_samples, ProcessConfig};
 
         let config = ProcessConfig {
             threads,
             min_coverage,
-            step,
-            z_thresh,
-            deriv_thresh,
-            max_points,
-            python_compat,
+            compress_ratio,
         };
 
         // Release the GIL and call the shared processing function
@@ -114,6 +107,7 @@ mod python {
                 &modules,
                 annotation_tool,
                 &config,
+                create_indexes,
             )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))
         })?;

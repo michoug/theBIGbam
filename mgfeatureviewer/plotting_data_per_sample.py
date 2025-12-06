@@ -204,11 +204,27 @@ def get_feature_data(cur, feature, contig_id, sample_id, accessor=None, contig_n
         feature_dict["x"] = []
         feature_dict["y"] = []
 
-        # Query feature table for this sample and contig
-        cur.execute(f"SELECT Position, Value FROM {feature_table} WHERE Sample_id=? AND Contig_id=? ORDER BY Position", (sample_id, contig_id))
+        # Query feature table for this sample and contig (RLE format: First_position, Last_position, Value)
+        cur.execute(f"SELECT First_position, Last_position, Value FROM {feature_table} WHERE Sample_id=? AND Contig_id=? ORDER BY First_position", (sample_id, contig_id))
         rows = cur.fetchall()
-        feature_dict["x"] = [r[0] for r in rows]
-        feature_dict["y"] = [r[1] for r in rows]
+        
+        # Expand RLE runs into individual points for plotting
+        x_coords = []
+        y_coords = []
+        for first_pos, last_pos, value in rows:
+            # For visualization, create points at start and end of each run
+            # This preserves the run structure while allowing proper line/bar rendering
+            if first_pos == last_pos:
+                # Singleton point (spike)
+                x_coords.append(first_pos)
+                y_coords.append(value)
+            else:
+                # Run: add start and end points
+                x_coords.extend([first_pos, last_pos])
+                y_coords.extend([value, value])
+        
+        feature_dict["x"] = x_coords
+        feature_dict["y"] = y_coords
         list_feature_dict.append(feature_dict)
 
     return list_feature_dict

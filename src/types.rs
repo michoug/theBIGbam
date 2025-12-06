@@ -129,7 +129,7 @@ impl PlotType {
 ///
 /// This struct holds all the metadata needed for:
 /// - Database storage (name, module)
-/// - Visualization (subplot, plot_type, color, alpha, etc.)
+/// - Visualization (subplot, plot_type, color, line_alpha, etc.)
 ///
 /// # Rust concept - `&'static str` fields:
 /// Using `&'static str` instead of `String` means these are references to
@@ -352,16 +352,25 @@ pub struct FeatureAnnotation {
 /// # Why compress?
 /// A 50kb phage genome at single-base resolution = 50,000 points per feature.
 /// With 10 features × 100 samples = 50 million points! Compression reduces
-/// this dramatically by keeping only significant points.
+/// A single feature data point (run-length encoded).
+///
+/// Each FeaturePoint represents a run of consecutive positions with the same value.
+/// For singleton points (spikes), start_pos == end_pos.
+///
+/// Before compression, genomic signals have millions of (position, value) pairs.
+/// Run-length encoding with adaptive thresholding reduces storage by encoding
+/// constant regions as single runs while preserving rapid changes as short runs.
 #[derive(Clone, Debug)]
 pub struct FeaturePoint {
     /// Which contig this point belongs to
     pub contig_name: String,
     /// Which feature (e.g., "coverage", "reads_starts")
     pub feature: String,
-    /// Position along the contig (1-based)
-    pub position: i32,
-    /// The value at this position (e.g., coverage depth, read count)
+    /// First position in the run (1-indexed, inclusive)
+    pub start_pos: i32,
+    /// Last position in the run (1-indexed, inclusive)
+    pub end_pos: i32,
+    /// The value for this run
     pub value: f32,
 }
 

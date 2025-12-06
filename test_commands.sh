@@ -42,7 +42,10 @@ mgfeatureviewer run-pipeline --threads 4 --csv ${INPUT_DIR}/mapping_rows.csv --c
 mgfeatureviewer mapping-all-samples --threads 4 --csv ${INPUT_DIR}/mapping_rows.csv --circular --output-dir ${OUTPUT_DIR}
 mgfeatureviewer annotate-assemblies --threads 4 --csv ${INPUT_DIR}/mapping_rows.csv --tool pharokka --db /mnt/c/Users/boutroux/Documents/databases/pharokka_db --output-genbank ${OUTPUT_DIR}/combined_annotations.gbk
 
-mgfeatureviewer calculate -t 4 -g ${INPUT_DIR}/HK97_GCF_000848825.1_pharokka.gbk -a pharokka -b ${OUTPUT_DIR} -m coverage,phagetermini,assemblycheck -d ${OUTPUT_DIR}/HK97.db
+mgfeatureviewer calculate -t 4 -g ${INPUT_DIR}/HK97_GCF_000848825.1_pharokka.gbk -a pharokka -b ${INPUT_DIR} -m coverage,phagetermini,assemblycheck -o ${OUTPUT_DIR}/HK97.db
+mgfeatureviewer serve --db ${OUTPUT_DIR}/HK97.db --port 5006
+
+cargo run --release -- -t 4 -g ${INPUT_DIR}/HK97_GCF_000848825.1_pharokka.gbk -a pharokka -b ${INPUT_DIR} -m coverage,phagetermini,assemblycheck -o ${OUTPUT_DIR}/HK97.db
 mgfeatureviewer serve --db ${OUTPUT_DIR}/HK97.db --port 5006
 
 # For Sphingomonas sp 5
