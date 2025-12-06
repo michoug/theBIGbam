@@ -173,11 +173,9 @@ def main(argv=None):
             print(f"Starting annotation step (annotation_tool={anno_ns.annotation_tool}) -> output: {anno_ns.genbank}")
             assembly_annotation.run_annotation(anno_ns)
 
-            # Ensure annotation output exists
             if not os.path.exists(anno_target):
                 raise FileNotFoundError(f"Annotation output not found at expected location: {anno_target}")
 
-            # Calculation namespace - output is now a .db file
             calc_ns = argparse.Namespace(
                 threads=args.threads,
                 genbank=anno_target,
@@ -186,10 +184,7 @@ def main(argv=None):
                 output=output_db_abs,
                 annotation_tool=args.annotation_tool,
                 min_coverage=50,
-                step=50,
-                outlier_threshold=3,
-                derivative_threshold=3,
-                max_points=10000,
+                compress_ratio=0.1,
             )
             print(f"Starting calculation step -> output: {calc_ns.output}")
             calculating_data.run_calculate_args(calc_ns)

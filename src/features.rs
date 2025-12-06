@@ -1,68 +1,9 @@
-//! Feature calculation functions.
+//! Feature calculation from aligned sequencing reads.
 //!
-//! This module contains all the feature calculation logic for coverage,
-//! phage termini, and assembly check features.
+//! Calculates coverage, phage termini features (reads_starts, reads_ends, tau),
+//! and assembly check features (clippings, indels, mismatches, orientations).
 //!
-//! # Bioinformatics Context
-//!
-//! We calculate several types of features from aligned sequencing reads:
-//!
-//! ## Coverage Module
-//! - **coverage**: Number of reads overlapping each position (read depth)
-//!
-//! ## Phage Termini Module (for detecting DNA packaging sites)
-//! - **coverage_reduced**: Coverage counting only "clean" reads that align perfectly
-//!   at their ends (no soft-clipping or mismatches). This helps identify true termini.
-//! - **reads_starts**: Count of read 5' ends at each position
-//! - **reads_ends**: Count of read 3' ends at each position
-//! - **tau**: Ratio of termini counts to coverage (calculated later as derived feature)
-//!
-//! ## Assembly Check Module (for detecting assembly errors)
-//! - **left_clippings**: Reads that are soft/hard clipped at their start
-//! - **right_clippings**: Reads that are soft/hard clipped at their end
-//! - **insertions**: Insertion events from CIGAR
-//! - **deletions**: Deletion events from CIGAR
-//! - **mismatches**: Base mismatches from MD tag
-//! - **read_lengths**: Average read length at each position (long reads only)
-//! - **insert_sizes**: Average insert size at each position (paired-end only)
-//! - **bad_orientations**: Reads with unexpected pair orientation
-//!
-//! # Architecture - Single Pass Processing
-//!
-//! The key optimization here is processing all features in a **single pass** through
-//! the reads. Instead of:
-//!
-//! ```text
-//! OLD (multiple passes):
-//!   for read in reads: update coverage
-//!   for read in reads: update phagetermini
-//!   for read in reads: update assemblycheck
-//!   → 3 iterations over potentially millions of reads!
-//! ```
-//!
-//! We do:
-//!
-//! ```text
-//! NEW (single pass):
-//!   for read in reads:
-//!       update coverage
-//!       update phagetermini
-//!       update assemblycheck
-//!   → Just 1 iteration!
-//! ```
-//!
-//! # For Python Developers
-//!
-//! ## Key Rust Concepts
-//!
-//! - **`Vec<u64>`**: Like a Python `list` but all elements must be the same type.
-//!   `u64` is an unsigned 64-bit integer (0 to 18 quintillion).
-//!
-//! - **`&mut self`**: A mutable reference to `self`. In Python, `self` is always
-//!   mutable. In Rust, you must explicitly say you want to modify something.
-//!
-//! - **Pattern matching with `match`**: Like a powerful if-elif-else chain.
-//!   Rust ensures you handle all cases (exhaustive matching).
+//! All features are calculated in a single pass through the BAM reads for efficiency.
 
 use crate::cigar::{raw_cigar_consumes_ref, raw_cigar_is_clipping, raw_has_match_at_position, MdTag};
 use crate::circular::CircularArray;
@@ -92,6 +33,14 @@ pub struct FeatureArrays {
     /// Number of reads overlapping each position (standard read depth).
     /// coverage[i] = number of reads spanning position i
     pub coverage: Vec<u64>,
+
+    /// Number of secondary alignments at each position.
+    /// Secondary reads have flag 0x100 set.
+    pub secondary_reads: Vec<u64>,
+
+    /// Number of supplementary alignments at each position.
+    /// Supplementary reads have flag 0x800 set.
+    pub supplementary_reads: Vec<u64>,
 
     // -------------------------------------------------------------------------
     // Phagetermini Module
@@ -183,6 +132,8 @@ impl FeatureArrays {
         Self {
             // Initialize all arrays to zero
             coverage: vec![0u64; ref_length],
+            secondary_reads: vec![0u64; ref_length],
+            supplementary_reads: vec![0u64; ref_length],
             coverage_reduced: vec![0u64; ref_length],
             reads_starts: vec![0u64; ref_length],
             reads_ends: vec![0u64; ref_length],
@@ -402,6 +353,8 @@ pub fn process_read(
     is_read1: bool,
     is_proper_pair: bool,
     is_reverse: bool,
+    is_secondary: bool,
+    is_supplementary: bool,
     cigar_raw: &[(u32, u32)],
     md_tag: Option<&[u8]>,
     seq_type: SequencingType,
@@ -433,6 +386,14 @@ pub fn process_read(
     if flags.coverage {
         // increment_circular handles wrap-around for circular genomes
         arrays.coverage.increment_circular(start, end, 1);
+        
+        // Track secondary and supplementary reads separately
+        if is_secondary {
+            arrays.secondary_reads.increment_circular(start, end, 1);
+        }
+        if is_supplementary {
+            arrays.supplementary_reads.increment_circular(start, end, 1);
+        }
     }
 
     // -------------------------------------------------------------------------

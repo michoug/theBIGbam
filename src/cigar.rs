@@ -1,117 +1,34 @@
 //! CIGAR and MD tag parsing for BAM alignment analysis.
 //!
-//! # Overview
+//! CIGAR strings describe how a read aligns to reference (e.g., "50M2I30M"):
+//! - M: Match, I: Insertion, D: Deletion, S: Soft clip, H: Hard clip
 //!
-//! ## CIGAR Strings
-//! CIGAR (Compact Idiosyncratic Gapped Alignment Report) strings describe how a
-//! sequencing read aligns to a reference genome. A string like "50M2I30M" means:
-//! - 50 bases Match/align to reference
-//! - 2 bases Inserted in the read (not in reference)
-//! - 30 bases Match/align to reference
-//!
-//! Common CIGAR operations:
-//! - M: alignment Match (may include mismatches!)
-//! - I: Insertion to the reference (bases in read, not in reference)
-//! - D: Deletion from the reference (bases in reference, not in read)
-//! - S: Soft clip (bases in read sequence but not aligned)
-//! - H: Hard clip (bases not even in the read sequence)
-//! - N: Skipped region (like introns in RNA-seq)
-//! - =: Sequence match (exact match, unlike M)
-//! - X: Sequence mismatch
-//!
-//! ## MD Tags
-//! The MD tag provides mismatch and deletion information without needing the
-//! reference sequence. Format: `10A5^GT3` means:
-//! - 10 matching bases
-//! - Mismatch to 'A'
-//! - 5 matching bases
-//! - Deletion of 'GT'
-//! - 3 matching bases
-//!
-//! # Python Equivalent
-//!
-//! This module corresponds to the `starts_with_match()` function and MD tag
-//! parsing logic in `calculating_data.py:301-315`:
-//! ```python
-//! def starts_with_match(cigar, md, start):
-//!     op, length = cigar[0] if start else cigar[-1]
-//!     if op in (4, 5):  # soft or hard clip
-//!         return False
-//!     if op == 1:  # insertion
-//!         return False
-//!     val = md[0] if start else md[-1]
-//!     return val > 0
-//! ```
-//!
-//! # Rust Concepts
-//!
-//! ## Enums with Derive Macros
-//! `#[derive(Clone, Copy, Debug)]` automatically implements traits:
-//! - `Clone`: enables `.clone()` to create a copy
-//! - `Copy`: enables implicit copying (for small types like enums)
-//! - `Debug`: enables `{:?}` formatting for debugging
-//!
-//! ## Lifetimes (`'a`)
-//! `MdTag<'a>` has a lifetime parameter because it borrows data rather than
-//! owning it. The `'a` indicates the struct lives only as long as the data it
-//! references. This avoids copying the MD tag bytes.
-//!
-//! ## Custom Iterators
-//! `MdMismatchIter` implements the `Iterator` trait to lazily yield mismatch
-//! positions. This is memory-efficient: positions are computed on-demand rather
-//! than building a complete list upfront.
+//! MD tags provide mismatch information (e.g., "10A5^GT3"):
+//! - Numbers: matching bases
+//! - Letters: mismatches
+//! - ^: deletions
 
 // ============================================================================
 // CIGAR OPERATION TYPES
 // ============================================================================
 
-/// CIGAR operation types - each represents a different alignment event.
-///
-/// # Rust Concept: Enums
-/// In Rust, `enum` defines a type that can be one of several variants.
-/// Unlike Python's string-based approach ("M", "I", etc.), this is type-safe:
-/// the compiler ensures you handle all cases.
-///
-/// # Derive Macros Explained
-/// - `Clone, Copy`: These are small (1 byte), so we can copy them freely
-/// - `Debug`: Enables printing with `{:?}` for debugging
-/// - `PartialEq, Eq`: Enables `==` comparison between operations
+/// CIGAR operation types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CigarOp {
-    // Each variant maps to a single character in the CIGAR string
-    Match,          // M - alignment match (can be sequence match or mismatch)
-    Insertion,      // I - insertion to the reference
-    Deletion,       // D - deletion from the reference
-    Skip,           // N - skipped region from the reference (e.g., introns)
-    SoftClip,       // S - soft clipping (sequence present in SEQ but not aligned)
-    HardClip,       // H - hard clipping (sequence NOT present in SEQ)
-    Padding,        // P - padding (silent deletion from padded reference)
-    SeqMatch,       // = - sequence match (exact match, more specific than M)
-    SeqMismatch,    // X - sequence mismatch (more specific than M)
+    Match,
+    Insertion,
+    Deletion,
+    Skip,
+    SoftClip,
+    HardClip,
+    Padding,
+    SeqMatch,
+    SeqMismatch,
 }
 
-// ============================================================================
-// Rust Concept: impl blocks
-// ============================================================================
-// `impl CigarOp { ... }` adds methods to the CigarOp enum. In Python, these
-// would be class methods. In Rust, the data definition (the enum above) is
-// separated from its methods (the impl block below).
-
 impl CigarOp {
-    /// Parse a CIGAR operation from its character representation.
-    ///
-    /// # Rust Concept: #[inline]
-    /// The `#[inline]` attribute suggests the compiler should inline this function
-    /// at call sites (copy the code directly instead of making a function call).
-    /// This is a performance optimization for small, frequently-called functions.
-    ///
-    /// # Rust Concept: Option<T>
-    /// Returns `Some(CigarOp)` if valid, `None` if unknown character.
-    /// This is safer than Python's approach of raising exceptions or returning None.
     #[inline]
     pub fn from_char(c: char) -> Option<Self> {
-        // Rust Concept: match expression
-        // Like Python's match/case but exhaustive - compiler ensures all cases handled
         match c {
             'M' => Some(Self::Match),
             'I' => Some(Self::Insertion),
@@ -122,29 +39,15 @@ impl CigarOp {
             'P' => Some(Self::Padding),
             '=' => Some(Self::SeqMatch),
             'X' => Some(Self::SeqMismatch),
-            _ => None,  // Unknown character - return None
+            _ => None,
         }
     }
 
-    /// Parse from u32 (as stored internally from rust-htslib char()).
-    ///
-    /// rust-htslib stores CIGAR operations as u32 where the operation character
-    /// is encoded in the lower bits. We extract it and convert.
     #[inline]
     pub fn from_u32(op: u32) -> Option<Self> {
-        // Cast chain: u32 -> u8 (truncate to byte) -> char
         Self::from_char(op as u8 as char)
     }
 
-    /// Check if this operation is a clipping operation (soft or hard).
-    ///
-    /// Clipping indicates bases at read ends that don't align:
-    /// - SoftClip: bases present in read sequence but not used in alignment
-    /// - HardClip: bases not even included in the read sequence
-    ///
-    /// # Rust Concept: matches! macro
-    /// `matches!(value, pattern1 | pattern2)` returns true if value matches
-    /// any of the patterns. More concise than a match expression that returns bool.
     #[inline]
     pub fn is_clipping(&self) -> bool {
         matches!(self, Self::SoftClip | Self::HardClip)

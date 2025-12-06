@@ -1,57 +1,12 @@
-//! Shared processing logic for both CLI and Python bindings.
+//! Parallel BAM file processing and feature calculation.
 //!
-//! # Overview
+//! Orchestrates parallel processing of BAM files:
+//! 1. Each BAM file processed by separate thread (rayon)
+//! 2. Features written to temporary SQLite database per sample
+//! 3. Temp databases merged sequentially into main database
 //!
-//! This module orchestrates the parallel processing of BAM files:
-//! 1. Parse GenBank file to get contig metadata
-//! 2. Discover BAM files in input directory
-//! 3. Process each BAM file in parallel using rayon
-//! 4. Write results to SQLite database
-//!
-//! The processing is optimized for single-pass streaming of BAM files,
-//! avoiding the need to load all reads into memory.
-//!
-//! # Python Equivalent
-//!
-//! This module corresponds to the main processing functions in `calculating_data.py`:
-//! ```python
-//! # Python: calculating_all_features_parallel() - parallel sample processing
-//! def calculating_all_features_parallel(list_modules, bam_files, db_path, ...):
-//!     with Pool(processes=n_sample_cores) as pool:
-//!         pool.starmap(_process_single_sample, args_list)
-//!
-//! # Python: _process_single_sample() - single sample processing
-//! def _process_single_sample(list_modules, bam_file, db_path, ...):
-//!     # Create temp DB, process all contigs, merge into main DB
-//!     calculating_features_per_sample(...)
-//!     merge_temp_db_into_main(db_main, str(temp_db))
-//! ```
-//!
-//! # Architecture Differences
-//!
-//! ## Python
-//! - Uses multiprocessing.Pool for parallelism
-//! - Each process opens its own BAM file and database connections
-//! - Temp DBs are merged sequentially after all processing
-//!
-//! ## Rust
-//! - Uses rayon for thread-based parallelism (lower overhead than processes)
-//! - Dedicated merge thread receives temp DBs via channel and merges incrementally
-//! - Progress bars show both processing and merge progress
-//!
-//! # Rust Concepts
-//!
-//! ## Rayon
-//! `bam_files.par_iter().for_each(...)` parallelizes iteration over BAM files.
-//! Rayon automatically distributes work across threads.
-//!
-//! ## Channels (`mpsc`)
-//! `mpsc::channel()` creates a multi-producer, single-consumer channel.
-//! Processing threads send temp DB paths to a dedicated merge thread.
-//!
-//! ## Atomics
-//! `AtomicUsize` provides thread-safe counters without mutex overhead.
-//! Used for tracking completed/failed samples.
+//! BAM processing (95% of time) is fully parallelized.
+//! Database merging (5% of time) runs sequentially after processing completes.
 
 use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -61,9 +16,8 @@ use rust_htslib::htslib;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
-use std::thread;
+use std::sync::Mutex;
 use walkdir::WalkDir;
 
 use crate::bam_reader::{detect_sequencing_type, process_contig_streaming};
@@ -154,6 +108,14 @@ fn add_features_from_arrays(
     let coverage_f64: Vec<f64> = arrays.coverage.iter().map(|&x| x as f64).collect();
     if flags.coverage {
         add_compressed_feature(&coverage_f64, "coverage", contig_name, config, output);
+        
+        // Secondary reads (self-referential curve)
+        let secondary_reads_f64: Vec<f64> = arrays.secondary_reads.iter().map(|&x| x as f64).collect();
+        add_compressed_feature(&secondary_reads_f64, "secondary_reads", contig_name, config, output);
+        
+        // Supplementary reads (self-referential curve)
+        let supplementary_reads_f64: Vec<f64> = arrays.supplementary_reads.iter().map(|&x| x as f64).collect();
+        add_compressed_feature(&supplementary_reads_f64, "supplementary_reads", contig_name, config, output);
     }
 
     // Coverage_reduced for phagetermini (use as reference for phagetermini bar features)
@@ -408,21 +370,13 @@ fn process_samples_parallel(
         .progress_chars("=>-"),
     );
     merge_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    let merge_pb = Arc::new(merge_pb);
 
     let start_time = std::time::Instant::now();
     let completed_count = AtomicUsize::new(0);
     let failed_count = AtomicUsize::new(0);
 
-    let (merge_tx, merge_rx) = mpsc::channel::<PathBuf>();
-
-    let merge_handle = spawn_merge_thread(
-        merge_rx,
-        db_path.to_path_buf(),
-        contigs.to_vec(),
-        temp_dir.to_path_buf(),
-        Arc::clone(&merge_pb),
-    );
+    // Collect temp DB paths from parallel processing
+    let temp_db_paths = Arc::new(Mutex::new(Vec::new()));
 
     bam_files.par_iter().for_each(|bam_path| {
         process_single_sample(
@@ -431,7 +385,7 @@ fn process_samples_parallel(
             modules,
             config,
             temp_dir,
-            &merge_tx,
+            Arc::clone(&temp_db_paths),
             &completed_count,
             &failed_count,
             &process_pb,
@@ -440,9 +394,29 @@ fn process_samples_parallel(
     });
 
     process_pb.finish_with_message("Done");
-    drop(merge_tx);
 
-    merge_handle.join().expect("Merge thread panicked");
+    // Merge all temp DBs sequentially (fast operation, not a bottleneck)
+    let temp_paths = temp_db_paths.lock().unwrap();
+    for temp_db_path in temp_paths.iter() {
+        let sample_name = temp_db_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        if merge_temp_db_into_main(db_path, temp_db_path, contigs).is_err() {
+            merge_pb.set_message(format!("ERR: {}", sample_name));
+        } else {
+            merge_pb.set_message(sample_name);
+        }
+
+        let _ = fs::remove_file(temp_db_path);
+        merge_pb.inc(1);
+    }
+    drop(temp_paths);
+
+    let _ = fs::remove_dir(temp_dir);
+    merge_pb.finish_with_message("Done");
 
     let elapsed = start_time.elapsed();
     let failed = failed_count.load(Ordering::SeqCst);
@@ -461,7 +435,7 @@ fn process_single_sample(
     modules: &[String],
     config: &ProcessConfig,
     temp_dir: &Path,
-    merge_tx: &mpsc::Sender<PathBuf>,
+    temp_db_paths: Arc<Mutex<Vec<PathBuf>>>,
     completed_count: &AtomicUsize,
     failed_count: &AtomicUsize,
     process_pb: &ProgressBar,
@@ -475,18 +449,20 @@ fn process_single_sample(
             let temp_db_path = temp_dir.join(format!("{}.db", sample_name));
 
             if let Ok(temp_conn) = create_temp_sample_db(&temp_db_path) {
-                let write_ok = (!features.is_empty()
+                let write_failed = (!features.is_empty()
                     && write_features_to_temp_db(&temp_conn, &features).is_err())
                     || (!presences.is_empty()
                         && write_presences_to_temp_db(&temp_conn, &sample_name, &presences).is_err());
 
-                if write_ok {
+                if write_failed {
                     failed_count.fetch_add(1, Ordering::SeqCst);
                     return;
                 }
 
                 drop(temp_conn);
-                let _ = merge_tx.send(temp_db_path);
+                
+                // Add temp DB path to collection for later merging
+                temp_db_paths.lock().unwrap().push(temp_db_path);
             } else {
                 failed_count.fetch_add(1, Ordering::SeqCst);
                 return;
@@ -505,40 +481,6 @@ fn process_single_sample(
             process_pb.inc(1);
         }
     }
-}
-
-fn spawn_merge_thread(
-    merge_rx: mpsc::Receiver<PathBuf>,
-    merge_db_path: PathBuf,
-    merge_contigs: Vec<ContigInfo>,
-    merge_temp_dir: PathBuf,
-    merge_pb: Arc<ProgressBar>,
-) -> thread::JoinHandle<usize> {
-    thread::spawn(move || {
-        let mut merged = 0usize;
-
-        for temp_db_path in merge_rx {
-            let sample_name = temp_db_path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            if merge_temp_db_into_main(&merge_db_path, &temp_db_path, &merge_contigs).is_err() {
-                merge_pb.set_message(format!("ERR: {}", sample_name));
-            } else {
-                merge_pb.set_message(sample_name);
-            }
-
-            let _ = fs::remove_file(&temp_db_path);
-            merged += 1;
-            merge_pb.inc(1);
-        }
-
-        let _ = fs::remove_dir(&merge_temp_dir);
-        merge_pb.finish_with_message("Done");
-        merged
-    })
 }
 
 fn print_summary(result: &ProcessResult, output_db: &Path) {

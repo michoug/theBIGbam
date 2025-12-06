@@ -1,22 +1,9 @@
-//! Adaptive Run-Length Encoding (RLE) for genomic signals.
+//! Adaptive Run-Length Encoding (RLE) compression for genomic feature data.
 //!
-//! # Bioinformatics Background
-//!
-//! Raw genomic signals (coverage, tau, etc.) can have millions of data points.
-//! This module compresses signals using adaptive run-length encoding:
-//! - Consecutive positions with similar values are encoded as a single run
-//! - A new run starts when |value - current_run_value| > compress_ratio * current_run_value
-//! - This automatically preserves rapid changes (spikes/drops) while compressing flat regions
-//!
-//! # Algorithm
-//!
-//! Starting with the first position, maintain a "current run" with a value.
-//! For each subsequent position:
-//! - If the new value is within compress_ratio% of the current run value, extend the run
-//! - Otherwise, close the current run and start a new one
-//!
-//! This is simpler than the previous outlier-based approach and adapts to
-//! signal magnitude (relative threshold instead of absolute z-scores).
+//! Compresses signals by grouping consecutive positions with similar values into runs.
+//! For curves: uses self-referential threshold (compress_ratio * run_value).
+//! For bars: uses coverage-relative threshold (compress_ratio * coverage[i]).
+//! Bar values below threshold are filtered out (only significant deviations saved).
 
 use crate::types::PlotType;
 
