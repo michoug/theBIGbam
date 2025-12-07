@@ -85,6 +85,7 @@ pub fn process_contig_streaming(
     seq_type: SequencingType,
     flags: ModuleFlags,
     circular: bool,
+    min_coverage: f64,
 ) -> Result<Option<FeatureArrays>> {
     // -------------------------------------------------------------------------
     // Step 1: Check if this contig exists in the BAM file
@@ -151,6 +152,19 @@ pub fn process_contig_streaming(
         return Ok(None);
     }
 
+    // Check coverage percentage before post-processing and feature calculation
+    // This saves time on low-coverage contigs by skipping:
+    // 1. finalize_strands() (phagetermini-specific, expensive)
+    // 2. All feature compression in the caller (very expensive)
+    // 3. Database writes
+    let coverage_pct = arrays.coverage_percentage();
+    if coverage_pct < min_coverage {
+        return Ok(None);
+    }
+
+    // Finalize strand-specific reads_starts/reads_ends for phagetermini
+    // This merges forward/reverse strand tracking into final arrays
+    // Only needed for phagetermini; other features are already finalized
     if flags.phagetermini {
         arrays.finalize_strands(seq_type);
     }

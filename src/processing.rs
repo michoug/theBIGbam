@@ -48,7 +48,7 @@ impl Default for ProcessConfig {
         Self {
             threads: 1,
             min_coverage: 50.0,
-            compress_ratio: 0.1,  // 10% change threshold
+            compress_ratio: 10.0,  // 10% change threshold
             circular: false,
         }
     }
@@ -279,7 +279,8 @@ pub fn process_sample(
             let contig = contigs.iter().find(|c| c.name == ref_name)?;
 
             // Process contig using streaming - single pass over reads
-            let arrays = match process_contig_streaming(&mut bam, &ref_name, ref_length, seq_type, flags, config.circular) {
+            // Early coverage check happens inside process_contig_streaming
+            let arrays = match process_contig_streaming(&mut bam, &ref_name, ref_length, seq_type, flags, config.circular, config.min_coverage) {
                 Ok(Some(arrays)) => arrays,
                 Ok(None) => return None,
                 Err(e) => {
@@ -288,11 +289,8 @@ pub fn process_sample(
                 }
             };
 
-            // Check coverage percentage
+            // Coverage already checked in process_contig_streaming
             let coverage_pct = arrays.coverage_percentage();
-            if coverage_pct < config.min_coverage {
-                return None;
-            }
 
             let presence = PresenceData {
                 contig_name: contig.name.clone(),

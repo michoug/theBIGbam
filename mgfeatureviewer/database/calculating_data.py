@@ -10,7 +10,7 @@ except ImportError:
     _rust = None
 
 
-def calculating_all_features_parallel(list_modules, bam_files, output_db, min_coverage, compress_ratio=0.1, n_sample_cores=None, genbank_path=None, annotation_tool=""):
+def calculating_all_features_parallel(list_modules, bam_files, output_db, min_coverage, compress_ratio, circular=False, n_sample_cores=None, genbank_path=None, annotation_tool=""):
     """Process all BAM files in parallel using Rust bindings."""
     if not HAS_RUST:
         sys.exit("ERROR: Rust bindings (mgfeatureviewer_rs) are required but not available. Please install them first.")
@@ -31,6 +31,7 @@ def calculating_all_features_parallel(list_modules, bam_files, output_db, min_co
         annotation_tool=annotation_tool,
         min_coverage=float(min_coverage),
         compress_ratio=float(compress_ratio),
+        circular=circular,
     )
 
     total_time = result.get("total_time", 0.0)
@@ -47,8 +48,9 @@ def add_calculate_args(parser):
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
     parser.add_argument("-o", "--output", required=True, help="Output database file path (.db)")
     parser.add_argument("-a", "--annotation_tool", default="", help="Optional: to color the contigs specify the annotation tool used (options allowed: pharokka)")
-    parser.add_argument("--min_coverage", type=int, default=50, help="Minimum alignment-length coverage proportion for contig inclusion")
-    parser.add_argument("--compress_ratio", type=float, default=0.1, help="RLE compression ratio (e.g., 0.1 = 10%% change threshold)")
+    parser.add_argument("--min_coverage", type=int, default=50, help="Minimum alignment-length coverage proportion for contig inclusion (default 50%% change threshold)")
+    parser.add_argument("--compress_ratio", type=float, default=10, help="RLE compression ratio (default 10%% change threshold)")
+    parser.add_argument("--circular", action="store_true", help="Set if assembly was doubled during mapping (enables modulo logic)")
 
 def run_calculate_args(args):
     annotation_tool = args.annotation_tool
@@ -63,6 +65,7 @@ def run_calculate_args(args):
     requested_modules = args.modules.split(",")
     min_coverage = args.min_coverage
     compress_ratio = args.compress_ratio
+    circular = args.circular
     n_cores = int(args.threads)
 
     output_db = args.output
@@ -71,7 +74,7 @@ def run_calculate_args(args):
 
     print("Calculating values for all requested features from mapping files...", flush=True)
     calculating_all_features_parallel(
-        requested_modules, bam_files, output_db, min_coverage, compress_ratio, n_cores,
+        requested_modules, bam_files, output_db, min_coverage, compress_ratio, circular, n_cores,
         genbank_path=args.genbank, annotation_tool=annotation_tool
     )
 

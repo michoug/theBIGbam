@@ -16,13 +16,13 @@ def _double_fasta(in_path: Path, out_path: Path) -> None:
             SeqIO.write(rec, fh, "fasta")
 
 def add_mapping_per_sample_args(parser):
-    parser.add_argument('--read1', required=True, help='Read1 fastq/fastq.gz')
-    parser.add_argument('--read2', help='Read2 fastq/fastq.gz (optional)')
-    parser.add_argument('--assembly', required=True, help='Assembly fasta to map against')
-    parser.add_argument('--sequencing-type', required=True, choices=['long', 'short'], help='Sequencing type: long or short')
-    parser.add_argument('--threads', type=int, default=4, help='Threads to pass to minimap2/samtools')
-    parser.add_argument('--circular', action='store_true', help='Treat assembly as circular (double sequences)')
-    parser.add_argument('--output', required=True, help='Output BAM path (will be written)')
+    parser.add_argument('-r1', '--read1', required=True, help='Read1 (fastq/fastq.gz)')
+    parser.add_argument('-r2', '--read2', help='Read2 (fastq/fastq.gz; optional)')
+    parser.add_argument('-a', '--assembly', required=True, help='Reference assembly to map against (fasta file)')
+    parser.add_argument('-s', '--sequencing-type', required=True, choices=['long', 'short'], help='Sequencing type: use "long" or "short"')
+    parser.add_argument('--circular', action='store_true', help='Concatenate each contig to itself during the mapping to circularize it')
+    parser.add_argument('-o', '--output', required=True, help='Output BAM path (will be written)')
+    parser.add_argument('-t', '--threads', type=int, default=4, help='Threads to pass to minimap2 and samtools (default: 4)')
 
 def run_mapping_per_sample(args):
     read2 = Path(args.read2) if getattr(args, 'read2', None) else None
@@ -101,11 +101,12 @@ def map_with_minimap2(threads: int, assembly_file: Path, sequencing_type: str, r
                 pass
 
 def add_mapping_all_args(parser):
-    parser.add_argument('--csv', required=True, help='CSV file with columns: assembly_file,read1,read2,sequencing_type')
-    parser.add_argument('--assembly', help='Assembly file to use for all rows (overrides CSV field)')
-    parser.add_argument('--circular', action='store_true', help='Treat assemblies as circular (double sequences)')
-    parser.add_argument('--output-dir', required=True, help='Directory to create and place outputs (must NOT exist)')
-    parser.add_argument('--threads', type=int, default=4, help='Threads to pass to minimap2/samtools')
+    parser.add_argument('--csv', required=True, help='CSV file with comma-separated columns: read1,read2,sequencing_type,assembly_file')
+    parser.add_argument('-a', '--assembly', help='Assembly file to use for all rows (overrides CSV field; optional)')
+    parser.add_argument('-s', '--sequencing-type', choices=['long', 'short'], help='Sequencing type: use "long" or "short"')
+    parser.add_argument('--circular', action='store_true', help='Concatenate each contig to itself during the mapping to circularize it')
+    parser.add_argument('-o', '--output-dir', required=True, help='Directory to create and place outputs (must NOT exist)')
+    parser.add_argument('-t', '--threads', type=int, default=4, help='Threads to pass to minimap2 and samtools (default: 4)')
 
 def run_mapping_all(args):
     csv_path = Path(args.csv)
@@ -116,6 +117,8 @@ def run_mapping_all(args):
     if outdir.exists():
         raise FileExistsError(f"Output directory already exists: {outdir}")
     outdir.mkdir(parents=True, exist_ok=False)
+
+    global_seqtype = args.sequencing_type if getattr(args, 'sequencing_type', None) else None
 
     global_assembly = Path(args.assembly) if getattr(args, 'assembly', None) else None
     if global_assembly and not global_assembly.exists():
@@ -140,24 +143,12 @@ def run_mapping_all(args):
         row = [c.strip() for c in raw]
         while len(row) < 4:
             row.append("")
-        assembly, read1, read2, seqtype = row[:4]
+        read1, read2, seqtype, assembly = row[:4]
         read2 = read2 or None
         seqtype = seqtype.lower() if seqtype else None
 
         if not read1:
             raise ValueError(f"Row {i}: read1 is required")
-
-        assembly_to_use = global_assembly if global_assembly else (Path(assembly) if assembly else None)
-        if assembly_to_use is None:
-            raise ValueError(f"Row {i}: no assembly provided (neither CSV nor --assembly)")
-        if not assembly_to_use.exists():
-            raise FileNotFoundError(f"Row {i}: assembly not found: {assembly_to_use}")
-
-        if not seqtype:
-            raise ValueError(f"Row {i}: sequencing_type is required (long or short)")
-        if seqtype not in {"long", "short"}:
-            raise ValueError(f"Row {i}: sequencing_type must be 'long' or 'short', got: {seqtype}")
-
         read1p = Path(read1)
         if not read1p.exists():
             raise FileNotFoundError(f"Row {i}: read1 file not found: {read1p}")
@@ -165,6 +156,18 @@ def run_mapping_all(args):
         read2p = Path(read2) if read2 else None
         if read2p and not read2p.exists():
             raise FileNotFoundError(f"Row {i}: read2 file not found: {read2p}")
+        
+        seqtype_to_use = global_seqtype if global_seqtype else seqtype
+        if not seqtype_to_use:
+            raise ValueError(f"Row {i}: sequencing_type is required (long or short)")
+        if seqtype_to_use not in {"long", "short"}:
+            raise ValueError(f"Row {i}: sequencing_type must be 'long' or 'short', got: {seqtype_to_use}")
+        
+        assembly_to_use = global_assembly if global_assembly else (Path(assembly) if assembly else None)
+        if assembly_to_use is None:
+            raise ValueError(f"Row {i}: no assembly provided (neither CSV nor --assembly)")
+        if not assembly_to_use.exists():
+            raise FileNotFoundError(f"Row {i}: assembly not found: {assembly_to_use}")
 
         basename_read1 = read1p.stem
         basename_assembly = Path(assembly_to_use).stem
@@ -173,7 +176,7 @@ def run_mapping_all(args):
         print(f"Processing row {i}: {read1p} -> assembly {assembly_to_use} (seqtype={seqtype}) -> {desired_bam}")
 
         # Local execution
-        map_with_minimap2(args.threads, assembly_to_use, seqtype, read1p, read2p, desired_bam, circular=getattr(args, 'circular', False))
+        map_with_minimap2(args.threads, assembly_to_use, seqtype_to_use, read1p, read2p, desired_bam, circular=getattr(args, 'circular', False))
 
     print("All rows processed")
     return 0

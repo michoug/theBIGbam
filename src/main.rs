@@ -72,12 +72,12 @@ struct Args {
     #[arg(short = 'a', long, default_value = "")]
     annotation_tool: String,
 
-    /// Minimum coverage percentage for contig inclusion
+    /// Minimum alignment-length coverage proportion for contig inclusion (default 50%% change threshold)
     #[arg(long, default_value = "50")]
     min_coverage: f64,
 
-    /// Relative tolerance for RLE compression (e.g., 0.1 = 10% change threshold)
-    #[arg(long, default_value = "0.1")]
+    /// RLE compression ratio (default 10%% change threshold)
+    #[arg(long, default_value = "10")]
     compress_ratio: f64,
 
     /// Circular genome flag: set if assembly was doubled during mapping (enables modulo logic)

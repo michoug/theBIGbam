@@ -41,7 +41,7 @@ pub struct Run {
 /// - `values`: The signal to compress (e.g., coverage at each position)
 /// - `reference`: Optional reference signal (e.g., coverage for bar plots). Use None for curves.
 /// - `plot_type`: Curve (self-referential RLE) or Bars (threshold filtering)
-/// - `compress_ratio`: Relative tolerance (e.g., 0.1 for 10% change threshold)
+/// - `compress_ratio`: Relative tolerance (e.g., 10 for 10% change threshold)
 ///
 /// # Algorithm
 /// - **Curves** (reference=None): Adaptive RLE. Compresses based on value changes.
@@ -62,7 +62,7 @@ pub fn compress_signal_with_reference(
     values: &[f64],
     reference: Option<&[f64]>,
     plot_type: PlotType,
-    compress_ratio: f64,
+    mut compress_ratio: f64,
 ) -> Vec<Run> {
     let n = values.len();
     if n == 0 {
@@ -72,6 +72,7 @@ pub fn compress_signal_with_reference(
     let mut runs = Vec::new();
 
     // For bars with reference: save positions where value > coverage * compress_ratio
+    compress_ratio *= 0.01; // Convert percentage to fraction
     if matches!(plot_type, PlotType::Bars) && reference.is_some() {
         let coverage = reference.unwrap();
         let mut i = 0;
@@ -165,7 +166,7 @@ mod tests {
     fn test_adaptive_rle_simple() {
         // Test case from the documentation example
         let values = vec![100.0, 102.0, 98.0, 200.0, 205.0, 95.0, 100.0];
-        let compress_ratio = 0.1; // 10% tolerance
+        let compress_ratio = 10; // 10% tolerance
         
         let runs = compress_signal(&values, PlotType::Curve, compress_ratio);
         
@@ -192,7 +193,7 @@ mod tests {
     fn test_adaptive_rle_constant() {
         // All values the same - should produce one run
         let values = vec![50.0; 1000];
-        let compress_ratio = 0.1;
+        let compress_ratio = 10;
         
         let runs = compress_signal_with_reference(&values, None, PlotType::Curve, compress_ratio);
         
@@ -206,7 +207,7 @@ mod tests {
     fn test_adaptive_rle_spike() {
         // Constant with a spike - spike should be its own run
         let values = vec![100.0, 100.0, 500.0, 100.0, 100.0];
-        let compress_ratio = 0.1;
+        let compress_ratio = 10;
         
         let runs = compress_signal_with_reference(&values, None, PlotType::Curve, compress_ratio);
         
@@ -227,7 +228,7 @@ mod tests {
     #[test]
     fn test_adaptive_rle_empty() {
         let values: Vec<f64> = vec![];
-        let compress_ratio = 0.1;
+        let compress_ratio = 10;
         
         let runs = compress_signal_with_reference(&values, None, PlotType::Curve, compress_ratio);
         assert_eq!(runs.len(), 0);
@@ -239,7 +240,7 @@ mod tests {
         // Scenario: constant mismatches (5) but varying coverage
         let coverage = vec![1000.0, 1000.0, 1000.0, 50.0, 50.0, 1000.0, 1000.0];
         let mismatches = vec![5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0];
-        let compress_ratio = 0.1; // 10% threshold
+        let compress_ratio = 10; // 10% threshold
         
         // Positions 0-2: 5 <= 0.1*1000 (100) → filtered out (insignificant at high coverage)
         // Positions 3-4: 5 > 0.1*50 (5) → saved as run (significant at low coverage!)
@@ -259,7 +260,7 @@ mod tests {
     fn test_bars_without_reference_fallback() {
         // Test that bars without reference fall back to curve-like behavior
         let values = vec![5.0, 5.0, 50.0, 50.0, 5.0];
-        let compress_ratio = 0.1;
+        let compress_ratio = 10;
         
         let runs = compress_signal_with_reference(&values, None, PlotType::Bars, compress_ratio);
         

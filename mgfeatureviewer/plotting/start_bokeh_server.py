@@ -11,7 +11,7 @@ from bokeh.models.plots import GridPlot
 # Import the plotting function from the repo
 from .plotting_data_per_sample import generate_bokeh_plot_per_sample
 from .plotting_data_all_samples import generate_bokeh_plot_all_samples
-from .data_accessor import DataAccessor
+from mgfeatureviewer.database.data_accessor import DataAccessor
 
 def build_controls(conn):
     """Query DB and return widgets and helper mappings."""
@@ -80,7 +80,7 @@ def modify_doc_factory(db_path):
                  or a .db file (Python output with Feature_* tables)
     """
     # Load the CSS
-    css_path = os.path.join(os.path.dirname(__file__), "..", "static", "bokeh_styles.css")
+    css_path = os.path.join(os.path.dirname(__file__), "..", "..", "static", "bokeh_styles.css")
     with open(css_path) as f:
         css_text = f.read()
     stylesheet = InlineStyleSheet(css=css_text)

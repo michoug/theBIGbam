@@ -7,10 +7,23 @@ from bokeh.layouts import gridplot
 from bokeh.plotting import output_file, save, figure
 from dna_features_viewer import BiopythonTranslator
 
-from . import colors_for_genbank
-from .data_accessor import DataAccessor
-
 ### Custom translator for coloring and labeling features (with DNAFeaturesViewer python library)
+# Define function-to-color mapping
+# Use the color scheme from pharokka
+PHAROKKA_COLORS = {
+    "vfdb_card": "#FF0000",
+    "unknown function": "#AAAAAA",
+    "other": "#4deeea",
+    "tail": "#74ee15",
+    "transcription regulation": "#ffe700",
+    "dna, rna and nucleotide metabolism": "#f000ff",
+    "lysis": "#001eff",
+    "moron, auxiliary metabolic gene and host takeover": "#8900ff",
+    "integration and excision": "#E0B0FF",
+    "head and packaging": "#ff008d",
+    "connector": "#5A5A5A",
+}
+
 class CustomTranslator(BiopythonTranslator):
     def compute_feature_color(self, feature):
         if feature.qualifiers.get("annotation_tool", []) == "pharokka":
@@ -25,7 +38,7 @@ class CustomTranslator(BiopythonTranslator):
 
             function = function.lower()
 
-            color_scheme = colors_for_genbank.PHAROKKA_COLORS
+            color_scheme = PHAROKKA_COLORS
             for key, color in color_scheme.items():
                 if key in function:
                     return color

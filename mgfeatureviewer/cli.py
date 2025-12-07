@@ -3,15 +3,11 @@ import os
 import sys
 
 # Import command modules so we can share arg definitions and run functions
-from mgfeatureviewer import (
-    assembly_annotation,
-    calculating_data,
-    add_variable,
-    plotting_data_per_sample,
-    plotting_data_all_samples,
-    read_mapping,
-    start_bokeh_server,
+from mgfeatureviewer.utils import (
+    read_mapping, assembly_annotation
 )
+from mgfeatureviewer.database import add_variable, calculating_data
+from mgfeatureviewer.plotting import plotting_data_all_samples, plotting_data_per_sample, start_bokeh_server
 
 # Path helpers
 BASE_DIR = os.path.dirname(__file__)
@@ -184,7 +180,8 @@ def main(argv=None):
                 output=output_db_abs,
                 annotation_tool=args.annotation_tool,
                 min_coverage=50,
-                compress_ratio=0.1,
+                compress_ratio=10,
+                circular=bool(getattr(args, 'circular', False)),
             )
             print(f"Starting calculation step -> output: {calc_ns.output}")
             calculating_data.run_calculate_args(calc_ns)
@@ -196,7 +193,7 @@ def main(argv=None):
     # DB inspection commands (call into package functions)
     if args.cmd == 'list-variables':
         try:
-            from mgfeatureviewer import database_getters
+            from mgfeatureviewer.database import database_getters
             database_getters.list_variables(args.db, args.detailed)
             return 0
         except Exception as e:
@@ -205,7 +202,7 @@ def main(argv=None):
 
     if args.cmd == 'list-samples':
         try:
-            from mgfeatureviewer import database_getters
+            from mgfeatureviewer.database import database_getters
             database_getters.list_samples(args.db)
             return 0
         except Exception as e:
@@ -214,7 +211,7 @@ def main(argv=None):
 
     if args.cmd == 'list-contigs':
         try:
-            from mgfeatureviewer import database_getters
+            from mgfeatureviewer.database import database_getters
             database_getters.list_contigs(args.db)
             return 0
         except Exception as e:

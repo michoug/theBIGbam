@@ -48,7 +48,6 @@ pub use types::{
 
 #[cfg(feature = "python")]
 mod python {
-    use super::*;
     use pyo3::prelude::*;
     use pyo3::types::PyDict;
     use std::path::Path;
@@ -77,7 +76,7 @@ mod python {
     ///         - "samples_failed": int
     ///         - "total_time": float (seconds)
     #[pyfunction]
-    #[pyo3(signature = (genbank_path, bam_dir, output_db, modules, threads, annotation_tool="", min_coverage=50.0, compress_ratio=0.1, create_indexes=true))]
+    #[pyo3(signature = (genbank_path, bam_dir, output_db, modules, threads, annotation_tool="", min_coverage=50.0, compress_ratio=0.1, circular=false, create_indexes=true))]
     fn process_all_samples<'py>(
         py: Python<'py>,
         genbank_path: &str,
@@ -88,6 +87,7 @@ mod python {
         annotation_tool: &str,
         min_coverage: f64,
         compress_ratio: f64,
+        circular: bool,
         create_indexes: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         use crate::processing::{run_all_samples, ProcessConfig};
@@ -96,6 +96,7 @@ mod python {
             threads,
             min_coverage,
             compress_ratio,
+            circular,
         };
 
         // Release the GIL and call the shared processing function
