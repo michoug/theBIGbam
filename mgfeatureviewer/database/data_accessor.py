@@ -96,6 +96,11 @@ class DataAccessor:
             )
             data_rows = cur.fetchall()
             
+            # Debug: log if we have data but it's not being plotted
+            if data_rows:
+                print(f"[DataAccessor] Found {len(data_rows)} rows for {feature_table} (sample_id={sample_id}, contig_id={contig_id})", flush=True)
+                print(f"[DataAccessor] First row: first_pos={data_rows[0][0]}, last_pos={data_rows[0][1]}, value={data_rows[0][2]}", flush=True)
+            
             # Expand RLE runs into individual points for plotting
             x_coords = []
             y_coords = []
@@ -115,6 +120,8 @@ class DataAccessor:
                     else:
                         x_coords.extend([first_pos, last_pos])
                         y_coords.extend([value, value])
+            
+            print(f"[DataAccessor] After expansion: {len(x_coords)} points for {feature_table}", flush=True)
             
             feature_dict["x"] = x_coords
             feature_dict["y"] = y_coords

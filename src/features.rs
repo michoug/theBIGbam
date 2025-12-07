@@ -385,16 +385,9 @@ pub fn process_read(
     arrays.covered[cov_start..cov_end].fill(true);
 
     // -------------------------------------------------------------------------
-    // Coverage module: simple increment
+    // Coverage module: primary mappings only
     // -------------------------------------------------------------------------
     if flags.coverage {
-        // increment_circular handles wrap-around for circular genomes
-        if circular {
-            arrays.coverage.increment_circular(start, end, 1);
-        } else {
-            arrays.coverage.increment_range(start, end, 1);
-        }
-        
         // Track secondary and supplementary reads separately
         if is_secondary {
             if circular {
@@ -402,20 +395,26 @@ pub fn process_read(
             } else {
                 arrays.secondary_reads.increment_range(start, end, 1);
             }
-        }
-        if is_supplementary {
+        } else if is_supplementary {
             if circular {
                 arrays.supplementary_reads.increment_circular(start, end, 1);
             } else {
                 arrays.supplementary_reads.increment_range(start, end, 1);
             }
+        } else {
+            // Only count primary mappings in main coverage
+            if circular {
+                arrays.coverage.increment_circular(start, end, 1);
+            } else {
+                arrays.coverage.increment_range(start, end, 1);
+            }
         }
     }
 
     // -------------------------------------------------------------------------
-    // Phagetermini module
+    // Phagetermini module - primary mappings only
     // -------------------------------------------------------------------------
-    if flags.phagetermini {
+    if flags.phagetermini && !is_secondary && !is_supplementary {
         // For long reads, we also check the end for clipping/mismatches
         let check_end = seq_type.is_long();
 
@@ -424,9 +423,9 @@ pub fn process_read(
         let start_matches = raw_has_match_at_position(cigar_raw, md_tag, true);
         let end_matches = !check_end || raw_has_match_at_position(cigar_raw, md_tag, false);
 
-        // Only count "clean" reads for phage termini detection
+        // Only count "clean" primary reads for phage termini detection
         if start_matches && end_matches {
-            // Update coverage_reduced (clean coverage)
+            // Update coverage_reduced (clean coverage from primary mappings only)
             if circular {
                 arrays.coverage_reduced.increment_circular_inclusive(start, end, 1);
             } else {
@@ -446,9 +445,9 @@ pub fn process_read(
     }
 
     // -------------------------------------------------------------------------
-    // Assemblycheck module
+    // Assemblycheck module - primary mappings only
     // -------------------------------------------------------------------------
-    if flags.assemblycheck {
+    if flags.assemblycheck && !is_secondary && !is_supplementary {
         // --- Read lengths (long reads only) ---
         // Track sum and count to compute average read length at each position
         if seq_type.is_long() {

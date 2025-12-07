@@ -4,8 +4,8 @@ import sqlite3
 import traceback
 
 from bokeh.layouts import column, row
-from bokeh.models import Div, InlineStyleSheet, Tooltip
-from bokeh.models.widgets import Select, CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup
+from bokeh.models import Div, InlineStyleSheet, Tooltip, CustomJS
+from bokeh.models.widgets import AutocompleteInput, CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup
 from bokeh.models.plots import GridPlot
 
 # Import the plotting function from the repo
@@ -17,15 +17,29 @@ def build_controls(conn):
     """Query DB and return widgets and helper mappings."""
     cur = conn.cursor()
 
-    # Widget Selector for Contigs
+    # Widget Selector for Contigs (autocomplete with max 20 suggestions)
     cur.execute("SELECT Contig_name FROM Contig ORDER BY Contig_name")
     contigs = [r[0] for r in cur.fetchall()]
-    contig_select = Select(value=contigs[0], options=contigs, sizing_mode="stretch_width")
+    contig_select = AutocompleteInput(value=contigs[0] if contigs else "", 
+                                      completions=contigs, 
+                                      min_characters=1,
+                                      case_sensitive=False,
+                                      restrict=False,
+                                      max_completions=20,
+                                      placeholder="Type to search contigs...",
+                                      sizing_mode="stretch_width")
 
-    # Widget Selector for Samples
+    # Widget Selector for Samples (autocomplete with max 20 suggestions)
     cur.execute("SELECT Sample_name FROM Sample ORDER BY Sample_name")
     samples = [r[0] for r in cur.fetchall()]
-    sample_select = Select(value=samples[0], options=samples, sizing_mode="stretch_width")
+    sample_select = AutocompleteInput(value=samples[0] if samples else "", 
+                                      completions=samples,
+                                      min_characters=1,
+                                      case_sensitive=False,
+                                      restrict=False,
+                                      max_completions=20,
+                                      placeholder="Type to search samples...",
+                                      sizing_mode="stretch_width")
 
     # Modules and variables
     cur.execute("SELECT DISTINCT Module FROM Variable")
@@ -68,7 +82,9 @@ def build_controls(conn):
         'module_names': module_names,
         'module_widgets': module_widgets,
         'helps_widgets': helps_widgets,
-        'variables_widgets': variables_widgets
+        'variables_widgets': variables_widgets,
+        'contigs': contigs,
+        'samples': samples
     }
     return widgets
 
@@ -113,8 +129,8 @@ def modify_doc_factory(db_path):
         contig_to_samples.setdefault(contig_name, set()).add(sample_name)
 
     # Keep original full lists so we can restore when filters are off
-    orig_contigs = list(widgets['contig_select'].options)
-    orig_samples = list(widgets['sample_select'].options)
+    orig_contigs = list(widgets['contigs'])
+    orig_samples = list(widgets['samples'])
 
     contigs_title = Div(text="<b>Contig</b>")
     filter_contigs = CheckboxGroup(labels=["Only show contigs present with selected sample"], active=[])
@@ -122,30 +138,30 @@ def modify_doc_factory(db_path):
     samples_title = Div(text="<b>Sample</b>")
     filter_samples = CheckboxGroup(labels=["Only show samples present with selected contig"], active=[])
 
-    # Helper functions to refresh options based on filters
+    # Helper functions to refresh completions based on filters
     def refresh_contig_options():
         if 0 in filter_contigs.active and views.active == 0:
             sel_sample = widgets['sample_select'].value
             allowed = sample_to_contigs.get(sel_sample, set())
-            options = [c for c in orig_contigs if c in allowed]
+            completions = [c for c in orig_contigs if c in allowed]
         else:
-            options = list(orig_contigs)
+            completions = list(orig_contigs)
 
-        widgets['contig_select'].options = options
-        if widgets['contig_select'].value not in options:
-            widgets['contig_select'].value = options[0] if options else ""
+        widgets['contig_select'].completions = completions
+        if widgets['contig_select'].value not in completions:
+            widgets['contig_select'].value = completions[0] if completions else ""
 
     def refresh_sample_options():
         if 0 in filter_samples.active and views.active == 0:
             sel_contig = widgets['contig_select'].value
             allowed = contig_to_samples.get(sel_contig, set())
-            options = [s for s in orig_samples if s in allowed]
+            completions = [s for s in orig_samples if s in allowed]
         else:
-            options = list(orig_samples)
+            completions = list(orig_samples)
 
-        widgets['sample_select'].options = options
-        if widgets['sample_select'].value not in options:
-            widgets['sample_select'].value = options[0] if options else ""
+        widgets['sample_select'].completions = completions
+        if widgets['sample_select'].value not in completions:
+            widgets['sample_select'].value = completions[0] if completions else ""
 
     # Global lock for toggles when enforcing single-variable mode
     global_toggle_lock = {'locked': False}
@@ -269,20 +285,24 @@ def modify_doc_factory(db_path):
     
     # Append variable selectors. For modules that have a module-checkbox widget we
     # show either the checkbox (One-sample) or the plain module title (All-samples).
-    header_with_checkbox = []
-    header_with_title = []
+    # We create a container that holds both variants and toggle visibility.
     for i, module_widget in enumerate(widgets['module_widgets']):
         module_name = widgets['module_names'][i]
-        module_title_div = Div(text=f"{module_name}")
-
+        
         help_btn = widgets['helps_widgets'][i]
 
         # Build two header variants: one with the checkbox (shows module name as label)
         # and one with the plain title (used when checkbox is hidden). Both may include the help button.
         if module_widget is not None:
+            # Create separate title div for the title-only header
+            module_title_div = Div(text=f"{module_name}")
+            
             if help_btn is not None:
-                hdr_cb = row(module_widget, help_btn, sizing_mode="stretch_width")
-                hdr_title = row(module_title_div, help_btn, sizing_mode="stretch_width")
+                # Need separate help buttons for each header to avoid "already in doc" error
+                help_btn_cb = HelpButton(tooltip=help_btn.tooltip, width=30, height=30, align="center")
+                help_btn_title = HelpButton(tooltip=help_btn.tooltip, width=30, height=30, align="center")
+                hdr_cb = row(module_widget, help_btn_cb, sizing_mode="stretch_width")
+                hdr_title = row(module_title_div, help_btn_title, sizing_mode="stretch_width")
             else:
                 hdr_cb = module_widget
                 hdr_title = module_title_div
@@ -292,17 +312,21 @@ def modify_doc_factory(db_path):
             hdr_title.visible = False
             controls_children.append(hdr_cb)
             controls_children.append(hdr_title)
+            
+            header_with_checkbox.append(hdr_cb)
+            header_with_title.append(hdr_title)
         else:
             # No module checkbox exists: show plain title (with help if available)
+            module_title_div = Div(text=f"{module_name}")
             if help_btn is not None:
                 hdr = row(module_title_div, help_btn, sizing_mode="stretch_width")
             else:
                 hdr = module_title_div
             hdr.visible = True
             controls_children.append(hdr)
-
-        header_with_checkbox.append(hdr_cb if module_widget is not None else None)
-        header_with_title.append(hdr_title if module_widget is not None else hdr)
+            
+            header_with_checkbox.append(None)
+            header_with_title.append(hdr)
 
         # Add the module's CheckboxButtonGroup for variables
         cbg = widgets['variables_widgets'][i]

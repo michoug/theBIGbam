@@ -60,24 +60,36 @@ def map_with_minimap2(threads: int, assembly_file: Path, sequencing_type: str, r
             temp_files.append(doubled)
 
         # Build minimap2 command
+        # from https://github.com/lh3/minimap2/blob/6d49eb690f3c32ae2b95a796951397bf598396f0/minimap2.1#L721
+        # minimap2 options for sr 
+        # -k21 -w11 --sr --frag=yes -A2 -B8 -O12,32 -E2,1 -r100 -p.5 -N20 -f1000,5000 -n2 -m25 -s40 -g100 -2K50m --heap-sort=yes --secondary=no
+        # minimap2 options for map-ont
+        # default mode -> no particular options needed
         if sequencing_type == "long":
-            preset = "map-ont"
+            minimap2_cmd = [
+                "minimap2", "-ax", "map-ont", "-t", str(threads), str(work_assembly), str(read1)
+            ]
         else:
-            preset = "sr"
-
-        minimap2_cmd = [
-            "minimap2", "-ax", preset, "-t", str(threads), str(work_assembly), str(read1)
-        ]
+            # just removed --secondary=no to keep secondary alignments
+            #minimap2_cmd = [
+            #    "minimap2", "-a", "-k21", "-w11", "--sr", "--frag=yes", "-A2", "-B8", 
+            #    "-O12,32", "-E2,1", "-r100", "-p.5", "-N20", "-f1000,5000", "-n2", 
+            #    "-m25", "-s40", "-g100", "-2K50m", "--heap-sort=yes", 
+            #    "-t", str(threads), str(work_assembly), str(read1)
+            #]
+            minimap2_cmd = [
+                "minimap2", "-ax", "sr", "-t", str(threads), str(work_assembly), str(read1)
+            ]
+        
         if read2:
             minimap2_cmd.append(str(read2))
 
         sorted_bam = Path(tempfile.mkstemp(prefix=output_file.stem + "_sorted_", suffix=".bam")[1])
         temp_files.append(sorted_bam)
 
-        # Pipe: minimap2 | samtools view -bS -F 2052 | samtools sort -o sorted_bam
-        view_cmd = ["samtools", "view", "-@", str(threads), "-F", "2052", "-bS", "-"]
+        # Pipe: minimap2 | samtools view -bS -F 4 | samtools sort -o sorted_bam
+        view_cmd = ["samtools", "view", "-@", str(threads), "-F", "4", "-bS", "-"]
         sort_cmd = ["samtools", "sort", "-@", str(threads), "-o", str(sorted_bam), "-"]
-
         p1 = subprocess.Popen(minimap2_cmd, stdout=subprocess.PIPE)
         p2 = subprocess.Popen(view_cmd, stdin=p1.stdout, stdout=subprocess.PIPE)
         # Close p1.stdout in parent to allow p1 to receive SIGPIPE if p2 exits
@@ -85,9 +97,14 @@ def map_with_minimap2(threads: int, assembly_file: Path, sequencing_type: str, r
         subprocess.run(sort_cmd, stdin=p2.stdout, check=True)
         p2.stdout.close()
 
-        # Add MD tags and write final BAM
+        # Add MD tags and write final BAM (suppress warnings about secondary/supplementary alignments)
         with output_file.open("wb") as outfh:
-            subprocess.run(["samtools", "calmd", "-@", str(threads), "-b", str(sorted_bam), str(work_assembly)], stdout=outfh, check=True)
+            subprocess.run(
+                ["samtools", "calmd", "-@", str(threads), "-b", str(sorted_bam), str(work_assembly)],
+                stdout=outfh,
+                stderr=subprocess.DEVNULL,
+                check=True
+            )
 
         # Index final BAM
         subprocess.run(["samtools", "index", "-@", str(threads), str(output_file)], check=True)
@@ -169,7 +186,8 @@ def run_mapping_all(args):
         if not assembly_to_use.exists():
             raise FileNotFoundError(f"Row {i}: assembly not found: {assembly_to_use}")
 
-        basename_read1 = read1p.stem
+        path_read1 = Path(read1p)
+        basename_read1 = path_read1.name.replace("".join(path_read1.suffixes), "")
         basename_assembly = Path(assembly_to_use).stem
         desired_bam = outdir / f"{basename_read1}_mapped_on_{basename_assembly}.bam"
 

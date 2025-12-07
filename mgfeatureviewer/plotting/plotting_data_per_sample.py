@@ -97,16 +97,34 @@ def make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool,
 
     return annotation_fig
 
-def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None):
-    # Sanity check: ensure we have data to plot
-    if not feature_dict or all(len(vals["x"]) == 0 for vals in feature_dict):
-        return None
-    
+def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None, feature_name=None):
+    # Create the figure first (even if empty)
     p = figure(
         height=height,
         x_range=x_range,
         tools="xpan,reset,save"
     )
+    
+    # Check if we have data to plot
+    has_data = feature_dict and any(len(vals["x"]) > 0 for vals in feature_dict)
+    
+    if not has_data:
+        # No data: create empty subplot with message
+        if feature_name:
+            p.yaxis.axis_label = f"{feature_name} (no data)"
+        else:
+            p.yaxis.axis_label = "(no data)"
+        p.yaxis.axis_label_text_font_size = "10pt"
+        p.yaxis.axis_label_standoff = 0
+        p.y_range.start = 0
+        p.y_range.end = 1
+        p.toolbar.logo = None
+        p.xgrid.visible = False
+        p.ygrid.grid_line_alpha = 0.2
+        p.outline_line_color = None
+        p.min_border_left = 40
+        p.min_border_right = 10
+        return p
             
     for data_feature in feature_dict:
         xx = data_feature["x"]
@@ -253,15 +271,14 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
             list_feature_dict = get_feature_data(cur, feature, contig_id, sample_id,
                                                  accessor=accessor, contig_name=contig_name, sample_name=sample_name)
             
-            if not list_feature_dict:
-                continue
-
-            subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange)
-            if subplot_feature is not None:
-                subplots.append(subplot_feature)
+            # Always create subplot, even if empty
+            subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, feature_name=feature)
+            subplots.append(subplot_feature)
         except Exception as e:
             print(f"Error processing feature '{feature}': {e}", flush=True)
-            continue
+            # Create empty subplot with error message
+            subplot_feature = make_bokeh_subplot([], subplot_size, shared_xrange, feature_name=f"{feature} (error)")
+            subplots.append(subplot_feature)
 
     # --- Combine all figures in a single grid with one shared toolbar ---
     if not subplots:

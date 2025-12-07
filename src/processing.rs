@@ -112,7 +112,15 @@ fn add_features_from_arrays(
         add_compressed_feature(&coverage_f64, "coverage", contig_name, config, output);
         
         // Secondary reads (self-referential curve)
-        let secondary_reads_f64: Vec<f64> = arrays.secondary_reads.iter().map(|&x| x as f64).collect();
+        // When circular=true, subtract coverage to remove artifact secondary alignments from doubled assembly
+        let secondary_reads_f64: Vec<f64> = if config.circular {
+            arrays.secondary_reads.iter()
+                .zip(&arrays.coverage)
+                .map(|(&sec, &cov)| if sec > cov { (sec - cov) as f64 } else { 0.0 })
+                .collect()
+        } else {
+            arrays.secondary_reads.iter().map(|&x| x as f64).collect()
+        };
         add_compressed_feature(&secondary_reads_f64, "secondary_reads", contig_name, config, output);
         
         // Supplementary reads (self-referential curve)
@@ -213,17 +221,6 @@ fn add_features_from_arrays(
         }
 
         // Insert sizes (curve for paired reads, self-referential)  
-        if seq_type.is_short_paired() {
-            let values: Vec<f64> = arrays
-                .sum_insert_sizes
-                .iter()
-                .zip(&arrays.count_insert_sizes)
-                .map(|(&s, &c)| if c > 0 { s as f64 / c as f64 } else { 0.0 })
-                .collect();
-            add_compressed_feature(&values, "insert_sizes", contig_name, config, output);
-        }
-
-        // Insert sizes (derived, for short-paired)
         if seq_type.is_short_paired() {
             let values: Vec<f64> = arrays
                 .sum_insert_sizes

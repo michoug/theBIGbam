@@ -21,33 +21,7 @@ mgfeatureviewer -h
 rust install?
 
 # Usage
-If you already have mapping files, you can skip the "Mapping" section and go to the "Database computation" section.
-
-## Mapping
-You can start the pipeline with your reference contigs and read files. You can map one sample only or several samples at once. Sorted ".bam" files are generated for each file along an index file ".bam.bai".
-
-To map several samples, you need to provide a csv file containing 4 columns separated by commas: "read1,read2,sequencing_type,assembly_file". Only read1 is compulsory: read2 is only used for paired-reads, while sequencing_type and assembly_file can be provided via the global options -s and -a whether their values should be the same for all samples.
-
-Example of csv file (available in examples/inputs/HK97/mapping_rows.csv):
-```
-examples/inputs/HK97/HK97_R1_illumina.fastq.gz,examples/inputs/HK97/HK97_R2_illumina.fastq.gz,short,examples/inputs/HK97/HK97_GCF_000848825.1.fasta
-examples/inputs/HK97/HK97_nanopore.fastq.gz,,long,examples/inputs/HK97/HK97_GCF_000848825.1.fasta
-```
-
-The mapping proposed here allows a circularized mapping via the --circular flag. All contigs are concatenated to themselves, doubling the size of the assembly. It allows reads to map at the ends of the contigs without breaking. During the rest of the pipeline all calculation take into account that the mapping was circular if the --circular flag is provided: mappings at positions beyond the end of a contig are counted at that position minus the size of the contig instead.
-
-Another particularity of this mapping is that MD tags are computed using samtools. MD tags are useful to quickly identify mismatches among the mapped reads.
-
-Examples of commands to map a single sample or several:
-```sh
-DIR="examples/inputs/HK97"
-mgfeatureviewer mapping-per-sample -s "short" -r1 "${DIR}/HK97_R1_illumina.fastq.gz" -r2 "${DIR}/HK97_R2_illumina.fastq.gz" -a "${DIR}/HK97_GCF_000848825.1.fasta" -c -o "${DIR}/HK97_GCF_000848825.1_with_MD.bam"
-
-mgfeatureviewer mapping-all-samples --csv "${DIR}/mapping_rows.csv" -c -o "${DIR}/bams"
-```
-
-## Assembly annotation
-TODO 
+If you do not have an assembly annotation file (.genbank) or sorted mapping files with MD tags (.bam), you can start with the scripts provided in the "Assembly annotation" and "Mapping" sections below to obtain the required input files.
 
 ## Database computation
 This is the core of the MGFeatureViewer pipeline. It takes a genbank file containing your contigs of interest and a list of bam files containing the mappings against all or some of your contigs of interest. You should specify the --circular flag if you did a circular mapping as explained in the "Mapping" section. Only contigs where more than --min_coverage % of their length are covered by reads are considered during calculations to speed up the program. Moreover, you can balance between sensitivity and compactness with the --compress_ratio option: the higher the lighter the final database but with a risk of missing positions with potentially relevant features.
@@ -63,6 +37,9 @@ The output is an SQLite database containing all those values. This database is t
 
 Example of command to compute the database:
 ```sh
+# rm examples/outputs/HK97/HK97.db
+# maturin develop
+
 DIR="examples/inputs/HK97"
 mgfeatureviewer calculate -t 4 -g ${DIR}/HK97_GCF_000848825.1_pharokka.gbk -a pharokka -b ${DIR}/bams -m coverage,phagetermini,assemblycheck -c -o examples/outputs/HK97/HK97.db --circular --compress-ratio=10
 
@@ -84,6 +61,33 @@ mgfeatureviewer add-variable examples/outputs/HK97/HK97.db test bars "#f60820" "
 mgfeatureviewer add-variable examples/outputs/HK97/HK97.db test2 curve "#aef1c2" "Test Curve" examples/inputs/HK97/variable_test2.csv
 ```
 
+# Utils
+
+## Mapping
+You can start the pipeline with your reference contigs and read files. You can map one sample only or several samples at once. Sorted ".bam" files are generated for each file along an index file ".bam.bai".
+
+To map several samples, you need to provide a csv file containing 4 columns separated by commas: "read1,read2,sequencing_type,assembly_file". Only read1 is compulsory: read2 is only used for paired-reads, while sequencing_type and assembly_file can be provided via the global options -s and -a whether their values should be the same for all samples.
+
+Example of csv file (available in examples/inputs/HK97/mapping_rows.csv):
+```
+examples/inputs/HK97/HK97_R1_illumina.fastq.gz,examples/inputs/HK97/HK97_R2_illumina.fastq.gz,short,examples/inputs/HK97/HK97_GCF_000848825.1.fasta
+examples/inputs/HK97/HK97_nanopore.fastq.gz,,long,examples/inputs/HK97/HK97_GCF_000848825.1.fasta
+```
+
+The mapping proposed here allows a circularized mapping via the --circular flag. All contigs are concatenated to themselves, doubling the size of the assembly. It allows reads to map at the ends of the contigs without breaking. During the rest of the pipeline all calculation take into account that the mapping was circular if the --circular flag is provided: mappings at positions beyond the end of a contig are counted at that position minus the size of the contig instead.
+
+Another particularity of this mapping is that MD tags are computed using samtools. MD tags are useful to quickly identify mismatches among the mapped reads.
+
+Examples of commands to map a single sample or several:
+```sh
+DIR="examples/inputs/HK97"
+mgfeatureviewer mapping-per-sample -s "short" -r1 "${DIR}/HK97_R1_illumina.fastq.gz" -r2 "${DIR}/HK97_R2_illumina.fastq.gz" -a "${DIR}/HK97_GCF_000848825.1.fasta" -o "${DIR}/HK97_GCF_000848825.1_with_MD.bam" --circular
+
+mgfeatureviewer mapping-all-samples --csv "${DIR}/mapping_rows.csv" -o "${DIR}/bams" --circular
+```
+
+## Assembly annotation
+TODO 
 
 
 
@@ -116,3 +120,14 @@ explain what are different features
 explain database structure
 explain how to interrogate database with sql
 assembly annotation explanation
+
+mention how secondary is an approximation in case of doubled mapping because some primary at the ends of the contig would not have associated secondary. as i keep a minimum of 0 secondary, i will not see if some true secondary appear there. but this is minor and allows to go way faster than checking each read individually to remove secondary associated exactly to a primary read
+
+tab to complete in plot  Contig and Sample if only one value possible
+
+
+need to rethink avout what i plot
+secondary and supplemnentary if i had them for minimap2
+i get insert_sizes and bad_orientations messed up in circular mode
+also think about proper way to calculate sequencing_type
+and parameters i should pass to assembly_annotation

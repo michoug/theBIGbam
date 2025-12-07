@@ -74,16 +74,16 @@ def run_add_variable(args):
 
         with open(csv_file, newline="") as f:
             reader = csv.DictReader(f)
-            next(reader)
             for row in reader:
                 line_no += 1
                 try:
                     sample = row["sample"].strip()
                     contig = row["contig"].strip()
-                    pos = int(row["position"])
+                    first_pos = int(row["first_position"])
+                    last_pos = int(row["last_position"])
                     value = float(row["value"])
                 except KeyError:
-                    raise ValueError(f"ERROR: CSV missing required columns (sample, contig, position, value)")
+                    raise ValueError(f"ERROR: CSV missing required columns (sample,contig,first_position,last_position,value)")
                 except ValueError:
                     raise ValueError(f"ERROR: Invalid number at line {line_no}: {row}")
 
@@ -94,8 +94,10 @@ def run_add_variable(args):
                     raise ValueError(f"ERROR: Contig '{contig}' not found in database (line {line_no})")
 
                 contig_id, contig_length = contigs_info[contig]
-                if pos < 0 or pos > contig_length:
-                    raise ValueError(f"ERROR: Position {pos} out of range for contig '{contig}' (length={contig_length}) at line {line_no}")
+                if first_pos > last_pos:
+                    raise ValueError(f"ERROR: first_position > last_position at line {line_no}")
+                if first_pos < 0 or last_pos > contig_length:
+                    raise ValueError(f"ERROR: Position out of bounds for contig '{contig}' (length {contig_length}) at line {line_no}")
 
                 # --- Check sample/contig pair is present ---
                 sample_id = samples[sample]
@@ -110,7 +112,33 @@ def run_add_variable(args):
                         presences_validated.append((contig_id, sample_id))
 
                 if (contig_id, sample_id) in presences_validated:
-                    rows_to_insert.append((contig_id, sample_id, pos, value))
+                    rows_to_insert.append((contig_id, sample_id, first_pos, last_pos, value))
+
+        # --- Check for overlapping ranges within each contig/sample pair ---
+        # Group rows by (contig_id, sample_id)
+        groups = {}
+        for contig_id, sample_id, first_pos, last_pos, value in rows_to_insert:
+            key = (contig_id, sample_id)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append((first_pos, last_pos))
+        
+        # Check for overlaps in each group
+        for (contig_id, sample_id), ranges in groups.items():
+            # Sort ranges by start position
+            sorted_ranges = sorted(ranges)
+            for i in range(len(sorted_ranges) - 1):
+                curr_start, curr_end = sorted_ranges[i]
+                next_start, next_end = sorted_ranges[i + 1]
+                # Check if ranges overlap: current range ends after next range starts
+                if curr_end >= next_start:
+                    # Find the contig and sample names for better error message
+                    contig_name = [name for name, (cid, _) in contigs_info.items() if cid == contig_id][0]
+                    sample_name = [name for name, sid in samples.items() if sid == sample_id][0]
+                    raise ValueError(
+                        f"ERROR: Overlapping ranges detected for contig '{contig_name}' and sample '{sample_name}': "
+                        f"[{curr_start}, {curr_end}] overlaps with [{next_start}, {next_end}]"
+                    )
 
         # --- Create new variable ---
         cur.execute("""
@@ -124,7 +152,8 @@ def run_add_variable(args):
             Feature_id INTEGER PRIMARY KEY AUTOINCREMENT,
             Contig_id INTEGER,
             Sample_id INTEGER,
-            Position INTEGER,
+            First_position INTEGER,
+            Last_position INTEGER,
             Value REAL,
             FOREIGN KEY(Contig_id) REFERENCES Contig(Contig_id),
             FOREIGN KEY(Sample_id) REFERENCES Sample(Sample_id)
@@ -133,7 +162,7 @@ def run_add_variable(args):
 
         # --- Insert data ---
         if rows_to_insert:
-            cur.executemany(f"INSERT INTO {feature_table} (Contig_id, Sample_id, Position, Value) VALUES (?, ?, ?, ?)", rows_to_insert)
+            cur.executemany(f"INSERT INTO {feature_table} (Contig_id, Sample_id, First_position, Last_position, Value) VALUES (?, ?, ?, ?, ?)", rows_to_insert)
 
         conn.commit()
         print(f"Variable '{var_name}' added and {len(rows_to_insert)} records inserted into '{feature_table}'")
