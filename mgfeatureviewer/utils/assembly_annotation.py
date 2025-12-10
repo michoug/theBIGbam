@@ -8,12 +8,12 @@ from typing import Optional
 
 def add_annotation_args(parser):
     parser.add_argument('--csv', required=True, help='CSV file with columns: assembly_file,read1,read2,sequencing_type')
-    parser.add_argument('--assembly', help='Assembly file to use for all rows (overrides CSV field)')
+    parser.add_argument('-a', '--assembly', help='Assembly file to use for all rows (overrides CSV field)')
     parser.add_argument('--annotation_tool', required=True, choices=['pharokka', 'bakta'], help='Annotation tool to run')
     parser.add_argument('--annotation_db', required=True, help='Annotation tool database path/identifier (passed to pharokka/bakta via --db)')
     parser.add_argument('--meta', action='store_true', help='Pass --meta flag to the annotator')
-    parser.add_argument('--threads', type=int, default=4, help='Threads to pass to the annotation tool')
-    parser.add_argument('--genbank', required=True, help='Final GenBank file path to write (gbk or gbff extension)')
+    parser.add_argument('-t', '--threads', type=int, default=4, help='Threads to pass to the annotation tool')
+    parser.add_argument('-g', '--genbank', required=True, help='Final GenBank file path to write (gbk or gbff extension)')
 
 def _collect_assembly_paths_from_csv(csv_path: Path) -> List[Path]:
     import csv

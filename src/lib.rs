@@ -76,7 +76,6 @@ mod python {
     ///         - "samples_failed": int
     ///         - "total_time": float (seconds)
     #[pyfunction]
-    #[pyo3(signature = (genbank_path, bam_dir, output_db, modules, threads, annotation_tool="", min_coverage=50.0, compress_ratio=0.1, circular=false, create_indexes=true))]
     fn process_all_samples<'py>(
         py: Python<'py>,
         genbank_path: &str,

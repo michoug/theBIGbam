@@ -6,17 +6,16 @@ from bokeh.plotting import output_file, save
 from .plotting_data_per_sample import get_contig_info, get_feature_data, make_bokeh_subplot, make_bokeh_genemap
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130, accessor=None):
+def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130):
     """Generate a Bokeh plot showing all samples for a single variable.
 
     Args:
-        conn: SQLite connection (used for metadata queries)
+        conn: SQLite connection
         variable: Variable/feature to plot
         contig_name: Name of the contig to plot
         xstart: Optional x-axis start position
         xend: Optional x-axis end position
         subplot_size: Height of each subplot in pixels
-        accessor: Optional DataAccessor for parquet mode
     """
     cur = conn.cursor()
 
@@ -46,7 +45,7 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
     for sample_id, sample_name in zip(sample_ids, sample_names):
         try:
             list_feature_dict = get_feature_data(cur, variable, contig_id, sample_id,
-                                                 accessor=accessor, contig_name=contig_name, sample_name=sample_name)
+                                                 contig_name=contig_name, sample_name=sample_name)
             if not list_feature_dict:
                 continue
 
@@ -70,9 +69,11 @@ def save_html_plot_all_samples(db_path, variable, contig_name, subplot_size, out
     # --- Save interactive HTML plot ---
     output_file(filename = output_filename)
     conn = sqlite3.connect(db_path)
-    grid = generate_bokeh_plot_all_samples(conn, variable, contig_name, subplot_size)
-    save(grid)
-    conn.close()
+    try:
+        grid = generate_bokeh_plot_all_samples(conn, variable, contig_name, subplot_size=subplot_size)
+        save(grid)
+    finally:
+        conn.close()
 
 ### Main function
 def main():

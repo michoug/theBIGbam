@@ -91,7 +91,7 @@ def make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool,
 
     wheel = WheelZoomTool(dimensions='width')  # only x-axis
     annotation_fig.add_tools(wheel)
-    annotation_fig.toolbar.active_scroll = wheel
+    # Don't set active_scroll here - will be set when merging with subplots
 
     annotation_fig.x_range = shared_xrange
 
@@ -208,35 +208,87 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None, feature
     return p
 
 ### Function to get features of one variable
-def get_feature_data(cur, feature, contig_id, sample_id, accessor=None, contig_name=None, sample_name=None):
+def get_feature_data(cur, feature, contig_id, sample_id, contig_name=None, sample_name=None):
     """Get feature data for plotting.
 
     Args:
-        cur: SQLite cursor (unused, kept for compatibility)
+        cur: SQLite cursor
         feature: Feature name to query
         contig_id: Contig ID
         sample_id: Sample ID
-        accessor: DataAccessor instance
-        contig_name: Contig name
-        sample_name: Sample name
+        contig_name: Contig name (unused, kept for compatibility)
+        sample_name: Sample name (unused, kept for compatibility)
     """
-    if accessor is None:
-        raise ValueError("accessor parameter is required")
-    return accessor.get_feature_data(feature, contig_id, sample_id, contig_name, sample_name)
+    # Get rendering info from Variable table
+    cur.execute(
+        "SELECT Type, Color, Alpha, Fill_alpha, Size, Title, Feature_table_name "
+        "FROM Variable WHERE Subplot=?",
+        (feature,)
+    )
+    rows = cur.fetchall()
+    print(rows, flush=True)
+
+    list_feature_dict = []
+    for row in rows:
+        type_picked, color, alpha, fill_alpha, size, title, feature_table = row
+        feature_dict = {
+            "type": type_picked,
+            "color": color,
+            "alpha": alpha,
+            "fill_alpha": fill_alpha,
+            "size": size,
+            "title": title,
+            "x": [],
+            "y": []
+        }
+
+        # Query Feature_* table (RLE format: First_position, Last_position, Value)
+        cur.execute(
+            f"SELECT First_position, Last_position, Value FROM {feature_table} "
+            "WHERE Sample_id=? AND Contig_id=? ORDER BY First_position",
+            (sample_id, contig_id)
+        )
+        data_rows = cur.fetchall()
+        
+        # Expand RLE runs into individual points for plotting
+        x_coords = []
+        y_coords = []
+        for first_pos, last_pos, value in data_rows:
+            if type_picked == "bars":
+                # For bars: expand to all positions in the run
+                for pos in range(first_pos, last_pos + 1):
+                    x_coords.append(pos)
+                    y_coords.append(value)
+            else:
+                # For curves: only need start and end points
+                if first_pos == last_pos:
+                    x_coords.append(first_pos)
+                    y_coords.append(value)
+                else:
+                    x_coords.extend([first_pos, last_pos])
+                    y_coords.extend([value, value])
+        
+        feature_dict["x"] = x_coords
+        feature_dict["y"] = y_coords
+
+        # Only append if we have actual data points
+        if x_coords:
+            list_feature_dict.append(feature_dict)
+
+    return list_feature_dict
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=130, accessor=None):
+def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=130):
     """Generate a Bokeh plot for a single sample.
 
     Args:
-        conn: SQLite connection (used for metadata queries)
-        list_features: List of features to plot
+        conn: SQLite connection
+        list_features: List of features/modules to plot (can be mix of modules and individual features)
         contig_name: Name of the contig to plot
         sample_name: Name of the sample to plot
         xstart: Optional x-axis start position
         xend: Optional x-axis end position
         subplot_size: Height of each subplot in pixels
-        accessor: Optional DataAccessor for parquet mode
     """
     cur = conn.cursor()
 
@@ -265,12 +317,13 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
     # Requested features are variables like 'coverage', 'reads_starts', etc.
     subplots = []
     requested_features = parse_requested_features(list_features)
+    print(requested_features, flush=True)
 
     for feature in requested_features:
         try:
             list_feature_dict = get_feature_data(cur, feature, contig_id, sample_id,
-                                                 accessor=accessor, contig_name=contig_name, sample_name=sample_name)
-            
+                                                 contig_name=contig_name, sample_name=sample_name)
+            print(list_feature_dict, flush=True)
             # Always create subplot, even if empty
             subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, feature_name=feature)
             subplots.append(subplot_feature)
@@ -293,36 +346,55 @@ def save_html_plot_per_sample(db_path, list_features, contig_name, sample_name, 
     # --- Save interactive HTML plot ---
     output_file(filename = output_filename)
     conn = sqlite3.connect(db_path)
-    grid = generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, subplot_size)
-    save(grid)
-    conn.close()
+    try:
+        grid = generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, subplot_size=subplot_size)
+        save(grid)
+    finally:
+        conn.close()
 
 ### Parsing features
 def parse_requested_features(list_features):
+    """Parse requested features, expanding modules to individual features.
+    
+    Accepts a mix of module names and individual feature names.
+    Module names are case-insensitive and can include:
+    - "coverage" or "Coverage" -> primary_reads, secondary_reads, supplementary_reads
+    - "phagetermini" or "Phage termini" -> coverage_reduced, reads_starts, reads_ends, tau
+    - "assemblycheck" or "Assembly check" -> all assembly check features
+    
+    Returns deduplicated list of individual feature names.
+    """
     features = []
-    for feature in list_features:
-        if feature == "Coverage":
-            features.append("Coverage")
-        elif feature == "Assembly check":
-            features.extend(["Read lengths", "Insert sizes", "Bad orientations", "Clippings", "Indels", "Mismatches"])
-        elif feature == "Phage termini":
-            features.extend(["Coverage reduced", "Reads termini", "Tau"])
+    for item in list_features:
+        item_lower = item.lower().strip()
+        
+        # Module: Coverage
+        if item_lower in ["coverage", "coverage module"]:
+            features.extend(["primary_reads", "secondary_reads", "supplementary_reads"])
+        # Module: Phage termini / phagetermini
+        elif item_lower in ["phage termini", "phagetermini", "phage_termini"]:
+            features.extend(["coverage_reduced", "reads_starts", "reads_ends", "tau"])
+        # Module: Assembly check / assemblycheck
+        elif item_lower in ["assembly check", "assemblycheck", "assembly_check"]:
+            features.extend(["left_clippings", "right_clippings", "insertions", "deletions", 
+                           "mismatches", "read_lengths", "insert_sizes", "bad_orientations"])
+        # Individual feature
         else:
-            features.append(feature)
-
+            features.append(item)
+    
+    # Deduplicate while preserving order
     seen = set()
     deduped_features = [f for f in features if not (f in seen or seen.add(f))]
-    return(deduped_features)
+    return deduped_features
 
 ### Main function
 def add_plot_per_sample_args(parser):
-    parser.add_argument("-d", "--db", required=True, help="Path to sqlite database file to store results")
-    parser.add_argument("-v", "--variables", required=True, help="List of variables or full modules to compute (comma-separated) (options allowed for modules: coverage, phagetermini, assemblycheck)")
+    parser.add_argument("--db", required=True, help="Path to sqlite database file to store results")
+    parser.add_argument("--variables", required=True, help="List of variables or full modules to compute (comma-separated) (options allowed for modules: coverage, phagetermini, assemblycheck)")
     parser.add_argument("--contig", required=True, help="Name of the contig to plot")
     parser.add_argument("--sample", required=True, help="Name of the sample to plot")
     parser.add_argument("--html", required=False, default="MGFeatureViewer_per_sample.html", help="Name for output html files. A bokeh server will be started if not provided")
     parser.add_argument("--subplot_height", required=False, default=130, help="Height of each subplot (in pixels)")
-
 
 def run_plot_per_sample(args):
     db_path = args.db
@@ -334,7 +406,6 @@ def run_plot_per_sample(args):
 
     print(f"Saving static HTML to {output_filename}...", flush=True)
     save_html_plot_per_sample(db_path, list_features, contig_name, sample_name, subplot_size, output_filename)
-
 
 if __name__ == "__main__":
     import argparse

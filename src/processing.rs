@@ -109,7 +109,7 @@ fn add_features_from_arrays(
     // Coverage (always compress self-referentially)
     let coverage_f64: Vec<f64> = arrays.coverage.iter().map(|&x| x as f64).collect();
     if flags.coverage {
-        add_compressed_feature(&coverage_f64, "coverage", contig_name, config, output);
+        add_compressed_feature(&coverage_f64, "primary_reads", contig_name, config, output);
         
         // Secondary reads (self-referential curve)
         // When circular=true, subtract coverage to remove artifact secondary alignments from doubled assembly

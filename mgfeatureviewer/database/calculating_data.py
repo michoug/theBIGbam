@@ -32,6 +32,7 @@ def calculating_all_features_parallel(list_modules, bam_files, output_db, min_co
         min_coverage=float(min_coverage),
         compress_ratio=float(compress_ratio),
         circular=circular,
+        create_indexes=True,
     )
 
     total_time = result.get("total_time", 0.0)
@@ -47,7 +48,7 @@ def add_calculate_args(parser):
     parser.add_argument("-b", "--bam_files", required=True, help="Path to bam file or directory containing mapping files (BAM format)")
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
     parser.add_argument("-o", "--output", required=True, help="Output database file path (.db)")
-    parser.add_argument("-a", "--annotation_tool", default="", help="Optional: to color the contigs specify the annotation tool used (options allowed: pharokka)")
+    parser.add_argument("--annotation_tool", default="", help="Optional: to color the contigs specify the annotation tool used (options allowed: pharokka)")
     parser.add_argument("--min_coverage", type=int, default=50, help="Minimum alignment-length coverage proportion for contig inclusion (default 50%% change threshold)")
     parser.add_argument("--compress_ratio", type=float, default=10, help="RLE compression ratio (default 10%% change threshold)")
     parser.add_argument("--circular", action="store_true", help="Set if assembly was doubled during mapping (enables modulo logic)")

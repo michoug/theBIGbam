@@ -1,42 +1,23 @@
-//! # MGFeatureViewer Rust Calculator
+//! # MGFeatureViewer Rust Calculator - DEPRECATED
 //!
-//! This is a 1:1 Rust port of the Python calculation code in `mgfeatureviewer/calculating_data.py`.
-//! It produces identical output values, with one minor difference noted below.
+//! **⚠️ This standalone Rust CLI is deprecated and no longer built.**
 //!
-//! ## Module Structure
+//! Use the Python CLI instead:
+//!     mgfeatureviewer calculate -g assembly.gbk -b bams/ -m coverage -o output.db
 //!
-//! - `types.rs`      - All structs and enums
-//! - `bam_reader.rs` - BAM file reading and sequencing type detection
-//! - `features.rs`   - Feature calculations (coverage, phagetermini, assemblycheck)
-//! - `compress.rs`   - Signal compression for storage
-//! - `db.rs`         - SQLite database operations
-//! - `genbank.rs`    - GenBank file parsing
-//! - `processing.rs` - Shared processing logic for CLI and Python bindings
+//! This file is kept for reference/debugging but is not compiled into a binary.
+//! The Python CLI (`mgfeatureviewer calculate`) calls the same Rust code via PyO3 bindings.
 //!
-//! ## Function Mapping (Rust → Python)
+//! ## Why deprecated?
+//! - Duplicate argument parsing (this file vs. calculating_data.py)
+//! - Maintenance burden - every parameter change needed updating in 2 places
+//! - Python CLI provides unified interface for all commands (calculate, plot, serve, etc.)
 //!
-//! | Rust Function                    | Python Function                              | Line  |
-//! |----------------------------------|----------------------------------------------|-------|
-//! | `detect_sequencing_type`         | `find_sequencing_type_from_bam`              | ~55   |
-//! | `process_contig_streaming`       | `preprocess_reads` + feature calc            | ~497+ |
-//! | `process_read`                   | Coverage, phagetermini, assemblycheck calcs  | ~182+ |
-//! | `compress_signal`                | `compress_signal`                            | ~91   |
-//! | `process_sample`                 | `calculating_features_per_sample`            | ~651  |
-//!
-//! ## Known Difference: Derivative Outlier Detection
-//!
-//! The Python `compress_signal` function (line ~116) has a subtle bug in derivative outlier
-//! detection where it performs arithmetic on a boolean array. This causes Python to keep
-//! fewer positions after compression. The Rust implementation correctly identifies derivative
-//! outliers, so it may keep slightly more positions. **All values at common positions are
-//! identical** - Rust just preserves more data points as originally intended.
-//!
-//! ## Output
-//!
-//! Produces a single SQLite database (.db) with:
-//! - Metadata tables (contigs, annotations, etc.)
-//! - Feature_* tables for each computed variable (e.g., Feature_coverage, Feature_reads_starts)
-//! - Presence table tracking sample-contig coverage
+//! ## For developers
+//! If you need to test Rust code directly without Python, you can temporarily re-enable
+//! the binary in Cargo.toml by uncommenting the [[bin]] section.
+
+#![allow(dead_code)]
 
 use anyhow::Result;
 use clap::Parser;

@@ -177,9 +177,9 @@ pub struct VariableConfig {
 /// we're borrowing it (not owning it). Think of it like a Python list view.
 pub const VARIABLES: &[VariableConfig] = &[
     // Coverage module - basic read depth
-    VariableConfig { name: "coverage", subplot: "Coverage", module: "Coverage", plot_type: PlotType::Curve, color: "#333333", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Coverage depth" },
-    VariableConfig { name: "secondary_reads", subplot: "Other aligments", module: "Coverage", plot_type: PlotType::Curve, color: "#1f77b4", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Secondary alignments" },
-    VariableConfig { name: "supplementary_reads", subplot: "Other aligments", module: "Coverage", plot_type: PlotType::Curve, color: "#B45C1F", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Supplementary alignments" },
+    VariableConfig { name: "primary_reads", subplot: "Primary alignments", module: "Coverage", plot_type: PlotType::Curve, color: "#333333", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Primary reads" },
+    VariableConfig { name: "secondary_reads", subplot: "Other alignments", module: "Coverage", plot_type: PlotType::Curve, color: "#1f77b4", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Secondary reads" },
+    VariableConfig { name: "supplementary_reads", subplot: "Other alignments", module: "Coverage", plot_type: PlotType::Curve, color: "#B45C1F", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Supplementary reads" },
 
     // Phage termini module - for detecting phage DNA packaging sites
     VariableConfig { name: "coverage_reduced", subplot: "Coverage reduced", module: "Phage termini", plot_type: PlotType::Curve, color: "#00c53b", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Coverage reduced" },
