@@ -129,14 +129,42 @@ pub fn process_contig_streaming(
             None
         };
 
+        // Compute template length and proper_pair with circular correction if needed
+        let (template_length, is_proper_pair) = if circular && seq_type.is_short_paired() {
+            // In circular mode, insert_size and is_proper_pair from BAM are based on doubled assembly
+            // We need to recompute based on the actual circular genome coordinates
+            let pos1 = record.pos() as usize;
+            let pos2 = record.mpos() as usize;
+            
+            // Both positions modulo actual genome length
+            let p1 = pos1 % ref_length;
+            let p2 = pos2 % ref_length;
+            
+            // Distance could wrap around - take the minimum of direct and wrapped distance
+            let direct = (p1 as i32 - p2 as i32).abs();
+            let wrapped = ref_length as i32 - direct;
+            let corrected_tlen = direct.min(wrapped);
+            
+            // Recompute proper_pair: pairs are proper if they're on same contig, opposite strands,
+            // facing each other, and within reasonable insert size
+            let same_ref = record.tid() == record.mtid();
+            let opposite_strands = record.is_reverse() != record.is_mate_reverse();
+            let reasonable_distance = corrected_tlen > 0 && corrected_tlen < 10000; // typical paired-end insert size range
+            let corrected_proper = same_ref && opposite_strands && reasonable_distance;
+            
+            (corrected_tlen, corrected_proper)
+        } else {
+            (record.insert_size().abs() as i32, record.is_proper_pair())
+        };
+
         process_read(
             &mut arrays,
             record.pos(),
             cigar_view.end_pos(),
             record.seq_len() as i32,
-            record.insert_size().abs() as i32,
+            template_length,
             record.is_first_in_template(),
-            record.is_proper_pair(),
+            is_proper_pair,
             record.is_reverse(),
             record.is_secondary(),
             record.is_supplementary(),

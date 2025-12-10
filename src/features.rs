@@ -30,9 +30,9 @@ pub struct FeatureArrays {
     // -------------------------------------------------------------------------
     // Coverage Module
     // -------------------------------------------------------------------------
-    /// Number of reads overlapping each position (standard read depth).
-    /// coverage[i] = number of reads spanning position i
-    pub coverage: Vec<u64>,
+    /// Number of primary reads overlapping each position (standard read depth).
+    /// Only counts reads that are neither secondary nor supplementary.
+    pub primary_reads: Vec<u64>,
 
     /// Number of secondary alignments at each position.
     /// Secondary reads have flag 0x100 set.
@@ -131,7 +131,7 @@ impl FeatureArrays {
     pub fn new(ref_length: usize) -> Self {
         Self {
             // Initialize all arrays to zero
-            coverage: vec![0u64; ref_length],
+            primary_reads: vec![0u64; ref_length],
             secondary_reads: vec![0u64; ref_length],
             supplementary_reads: vec![0u64; ref_length],
             coverage_reduced: vec![0u64; ref_length],
@@ -158,7 +158,7 @@ impl FeatureArrays {
     /// Get the reference length (number of positions in arrays).
     #[inline]
     pub fn ref_length(&self) -> usize {
-        self.coverage.len()
+        self.primary_reads.len()
     }
 
     /// Calculate what percentage of the reference has at least 1x coverage.
@@ -404,9 +404,9 @@ pub fn process_read(
         } else {
             // Only count primary mappings in main coverage
             if circular {
-                arrays.coverage.increment_circular(start, end, 1);
+                arrays.primary_reads.increment_circular(start, end, 1);
             } else {
-                arrays.coverage.increment_range(start, end, 1);
+                arrays.primary_reads.increment_range(start, end, 1);
             }
         }
     }

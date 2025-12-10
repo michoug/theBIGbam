@@ -226,7 +226,6 @@ def get_feature_data(cur, feature, contig_id, sample_id, contig_name=None, sampl
         (feature,)
     )
     rows = cur.fetchall()
-    print(rows, flush=True)
 
     list_feature_dict = []
     for row in rows:
@@ -317,13 +316,11 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
     # Requested features are variables like 'coverage', 'reads_starts', etc.
     subplots = []
     requested_features = parse_requested_features(list_features)
-    print(requested_features, flush=True)
 
     for feature in requested_features:
         try:
             list_feature_dict = get_feature_data(cur, feature, contig_id, sample_id,
                                                  contig_name=contig_name, sample_name=sample_name)
-            print(list_feature_dict, flush=True)
             # Always create subplot, even if empty
             subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, feature_name=feature)
             subplots.append(subplot_feature)
@@ -369,15 +366,14 @@ def parse_requested_features(list_features):
         item_lower = item.lower().strip()
         
         # Module: Coverage
-        if item_lower in ["coverage", "coverage module"]:
-            features.extend(["primary_reads", "secondary_reads", "supplementary_reads"])
+        if item_lower in ["coverage"]:
+            features.extend(["Primary alignments", "Other alignments", "Other alignments"])
         # Module: Phage termini / phagetermini
         elif item_lower in ["phage termini", "phagetermini", "phage_termini"]:
-            features.extend(["coverage_reduced", "reads_starts", "reads_ends", "tau"])
+            features.extend(["Coverage reduced", "Reads termini", "Tau"])
         # Module: Assembly check / assemblycheck
         elif item_lower in ["assembly check", "assemblycheck", "assembly_check"]:
-            features.extend(["left_clippings", "right_clippings", "insertions", "deletions", 
-                           "mismatches", "read_lengths", "insert_sizes", "bad_orientations"])
+            features.extend(["Clippings", "Indels", "Mismatches", "Read lengths", "Insert sizes", "Bad orientations"])
         # Individual feature
         else:
             features.append(item)

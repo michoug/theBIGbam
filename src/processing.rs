@@ -107,15 +107,15 @@ fn add_features_from_arrays(
     output: &mut Vec<FeaturePoint>,
 ) {
     // Coverage (always compress self-referentially)
-    let coverage_f64: Vec<f64> = arrays.coverage.iter().map(|&x| x as f64).collect();
+    let primary_reads_f64: Vec<f64> = arrays.primary_reads.iter().map(|&x| x as f64).collect();
     if flags.coverage {
-        add_compressed_feature(&coverage_f64, "primary_reads", contig_name, config, output);
+        add_compressed_feature(&primary_reads_f64, "primary_reads", contig_name, config, output);
         
         // Secondary reads (self-referential curve)
-        // When circular=true, subtract coverage to remove artifact secondary alignments from doubled assembly
+        // When circular=true, subtract primary coverage to remove artifact secondary alignments from doubled assembly
         let secondary_reads_f64: Vec<f64> = if config.circular {
             arrays.secondary_reads.iter()
-                .zip(&arrays.coverage)
+                .zip(&arrays.primary_reads)
                 .map(|(&sec, &cov)| if sec > cov { (sec - cov) as f64 } else { 0.0 })
                 .collect()
         } else {
@@ -206,7 +206,7 @@ fn add_features_from_arrays(
                 _ => continue,
             };
             let values: Vec<f64> = data.iter().map(|&x| x as f64).collect();
-            add_compressed_feature_with_reference(&values, Some(&coverage_f64), feature_name, contig_name, config, output);
+            add_compressed_feature_with_reference(&values, Some(&primary_reads_f64), feature_name, contig_name, config, output);
         }
 
         // Read lengths (curve for long reads, self-referential)

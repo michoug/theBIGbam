@@ -67,7 +67,7 @@ The output is an SQLite database containing all computed values. This database i
 
 #### Example with HK97 phage test data
 ```sh
-mgfeatureviewer calculate -t 4 -g examples/inputs/HK97/HK97_GCF_000848825.1_pharokka.gbk --annotation_tool pharokka -b examples/inputs/HK97/bams -m coverage,phagetermini,assemblycheck -c -o examples/outputs/HK97/HK97.db --circular --compress-ratio=10 --min-coverage=50
+mgfeatureviewer calculate -t 4 -g examples/inputs/HK97/HK97_GCF_000848825.1_pharokka.gbk --annotation_tool pharokka -b examples/inputs/HK97/bams -m coverage,phagetermini,assemblycheck -o examples/outputs/HK97/HK97.db --circular --compress-ratio=10 --min-coverage=50
 ```
 
 ### Visualisation
@@ -89,7 +89,7 @@ Example commands:
 ```sh
 mgfeatureviewer plot-per-sample -d examples/outputs/HK97/HK97.db -v "Coverage,Phage termini,Assembly check,test" --contig NC_002167.1 --sample HK97_R1_illumina_mapped_on_HK97_GCF_000848825.1 --html examples/outputs/HK97/HK97_illumina_per_sample.html
 
-mgfeatureviewer plot-all-samples -d examples/outputs/HK97/HK97.db -v "Coverage" --contig NC_002167.1 --html examples/outputs/HK97/HK97_illumina_all_samples.html
+mgfeatureviewer plot-all-samples -d examples/outputs/HK97/HK97.db -v "Primary alignments" --contig NC_002167.1 --html examples/outputs/HK97/HK97_illumina_all_samples.html
 ```
 
 ## Additional utilities
