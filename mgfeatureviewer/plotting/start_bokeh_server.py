@@ -5,7 +5,7 @@ import traceback
 
 from bokeh.layouts import column, row
 from bokeh.models import Div, InlineStyleSheet, Tooltip, CustomJS
-from bokeh.models.widgets import AutocompleteInput, CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup
+from bokeh.models.widgets import AutocompleteInput, CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup, Toggle
 from bokeh.models.plots import GridPlot
 
 # Import the plotting function from the repo
@@ -19,7 +19,7 @@ def build_controls(conn):
     # Widget Selector for Contigs (autocomplete with max 20 suggestions)
     cur.execute("SELECT Contig_name FROM Contig ORDER BY Contig_name")
     contigs = [r[0] for r in cur.fetchall()]
-    contig_select = AutocompleteInput(value=contigs[0] if contigs else "", 
+    contig_select = AutocompleteInput(value=contigs[0] if len(contigs) == 1 else "", 
                                       completions=contigs, 
                                       min_characters=1,
                                       case_sensitive=False,
@@ -31,7 +31,7 @@ def build_controls(conn):
     # Widget Selector for Samples (autocomplete with max 20 suggestions)
     cur.execute("SELECT Sample_name FROM Sample ORDER BY Sample_name")
     samples = [r[0] for r in cur.fetchall()]
-    sample_select = AutocompleteInput(value=samples[0] if samples else "", 
+    sample_select = AutocompleteInput(value=samples[0] if len(samples) == 1 else "", 
                                       completions=samples,
                                       min_characters=1,
                                       case_sensitive=False,
@@ -278,8 +278,16 @@ def modify_doc_factory(db_path):
     filter_contigs.on_change('active', lambda attr, old, new: refresh_contig_options())
     filter_samples.on_change('active', lambda attr, old, new: refresh_sample_options())
 
+    # Gene map visibility toggle (above variables)
+    genemap_title = Div(text="<b>Gene Map</b>")
+    show_genemap = CheckboxGroup(labels=["Show gene map"], active=[0])
+
     variables_title = Div(text="<b>Variables</b>")
-    controls_children = [instructions, views_title, views, contigs_title, widgets['contig_select'], filter_contigs, samples_title, widgets['sample_select'], filter_samples, variables_title]
+    controls_children = [instructions, views_title, views, contigs_title, widgets['contig_select'], filter_contigs, samples_title, widgets['sample_select'], filter_samples, genemap_title, show_genemap, variables_title]
+    
+    # Store toggle buttons and content containers for collapsible sections
+    module_toggles = []
+    module_contents = []
     
     # Append variable selectors. For modules that have a module-checkbox widget we
     # show either the checkbox (One-sample) or the plain module title (All-samples).
@@ -289,21 +297,25 @@ def modify_doc_factory(db_path):
         
         help_btn = widgets['helps_widgets'][i]
 
+        # Create a small toggle button for collapsible section (just the arrow)
+        toggle_btn = Button(label="▼", width=30, button_type="light", align="center")
+        module_toggles.append(toggle_btn)
+
         # Build two header variants: one with the checkbox (shows module name as label)
         # and one with the plain title (used when checkbox is hidden). Both may include the help button.
         if module_widget is not None:
             # Create separate title div for the title-only header
-            module_title_div = Div(text=f"{module_name}")
+            module_title_div = Div(text=f"{module_name}", align="center")
             
             if help_btn is not None:
                 # Need separate help buttons for each header to avoid "already in doc" error
                 help_btn_cb = HelpButton(tooltip=help_btn.tooltip, width=30, height=30, align="center")
                 help_btn_title = HelpButton(tooltip=help_btn.tooltip, width=30, height=30, align="center")
-                hdr_cb = row(module_widget, help_btn_cb, sizing_mode="stretch_width")
-                hdr_title = row(module_title_div, help_btn_title, sizing_mode="stretch_width")
+                hdr_cb = row(toggle_btn, module_widget, help_btn_cb, sizing_mode="stretch_width", align="center")
+                hdr_title = row(toggle_btn, module_title_div, help_btn_title, sizing_mode="stretch_width", align="center")
             else:
-                hdr_cb = module_widget
-                hdr_title = module_title_div
+                hdr_cb = row(toggle_btn, module_widget, sizing_mode="stretch_width", align="center")
+                hdr_title = row(toggle_btn, module_title_div, sizing_mode="stretch_width", align="center")
 
             # Default: show the checkbox header, hide the plain title header
             hdr_cb.visible = True
@@ -315,20 +327,36 @@ def modify_doc_factory(db_path):
             header_with_title.append(hdr_title)
         else:
             # No module checkbox exists: show plain title (with help if available)
-            module_title_div = Div(text=f"{module_name}")
+            module_title_div = Div(text=f"{module_name}", align="center")
             if help_btn is not None:
-                hdr = row(module_title_div, help_btn, sizing_mode="stretch_width")
+                hdr = row(toggle_btn, module_title_div, help_btn, sizing_mode="stretch_width", align="center")
             else:
-                hdr = module_title_div
+                hdr = row(toggle_btn, module_title_div, sizing_mode="stretch_width", align="center")
             hdr.visible = True
             controls_children.append(hdr)
             
             header_with_checkbox.append(None)
             header_with_title.append(hdr)
 
-        # Add the module's CheckboxButtonGroup for variables
+        # Add the module's CheckboxButtonGroup for variables (this will be collapsible)
         cbg = widgets['variables_widgets'][i]
+        module_contents.append(cbg)
         controls_children.append(cbg)
+
+    # Add callbacks for collapsible sections
+    for i, toggle_btn in enumerate(module_toggles):
+        content = module_contents[i]
+        
+        def make_toggle_callback(btn, content):
+            def callback():
+                content.visible = not content.visible
+                if content.visible:
+                    btn.label = "▼"
+                else:
+                    btn.label = "▶"
+            return callback
+        
+        toggle_btn.on_click(make_toggle_callback(toggle_btn, content))
 
     apply_button = Button(label="Apply", button_type="primary", align="center")
     controls_children.append(apply_button)
@@ -389,6 +417,9 @@ def modify_doc_factory(db_path):
             sample = widgets['sample_select'].value
             contig = widgets['contig_select'].value
 
+            # Check if gene map should be shown
+            genbank_path = db_path if (0 in show_genemap.active) else None
+
             # Build requested_features list
             requested_features = []
             for cbg in widgets['variables_widgets']:
@@ -419,7 +450,7 @@ def modify_doc_factory(db_path):
                     raise ValueError("When in 'All samples' view you must select one variable to plot.")
 
                 print(f"[start_bokeh_server] Generating plot for all samples with variable={selected_var}, contig={contig}")
-                grid = generate_bokeh_plot_all_samples(conn, selected_var, contig, xstart=xstart, xend=xend)
+                grid = generate_bokeh_plot_all_samples(conn, selected_var, contig, xstart=xstart, xend=xend, genbank_path=genbank_path)
             else:
                 # One-sample view: collect possibly-many requested features and call per-sample plot
                 requested_features = []
@@ -428,7 +459,7 @@ def modify_doc_factory(db_path):
                         requested_features.append(cbg.labels[idx])
 
                 print(f"[start_bokeh_server] Generating plot for sample={sample}, contig={contig}, features={requested_features}")
-                grid = generate_bokeh_plot_per_sample(conn, requested_features, contig, sample, xstart=xstart, xend=xend)
+                grid = generate_bokeh_plot_per_sample(conn, requested_features, contig, sample, xstart=xstart, xend=xend, genbank_path=genbank_path)
 
             main_placeholder.children = [grid]
 

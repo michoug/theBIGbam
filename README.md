@@ -39,10 +39,12 @@ See **[the installation guide](docs/INSTALL.md)** for more detailed instructions
 ## Main usage
 
 The MGFeatureViewer pipeline consists of two main steps: 
-- Generation of an SQLite database summarizing your genomic features with Rust, using your assembly and mapping files
+- Generation of an SQLite database summarizing your genomic features with Rust, using your mapping files (and optionally an annotation file and homemade csv files)
 - Interactive visualization of the SQLite database content using Python and Bokeh
 
 If you do not have an assembly annotation file (.genbank) or sorted mapping files with MD tags (.bam), you can generate them using the scripts provided in [the preprocessing section](docs/PREPROCESSING.md).
+
+TODO: you can also skip assembly altogether by not providing a genbank file
 
 ### Database computation
 
@@ -91,6 +93,8 @@ mgfeatureviewer plot-per-sample -d examples/outputs/HK97/HK97.db -v "Coverage,Ph
 
 mgfeatureviewer plot-all-samples -d examples/outputs/HK97/HK97.db -v "Primary alignments" --contig NC_002167.1 --html examples/outputs/HK97/HK97_illumina_all_samples.html
 ```
+
+TODO: also possibility to export from the server directly
 
 ## Additional utilities
 

@@ -294,7 +294,7 @@ def get_feature_data(cur, feature, contig_id, sample_id, contig_name=None, sampl
     return list_feature_dict
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=130):
+def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=130, genbank_path=None):
     """Generate a Bokeh plot for a single sample.
 
     Args:
@@ -305,6 +305,7 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
         xstart: Optional x-axis start position
         xend: Optional x-axis end position
         subplot_size: Height of each subplot in pixels
+        genbank_path: Optional genbank file path (if provided, gene map will be shown)
     """
     cur = conn.cursor()
 
@@ -312,14 +313,13 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
     contig_id, locus_name, locus_size, annotation_tool = get_contig_info(cur, contig_name)
     print(f"Locus {locus_name} validated ({locus_size} bp)", flush=True)
 
-    # --- Main gene annotation plot ---
-    # Build a SeqRecord from Contig_annotation entries for this contig
+    # --- Main gene annotation plot (only if genbank provided) ---
     shared_xrange = Range1d(-1000, locus_size+1000)
     if xstart is not None and xend is not None:
         shared_xrange.start = xstart
         shared_xrange.end = xend
 
-    annotation_fig = make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool, subplot_size, shared_xrange)
+    annotation_fig = make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool, subplot_size, shared_xrange) if genbank_path else None
 
     # Get sample characteristics
     cur.execute("SELECT Sample_id, Sample_name FROM Sample WHERE Sample_name=?", (sample_name,))
@@ -348,20 +348,26 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
             subplots.append(subplot_feature)
 
     # --- Combine all figures in a single grid with one shared toolbar ---
-    if not subplots:
-        grid = gridplot([[annotation_fig]], merge_tools=True, sizing_mode='stretch_width')
+    if annotation_fig:
+        if not subplots:
+            grid = gridplot([[annotation_fig]], merge_tools=True, sizing_mode='stretch_width')
+        else:
+            all_plots = [annotation_fig] + subplots
+            grid = gridplot([[p] for p in all_plots], merge_tools=True, sizing_mode='stretch_width')
     else:
-        all_plots = [annotation_fig] + subplots
-        grid = gridplot([[p] for p in all_plots], merge_tools=True, sizing_mode='stretch_width')
+        # No gene map - just show subplots
+        if not subplots:
+            raise ValueError("No plots to display")
+        grid = gridplot([[p] for p in subplots], merge_tools=True, sizing_mode='stretch_width')
 
     return grid
 
-def save_html_plot_per_sample(db_path, list_features, contig_name, sample_name, subplot_size, output_filename):
+def save_html_plot_per_sample(db_path, list_features, contig_name, sample_name, subplot_size, output_filename, genbank_path=None):
     # --- Save interactive HTML plot ---
     output_file(filename = output_filename)
     conn = sqlite3.connect(db_path)
     try:
-        grid = generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, subplot_size=subplot_size)
+        grid = generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, subplot_size=subplot_size, genbank_path=genbank_path)
         save(grid)
     finally:
         conn.close()
@@ -406,6 +412,7 @@ def add_plot_per_sample_args(parser):
     parser.add_argument("--variables", required=True, help="List of variables or full modules to compute (comma-separated) (options allowed for modules: coverage, phagetermini, assemblycheck)")
     parser.add_argument("--contig", required=True, help="Name of the contig to plot")
     parser.add_argument("--sample", required=True, help="Name of the sample to plot")
+    parser.add_argument("-g", "--genbank", help="Path to genbank file (optional; if provided, gene map will be plotted)")
     parser.add_argument("--html", required=False, default="MGFeatureViewer_per_sample.html", help="Name for output html files. A bokeh server will be started if not provided")
     parser.add_argument("--subplot_height", required=False, default=130, help="Height of each subplot (in pixels)")
 
@@ -416,9 +423,10 @@ def run_plot_per_sample(args):
     sample_name = args.sample
     output_filename = args.html
     subplot_size = int(args.subplot_height)
+    genbank_path = getattr(args, 'genbank', None)
 
     print(f"Saving static HTML to {output_filename}...", flush=True)
-    save_html_plot_per_sample(db_path, list_features, contig_name, sample_name, subplot_size, output_filename)
+    save_html_plot_per_sample(db_path, list_features, contig_name, sample_name, subplot_size, output_filename, genbank_path)
 
 if __name__ == "__main__":
     import argparse

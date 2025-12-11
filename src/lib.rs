@@ -58,16 +58,16 @@ mod python {
     /// all BAM files in parallel using rayon.
     ///
     /// Args:
-    ///     genbank_path: Path to the GenBank annotation file
-    ///     bam_dir: Path to directory containing BAM files (or single BAM file)
+    ///     genbank_path: Path to the GenBank annotation file (empty string to skip)
+    ///     bam_files: List of BAM file paths to process
     ///     output_db: Output database file path (.db)
     ///     modules: List of modules to compute: "coverage", "phagetermini", "assemblycheck"
     ///     threads: Number of threads to use
     ///     annotation_tool: Annotation tool name (e.g., "pharokka")
     ///     min_coverage: Minimum coverage percentage for contig inclusion (default 50.0)
-    ///     step: Compression step size (default 50)
-    ///     z_thresh: Z-score threshold for outliers (default 3.0)
-    ///     deriv_thresh: Derivative threshold for outliers (default 3.0)
+    ///     compress_ratio: Compression ratio threshold (default 10.0)
+    ///     circular: Whether the genome is circular (default False)
+    ///     create_indexes: Whether to create database indexes (default True)
     ///     max_points: Maximum points per feature (default 10000)
     ///
     /// Returns:
@@ -79,7 +79,7 @@ mod python {
     fn process_all_samples<'py>(
         py: Python<'py>,
         genbank_path: &str,
-        bam_dir: &str,
+        bam_files: Vec<String>,
         output_db: &str,
         modules: Vec<String>,
         threads: usize,
@@ -90,6 +90,7 @@ mod python {
         create_indexes: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         use crate::processing::{run_all_samples, ProcessConfig};
+        use std::path::PathBuf;
 
         let config = ProcessConfig {
             threads,
@@ -98,11 +99,14 @@ mod python {
             circular,
         };
 
+        // Convert string paths to PathBuf
+        let bam_paths: Vec<PathBuf> = bam_files.iter().map(|s| PathBuf::from(s)).collect();
+
         // Release the GIL and call the shared processing function
         let process_result = py.allow_threads(|| {
             run_all_samples(
                 Path::new(genbank_path),
-                Path::new(bam_dir),
+                &bam_paths,
                 Path::new(output_db),
                 &modules,
                 annotation_tool,

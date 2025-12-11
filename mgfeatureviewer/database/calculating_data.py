@@ -18,22 +18,26 @@ def calculating_all_features_parallel(list_modules, bam_files, output_db, min_co
     if n_sample_cores is None:
         n_sample_cores = max(1, cpu_count() - 1)
 
-    bam_dir = os.path.dirname(bam_files[0]) if bam_files else ""
-
     print(f"Using Rust bindings to process {len(bam_files)} samples with rayon ({n_sample_cores} threads)...", flush=True)
 
-    result = _rust.process_all_samples(
-        genbank_path=genbank_path,
-        bam_dir=bam_dir,
-        output_db=output_db,
-        modules=list_modules,
-        threads=n_sample_cores,
-        annotation_tool=annotation_tool,
-        min_coverage=float(min_coverage),
-        compress_ratio=float(compress_ratio),
-        circular=circular,
-        create_indexes=True,
-    )
+    try:
+        result = _rust.process_all_samples(
+            genbank_path=genbank_path if genbank_path else "",
+            bam_files=bam_files,
+            output_db=output_db,
+            modules=list_modules,
+            threads=n_sample_cores,
+            annotation_tool=annotation_tool,
+            min_coverage=float(min_coverage),
+            compress_ratio=float(compress_ratio),
+            circular=circular,
+            create_indexes=True,
+        )
+    except Exception as e:
+        print(f"ERROR: Rust processing failed: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
     total_time = result.get("total_time", 0.0)
     samples_processed = result.get("samples_processed", 0)
@@ -44,7 +48,7 @@ def calculating_all_features_parallel(list_modules, bam_files, output_db, min_co
 
 def add_calculate_args(parser):
     parser.add_argument("-t", "--threads", required=True, help="Number of threads available")
-    parser.add_argument("-g", "--genbank", required=True, help="Path to genbank file of all investigated contigs")
+    parser.add_argument("-g", "--genbank", help="Path to genbank file (optional; if not provided, no gene annotations will be stored)")
     parser.add_argument("-b", "--bam_files", required=True, help="Path to bam file or directory containing mapping files (BAM format)")
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
     parser.add_argument("-o", "--output", required=True, help="Output database file path (.db)")
@@ -55,6 +59,7 @@ def add_calculate_args(parser):
 
 def run_calculate_args(args):
     annotation_tool = args.annotation_tool
+    genbank_path = getattr(args, 'genbank', None)
 
     if os.path.isdir(args.bam_files):
         bam_files = [os.path.join(args.bam_files, f) for f in os.listdir(args.bam_files) if f.endswith(".bam")]
@@ -73,10 +78,13 @@ def run_calculate_args(args):
     if os.path.exists(output_db):
         sys.exit(f"ERROR: Output file '{output_db}' already exists. Please provide a new path to avoid overwriting.")
 
+    if genbank_path and not os.path.exists(genbank_path):
+        sys.exit(f"ERROR: GenBank file not found: {genbank_path}")
+
     print("Calculating values for all requested features from mapping files...", flush=True)
     calculating_all_features_parallel(
         requested_modules, bam_files, output_db, min_coverage, compress_ratio, circular, n_cores,
-        genbank_path=args.genbank, annotation_tool=annotation_tool
+        genbank_path=genbank_path, annotation_tool=annotation_tool if genbank_path else ""
     )
 
     print(f"\nOutput written to: {output_db}", flush=True)

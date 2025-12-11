@@ -417,7 +417,12 @@ pub fn process_read(
             // Track start/end positions by strand
             // We separate strands here; they're combined in finalize_strands()
             // Note: 'end' is exclusive, so the actual last position is end-1
-            let end_pos = if end > 0 { end - 1 } else { 0 };
+            let end_pos = if end > 0 { 
+                let pos = end - 1;
+                if circular { pos % ref_length } else { pos }
+            } else { 
+                0 
+            };
             if is_reverse {
                 arrays.start_minus[start] += 1;
                 arrays.end_minus[end_pos] += 1;
@@ -512,7 +517,13 @@ pub fn process_read(
                 if raw_cigar_is_clipping(op) {
                     // End position is where the clip happens
                     // (subtract 1 because end is exclusive)
-                    arrays.right_clippings[if end > 0 { end - 1 } else { ref_length - 1 }] += 1;
+                    let clip_pos = if end > 0 { 
+                        let pos = end - 1;
+                        if circular { pos % ref_length } else { pos }
+                    } else { 
+                        ref_length - 1 
+                    };
+                    arrays.right_clippings[clip_pos] += 1;
                 }
             }
         }

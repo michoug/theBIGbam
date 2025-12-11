@@ -18,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use walkdir::WalkDir;
 
 use crate::bam_reader::{detect_sequencing_type, process_contig_streaming};
 use crate::compress::compress_signal_with_reference;
@@ -270,10 +269,12 @@ pub fn process_sample(
             // Extract header info before mutable borrow
             let ref_name = std::str::from_utf8(bam.header().tid2name(tid)).ok()?.to_string();
             let bam_length = bam.header().target_len(tid).unwrap_or(0) as usize;
-            let ref_length = bam_length / 2;
+            let ref_length = if config.circular { bam_length / 2 } else { bam_length };
 
             // Skip if contig not in GenBank list
-            let contig = contigs.iter().find(|c| c.name == ref_name)?;
+            if contigs.iter().find(|c| c.name == ref_name).is_none() {
+                return None;
+            }
 
             // Process contig using streaming - single pass over reads
             // Early coverage check happens inside process_contig_streaming
@@ -288,13 +289,13 @@ pub fn process_sample(
 
             // Coverage already checked and returned from process_contig_streaming
             let presence = PresenceData {
-                contig_name: contig.name.clone(),
+                contig_name: ref_name.clone(),
                 coverage_pct: coverage_pct as f32,
             };
 
             // Calculate features for this contig
             let mut features = Vec::new();
-            add_features_from_arrays(&arrays, &contig.name, config, flags, seq_type, &mut features);
+            add_features_from_arrays(&arrays, &ref_name, config, flags, seq_type, &mut features);
 
             Some((features, presence))
         })
@@ -312,10 +313,60 @@ pub fn process_sample(
     Ok((all_features, all_presences, sample_name))
 }
 
-/// Run processing on all BAM files in a directory.
+/// Extract contig information from BAM file headers.
+/// Deduplicates contigs across all BAM files.
+fn extract_contigs_from_bams(bam_files: &[PathBuf], circular: bool) -> Result<Vec<ContigInfo>> {
+    use std::collections::HashMap;
+    
+    let mut contig_map: HashMap<String, usize> = HashMap::new();
+    
+    // Scan all BAM files to collect unique contigs
+    for bam_path in bam_files {
+        let bam = IndexedReader::from_path(bam_path)
+            .with_context(|| format!("Failed to open BAM file: {}", bam_path.display()))?;
+        let header = bam.header();
+        
+        for tid in 0..header.target_count() {
+            let ref_name = std::str::from_utf8(header.tid2name(tid))
+                .context("Invalid UTF-8 in reference name")?
+                .to_string();
+            let bam_length = header.target_len(tid).unwrap_or(0) as usize;
+            
+            // For circular genomes, BAM length is doubled, so actual length is half
+            let actual_length = if circular { bam_length / 2 } else { bam_length };
+            
+            // Use the contig if not seen, or verify length matches
+            contig_map.entry(ref_name.clone())
+                .and_modify(|existing_len| {
+                    if *existing_len != actual_length {
+                        eprintln!("Warning: Contig '{}' has different lengths across BAM files ({} vs {})", 
+                                  ref_name, *existing_len, actual_length);
+                    }
+                })
+                .or_insert(actual_length);
+        }
+    }
+    
+    // Convert to sorted vector of ContigInfo
+    let mut contigs: Vec<ContigInfo> = contig_map
+        .into_iter()
+        .map(|(name, length)| ContigInfo {
+            name,
+            length,
+            annotation_tool: String::new(),
+        })
+        .collect();
+    
+    // Sort by name for consistent ordering
+    contigs.sort_by(|a, b| a.name.cmp(&b.name));
+    
+    Ok(contigs)
+}
+
+/// Run processing on all BAM files.
 pub fn run_all_samples(
     genbank_path: &Path,
-    bam_dir: &Path,
+    bam_files: &[PathBuf],
     output_db: &Path,
     modules: &[String],
     annotation_tool: &str,
@@ -332,14 +383,20 @@ pub fn run_all_samples(
         .ok();
 
     eprintln!("### Parsing GenBank file...");
-    let (contigs, annotations) = parse_genbank(genbank_path, annotation_tool)?;
+    let (contigs, annotations) = if genbank_path.as_os_str().is_empty() {
+        eprintln!("No GenBank file provided - extracting contigs from BAM headers");
+        let contigs = extract_contigs_from_bams(bam_files, config.circular)?;
+        eprintln!("Found {} contigs from BAM files", contigs.len());
+        (contigs, Vec::new())
+    } else {
+        parse_genbank(genbank_path, annotation_tool)?
+    };
     eprintln!(
         "Found {} contigs with {} annotations",
         contigs.len(),
         annotations.len()
     );
 
-    let bam_files = discover_bam_files(bam_dir)?;
     eprintln!("Found {} BAM files\n", bam_files.len());
 
     if let Some(parent) = output_db.parent() {
@@ -366,27 +423,6 @@ pub fn run_all_samples(
     print_summary(&result, output_db);
 
     Ok(result)
-}
-
-fn discover_bam_files(bam_dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut bam_files: Vec<PathBuf> = if bam_dir.is_dir() {
-        WalkDir::new(bam_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|x| x == "bam").unwrap_or(false))
-            .map(|e| e.path().to_path_buf())
-            .collect()
-    } else {
-        vec![bam_dir.to_path_buf()]
-    };
-
-    if bam_files.is_empty() {
-        anyhow::bail!("No BAM files found in {}", bam_dir.display());
-    }
-
-    bam_files.sort_by_key(|p| std::cmp::Reverse(fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
-
-    Ok(bam_files)
 }
 
 fn process_samples_parallel(
