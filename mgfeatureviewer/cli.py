@@ -95,7 +95,8 @@ def build_argparser():
     # Calculation inputs
     sp.add_argument('-m', '--modules', required=True, help='Comma-separated modules (coverage,phagetermini,assemblycheck)')
     sp.add_argument('--min_coverage', type=int, default=50, help='Minimum coverage for contig inclusion (default: 50%%)')
-    sp.add_argument('--compress_ratio', type=float, default=10, help='Compression ratio (default: 10%%)')
+    sp.add_argument('--curve_ratio', type=float, default=10, help='Compression ratio for curve plots (default: 10%%)')
+    sp.add_argument('--bar_ratio', type=float, default=10, help='Compression ratio for bar plots (default: 10%%)')
     
     # Output
     sp.add_argument('-o', '--output', required=True, help='Output directory (must NOT exist)')
@@ -106,6 +107,10 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     parser = build_argparser()
     args, extras = parser.parse_known_args(argv)
+
+    # Warn about unused arguments
+    if extras:
+        print(f"Warning: Unknown/unused arguments provided: {' '.join(extras)}", file=sys.stderr)
 
     # Dispatch to module run functions (shared-args approach)
     if args.cmd == 'calculate':

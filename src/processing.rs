@@ -37,20 +37,10 @@ pub struct ProcessConfig {
     pub threads: usize,
     pub min_coverage: f64,
     /// Relative tolerance for RLE compression (e.g., 0.1 = 10% change threshold)
-    pub compress_ratio: f64,
+    pub curve_ratio: f64,
+    pub bar_ratio: f64,
     /// Circular genome flag: if true, assembly was doubled during mapping (enables modulo logic)
     pub circular: bool,
-}
-
-impl Default for ProcessConfig {
-    fn default() -> Self {
-        Self {
-            threads: 1,
-            min_coverage: 50.0,
-            compress_ratio: 10.0,  // 10% change threshold
-            circular: false,
-        }
-    }
 }
 
 /// Result of processing all samples.
@@ -85,7 +75,7 @@ fn add_compressed_feature_with_reference(
     output: &mut Vec<FeaturePoint>,
 ) {
     let plot_type = get_plot_type(feature);
-    let runs = compress_signal_with_reference(values, reference, plot_type, config.compress_ratio);
+    let runs = compress_signal_with_reference(values, reference, plot_type, config.curve_ratio, config.bar_ratio);
 
     output.extend(runs.into_iter().map(|run| FeaturePoint {
         contig_name: contig_name.to_string(),
@@ -137,10 +127,10 @@ fn add_features_from_arrays(
         
         // reads_starts and reads_ends (bars, use coverage_reduced as reference)
         let reads_starts: Vec<f64> = arrays.reads_starts.iter().map(|&x| x as f64).collect();
-        let reads_starts_runs = compress_signal_with_reference(&reads_starts, Some(&coverage_reduced_f64), PlotType::Bars, config.compress_ratio);
+        let reads_starts_runs = compress_signal_with_reference(&reads_starts, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio);
         
         let reads_ends: Vec<f64> = arrays.reads_ends.iter().map(|&x| x as f64).collect();
-        let reads_ends_runs = compress_signal_with_reference(&reads_ends, Some(&coverage_reduced_f64), PlotType::Bars, config.compress_ratio);
+        let reads_ends_runs = compress_signal_with_reference(&reads_ends, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio);
 
         // Add reads_starts and reads_ends to output
         output.extend(reads_starts_runs.iter().map(|run| FeaturePoint {

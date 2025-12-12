@@ -143,8 +143,7 @@ def modify_doc_factory(db_path):
     # Length filter slider (only if multiple contigs)
     length_slider = None
     if len(contig_lengths) > 1:
-        length_slider = RangeSlider(start=min_len, end=max_len, value=(min_len, max_len), 
-                                    step=1, title="Contig Length")
+        length_slider = RangeSlider(start=min_len, end=max_len, value=(min_len, max_len), step=1, title="Contig Length")
 
     samples_title = Div(text="<b>Sample</b>")
     filter_samples = CheckboxGroup(labels=["Only show samples present with selected contig"], active=[])
@@ -164,8 +163,11 @@ def modify_doc_factory(db_path):
             completions = [c for c in completions if min_length <= contig_lengths.get(c, 0) <= max_length]
 
         widgets['contig_select'].completions = completions
-        if widgets['contig_select'].value not in completions:
-            widgets['contig_select'].value = completions[0] if completions else ""
+        # Auto-fill when only one option
+        if len(completions) == 1:
+            widgets['contig_select'].value = completions[0]
+        elif widgets['contig_select'].value not in completions:
+            widgets['contig_select'].value = ""
 
     def refresh_sample_options():
         if 0 in filter_samples.active and views.active == 0:
@@ -176,8 +178,11 @@ def modify_doc_factory(db_path):
             completions = list(orig_samples)
 
         widgets['sample_select'].completions = completions
-        if widgets['sample_select'].value not in completions:
-            widgets['sample_select'].value = completions[0] if completions else ""
+        # Auto-fill when only one option
+        if len(completions) == 1:
+            widgets['sample_select'].value = completions[0]
+        elif widgets['sample_select'].value not in completions:
+            widgets['sample_select'].value = ""
 
     # Wire up filter callbacks
     filter_contigs.on_change('active', lambda attr, old, new: refresh_contig_options())
@@ -200,16 +205,9 @@ def modify_doc_factory(db_path):
             # Determine which index was most-recently changed.
             # Use set difference to find an added index (preferred).
             sel_index = None
-            try:
-                old_set = set(old) if old else set()
-                new_set = set(new) if new else set()
-            except Exception:
-                # Fallback: if types are unexpected, use last element of new
-                old_set = set(old) if old else set()
-                new_set = set(new) if new else set()
-
+            old_set = set(old) if old else set()
+            new_set = set(new) if new else set()
             added = new_set - old_set
-            removed = old_set - new_set
 
             if added:
                 # pick the (one) newly added index
@@ -217,9 +215,6 @@ def modify_doc_factory(db_path):
             elif new:
                 # no clear addition, fall back to last element
                 sel_index = new[-1]
-            else:
-                # user cleared selection entirely
-                sel_index = None
 
             global_toggle_lock['locked'] = True
             for other in widgets['variables_widgets']:
@@ -239,66 +234,54 @@ def modify_doc_factory(db_path):
 
     # Views (One sample / All samples) callback: show/hide sample-related controls
     def on_view_change(attr, old, new):
-        # new == 1 means All samples
-        is_all = (new == 1)
+        is_all = (new == 1)  # True means All samples
+        
+        # Toggle sample-related controls
         widgets['sample_select'].visible = not is_all
         samples_title.visible = not is_all
-        # hide/deactivate presence filters when All samples
+        
+        # Toggle filtering section
+        filtering_header.visible = not is_all
+        filtering_content.visible = not is_all
+        filter_contigs.visible = not is_all
+        filter_samples.visible = not is_all
+        
         if is_all:
-            # deactivate and hide the "only show contigs present with selected sample" checkbox
             filter_contigs.active = []
-            filter_contigs.visible = False
-            # hide sample filter as well
             filter_samples.active = []
-            filter_samples.visible = False
-            # Hide entire filtering section in All-samples view
-            filtering_header.visible = False
-            filtering_content.visible = False
-            # hide module checkboxes but keep module titles
+            # Hide module checkboxes and clear all variable selections
             for mw in widgets['module_widgets']:
                 if mw is not None:
                     mw.visible = False
                     mw.active = []
-            # Clear all variable toggles when switching to All-samples view
             for cbg in widgets['variables_widgets']:
                 cbg.active = []
         else:
-            filter_contigs.visible = True
-            filter_samples.visible = True
-            # Show filtering section in One-sample view
-            filtering_header.visible = True
-            filtering_content.visible = True
-            # show module checkboxes again
+            # Show module checkboxes
             for mw in widgets['module_widgets']:
                 if mw is not None:
                     mw.visible = True
-                    mw.active = mw.active
-        # When switching mode, refresh options to ensure consistency
-        # Toggle header visibility: show checkbox-header in One-sample, title-header in All-samples
+        
+        # Toggle header visibility: checkbox-header in One-sample, title-header in All-samples
         for i, mw in enumerate(widgets['module_widgets']):
-            hdr_cb = header_with_checkbox[i] if i < len(header_with_checkbox) else None
-            hdr_title = header_with_title[i] if i < len(header_with_title) else None
+            hdr_cb = header_with_checkbox[i]
+            hdr_title = header_with_title[i]
+            
             if mw is None:
-                # single-variable module: ensure title header visible
-                if hdr_cb is not None:
+                # Single-variable module: always show title header
+                if hdr_cb:
                     hdr_cb.visible = False
-                if hdr_title is not None:
+                if hdr_title:
                     hdr_title.visible = True
             else:
-                # module with checkbox: toggle which header is visible
-                if is_all:
-                    if hdr_cb is not None:
-                        hdr_cb.visible = False
-                    if hdr_title is not None:
-                        hdr_title.visible = True
-                else:
-                    if hdr_cb is not None:
-                        hdr_cb.visible = True
-                    if hdr_title is not None:
-                        hdr_title.visible = False
-        # When switching mode, refresh options to ensure consistency
-        refresh_contig_options()
-        refresh_sample_options()
+                # Module with checkbox: toggle between headers
+                hdr_cb.visible = not is_all
+                hdr_title.visible = is_all
+        
+        # Only refresh when switching to One-sample (not needed for All-samples)
+        if not is_all:
+            refresh_contig_options()
+            refresh_sample_options()
 
     views.on_change('active', on_view_change)
 
@@ -319,12 +302,12 @@ def modify_doc_factory(db_path):
     # Create collapsible Filtering section
     filtering_toggle_btn = Button(label="▼", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[stylesheet])
     filtering_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
-    filtering_title = Div(text="<b>Filtering</b>", align="center")
+    filtering_title = Div(text="<b>Filtering among contigs/samples</b>", align="center")
     filtering_header = row(filtering_toggle_btn, filtering_title, sizing_mode="stretch_width", align="center")
-    filtering_children = [filter_contigs]
+    filtering_children = [filter_samples]
+    filtering_children.append(filter_contigs)
     if length_slider is not None:
         filtering_children.append(length_slider)
-    filtering_children.append(filter_samples)
     filtering_content = column(
         *filtering_children,
         visible=True, sizing_mode="stretch_width"
@@ -333,7 +316,7 @@ def modify_doc_factory(db_path):
 
     variables_title = Div(text="<b>Variables</b>")
     show_genemap = CheckboxGroup(labels=["Show gene map"], active=[0])
-    controls_children = [instructions, views_title, views, samples_title, widgets['sample_select'], contigs_title, widgets['contig_select'], filtering_header, filtering_content, variables_title, show_genemap]
+    controls_children = [instructions, views_title, views, filtering_header, filtering_content, samples_title, widgets['sample_select'], contigs_title, widgets['contig_select'], variables_title, show_genemap]
     
     # Store toggle buttons and content containers for collapsible sections
     module_toggles = []
@@ -361,8 +344,8 @@ def modify_doc_factory(db_path):
             
             if help_btn is not None:
                 # Need separate help buttons for each header to avoid "already in doc" error
-                help_btn_cb = HelpButton(tooltip=help_btn.tooltip, width=30, height=30, align="center")
-                help_btn_title = HelpButton(tooltip=help_btn.tooltip, width=30, height=30, align="center")
+                help_btn_cb = HelpButton(tooltip=help_btn.tooltip, width=20, height=20, align="center", stylesheets=[stylesheet])
+                help_btn_title = HelpButton(tooltip=help_btn.tooltip, width=20, height=20, align="center", stylesheets=[stylesheet])
                 hdr_cb = row(toggle_btn, module_widget, help_btn_cb, sizing_mode="stretch_width", align="center")
                 hdr_title = row(toggle_btn, module_title_div, help_btn_title, sizing_mode="stretch_width", align="center")
             else:

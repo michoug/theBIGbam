@@ -164,6 +164,26 @@ def run_add_variable(args):
         if rows_to_insert:
             cur.executemany(f"INSERT INTO {feature_table} (Contig_id, Sample_id, First_position, Last_position, Value) VALUES (?, ?, ?, ?, ?)", rows_to_insert)
 
+        # --- Get Variable_id for the newly created variable ---
+        cur.execute("SELECT Variable_id FROM Variable WHERE Variable_name=?", (var_name,))
+        variable_id = cur.fetchone()[0]
+
+        # --- Update Summary table with row counts per contig/sample ---
+        if rows_to_insert:
+            # Count rows per (contig_id, sample_id) pair
+            summary_counts = {}
+            for contig_id, sample_id, first_pos, last_pos, value in rows_to_insert:
+                key = (contig_id, sample_id)
+                summary_counts[key] = summary_counts.get(key, 0) + 1
+            
+            # Insert into Summary table
+            summary_rows = [(contig_id, sample_id, variable_id, count) 
+                          for (contig_id, sample_id), count in summary_counts.items()]
+            cur.executemany(
+                "INSERT INTO Summary (Contig_id, Sample_id, Variable_id, Row_count) VALUES (?, ?, ?, ?)",
+                summary_rows
+            )
+
         conn.commit()
         print(f"Variable '{var_name}' added and {len(rows_to_insert)} records inserted into '{feature_table}'")
 

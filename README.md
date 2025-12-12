@@ -85,6 +85,9 @@ mgfeatureviewer serve --db ~/HK97.db --port 5006
 
 The visualisation has 2 modes: per-sample and all-samples. "One sample" mode allows you to explore all computed features for a single sample, while all-samples mode enables comparison of a specific feature across multiple samples.
 
+TODO: explain what we can do in this visualisation (filtering, zooming, exporting...)
+TODO: also possibility to export from the server directly
+
 Instead of exploring the plots interactively in your browser, you can also generate standalone HTML files containing the plots. You need to provide the database path, the contig of interest, the sample name or the feature to plot (for per-sample and all-samples plots, respectively).
 
 Example commands:
@@ -93,8 +96,6 @@ mgfeatureviewer plot-per-sample -d examples/outputs/HK97/HK97.db -v "Coverage,Ph
 
 mgfeatureviewer plot-all-samples -d examples/outputs/HK97/HK97.db -v "Primary alignments" --contig NC_002167.1 --html examples/outputs/HK97/HK97_illumina_all_samples.html
 ```
-
-TODO: also possibility to export from the server directly
 
 ## Additional utilities
 

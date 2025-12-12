@@ -62,7 +62,8 @@ pub fn compress_signal_with_reference(
     values: &[f64],
     reference: Option<&[f64]>,
     plot_type: PlotType,
-    mut compress_ratio: f64,
+    mut curve_ratio: f64,
+    mut bar_ratio: f64,
 ) -> Vec<Run> {
     let n = values.len();
     if n == 0 {
@@ -71,14 +72,15 @@ pub fn compress_signal_with_reference(
 
     let mut runs = Vec::new();
 
-    // For bars with reference: save positions where value > coverage * compress_ratio
-    compress_ratio *= 0.01; // Convert percentage to fraction
+    // For bars with reference: save positions where value > coverage * bar_ratio
+    curve_ratio *= 0.01; // Convert percentage to fraction
+    bar_ratio *= 0.01;   // Convert percentage to fraction
     if matches!(plot_type, PlotType::Bars) && reference.is_some() {
         let coverage = reference.unwrap();
         let mut i = 0;
         while i < n {
             let val = values[i];
-            let threshold = coverage[i] * compress_ratio;
+            let threshold = coverage[i] * bar_ratio;
             
             if val > threshold {
                 // Found a significant position - check if consecutive positions also qualify
@@ -89,7 +91,7 @@ pub fn compress_signal_with_reference(
                 // Extend run while consecutive positions are also significant
                 while i + 1 < n {
                     let next_val = values[i + 1];
-                    let next_threshold = coverage[i + 1] * compress_ratio;
+                    let next_threshold = coverage[i + 1] * bar_ratio;
                     if next_val > next_threshold {
                         i += 1;
                         run_sum += next_val;
@@ -122,9 +124,9 @@ pub fn compress_signal_with_reference(
         
         // Self-referential threshold for curves
         let threshold = if run_value.abs() < 1e-9 {
-            compress_ratio
+            curve_ratio
         } else {
-            compress_ratio * run_value.abs()
+            curve_ratio * run_value.abs()
         };
 
         if (val - run_value).abs() <= threshold {
@@ -166,9 +168,10 @@ mod tests {
     fn test_adaptive_rle_simple() {
         // Test case from the documentation example
         let values = vec![100.0, 102.0, 98.0, 200.0, 205.0, 95.0, 100.0];
-        let compress_ratio = 10; // 10% tolerance
+        let curve_ratio = 10.0; // 10% tolerance
+        let bar_ratio = 10.0; // 10% tolerance
         
-        let runs = compress_signal(&values, PlotType::Curve, compress_ratio);
+        let runs = compress_signal_with_reference(&values, None, PlotType::Curve, curve_ratio, bar_ratio);
         
         // Expected runs (approximately):
         // Run 1: positions 1-3, value ~100
@@ -193,9 +196,10 @@ mod tests {
     fn test_adaptive_rle_constant() {
         // All values the same - should produce one run
         let values = vec![50.0; 1000];
-        let compress_ratio = 10;
+        let curve_ratio = 10.0;
+        let bar_ratio = 10.0;
         
-        let runs = compress_signal_with_reference(&values, None, PlotType::Curve, compress_ratio);
+        let runs = compress_signal_with_reference(&values, None, PlotType::Curve, curve_ratio, bar_ratio);
         
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].start_pos, 1);
@@ -207,9 +211,10 @@ mod tests {
     fn test_adaptive_rle_spike() {
         // Constant with a spike - spike should be its own run
         let values = vec![100.0, 100.0, 500.0, 100.0, 100.0];
-        let compress_ratio = 10;
+        let curve_ratio = 10.0;
+        let bar_ratio = 10.0;
         
-        let runs = compress_signal_with_reference(&values, None, PlotType::Curve, compress_ratio);
+        let runs = compress_signal_with_reference(&values, None, PlotType::Curve, curve_ratio, bar_ratio);
         
         // Should have 3 runs: [1-2], [3], [4-5]
         assert_eq!(runs.len(), 3);
@@ -228,9 +233,10 @@ mod tests {
     #[test]
     fn test_adaptive_rle_empty() {
         let values: Vec<f64> = vec![];
-        let compress_ratio = 10;
+        let curve_ratio = 10.0;
+        let bar_ratio = 10.0;
         
-        let runs = compress_signal_with_reference(&values, None, PlotType::Curve, compress_ratio);
+        let runs = compress_signal_with_reference(&values, None, PlotType::Curve, curve_ratio, bar_ratio);
         assert_eq!(runs.len(), 0);
     }
 
@@ -240,13 +246,14 @@ mod tests {
         // Scenario: constant mismatches (5) but varying coverage
         let coverage = vec![1000.0, 1000.0, 1000.0, 50.0, 50.0, 1000.0, 1000.0];
         let mismatches = vec![5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0];
-        let compress_ratio = 10; // 10% threshold
+        let curve_ratio = 10.0; // 10% threshold
+        let bar_ratio = 10.0;
         
         // Positions 0-2: 5 <= 0.1*1000 (100) → filtered out (insignificant at high coverage)
         // Positions 3-4: 5 > 0.1*50 (5) → saved as run (significant at low coverage!)
         // Positions 5-6: 5 <= 0.1*1000 (100) → filtered out (back to insignificant)
         
-        let runs = compress_signal_with_reference(&mismatches, Some(&coverage), PlotType::Bars, compress_ratio);
+        let runs = compress_signal_with_reference(&mismatches, Some(&coverage), PlotType::Bars, curve_ratio, bar_ratio);
         
         // Should have only 1 run: the low-coverage spike (others filtered out)
         assert_eq!(runs.len(), 1);
@@ -260,9 +267,10 @@ mod tests {
     fn test_bars_without_reference_fallback() {
         // Test that bars without reference fall back to curve-like behavior
         let values = vec![5.0, 5.0, 50.0, 50.0, 5.0];
-        let compress_ratio = 10;
+        let curve_ratio = 10.0;
+        let bar_ratio = 10.0;
         
-        let runs = compress_signal_with_reference(&values, None, PlotType::Bars, compress_ratio);
+        let runs = compress_signal_with_reference(&values, None, PlotType::Bars, curve_ratio, bar_ratio);
         
         // Should create runs based on value changes (10x jump)
         assert!(runs.len() >= 2); // At least spike separated

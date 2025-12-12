@@ -127,6 +127,30 @@ fn create_core_tables(conn: &Connection, create_indexes: bool) -> Result<()> {
     )
     .context("Failed to create Variable table")?;
 
+    conn.execute(
+        "CREATE TABLE Summary (
+            Summary_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            Contig_id INTEGER NOT NULL,
+            Sample_id INTEGER NOT NULL,
+            Variable_id INTEGER NOT NULL,
+            Row_count INTEGER NOT NULL,
+            FOREIGN KEY(Contig_id) REFERENCES Contig(Contig_id),
+            FOREIGN KEY(Sample_id) REFERENCES Sample(Sample_id),
+            FOREIGN KEY(Variable_id) REFERENCES Variable(Variable_id),
+            UNIQUE(Contig_id, Sample_id, Variable_id)
+        )",
+        [],
+    )
+    .context("Failed to create Summary table")?;
+
+    if create_indexes {
+        conn.execute(
+            "CREATE INDEX idx_summary_lookup ON Summary(Contig_id, Sample_id, Variable_id)",
+            [],
+        )
+        .context("Failed to create Summary index")?;
+    }
+
     Ok(())
 }
 
@@ -417,6 +441,17 @@ fn merge_features(
         .and_then(|name| sample_name_to_id.get(name).copied())
         .unwrap_or(1);
 
+    // Get Variable_id mapping
+    let variable_name_to_id: HashMap<String, i64> = {
+        let mut stmt = conn.prepare("SELECT Variable_name, Variable_id FROM Variable")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    let mut summary_stmt = conn.prepare(
+        "INSERT INTO Summary (Contig_id, Sample_id, Variable_id, Row_count) VALUES (?1, ?2, ?3, ?4)"
+    )?;
+
     for v in VARIABLES {
         let table_name = feature_table_name(v.name);
 
@@ -432,6 +467,9 @@ fn merge_features(
             continue;
         }
 
+        // Track row counts per contig for summary
+        let mut contig_row_counts: HashMap<i64, usize> = HashMap::new();
+
         let mut stmt = conn.prepare(&format!(
             "INSERT INTO {} (Contig_id, Sample_id, First_position, Last_position, Value) VALUES (?1, ?2, ?3, ?4, ?5)",
             table_name
@@ -440,6 +478,14 @@ fn merge_features(
         for (contig_name, first_pos, last_pos, value) in features {
             if let Some(&contig_id) = contig_name_to_id.get(&contig_name) {
                 stmt.execute(params![contig_id, sample_id, first_pos, last_pos, value])?;
+                *contig_row_counts.entry(contig_id).or_insert(0) += 1;
+            }
+        }
+
+        // Insert summary data for this variable
+        if let Some(&variable_id) = variable_name_to_id.get(v.name) {
+            for (contig_id, row_count) in contig_row_counts {
+                summary_stmt.execute(params![contig_id, sample_id, variable_id, row_count as i64])?;
             }
         }
     }

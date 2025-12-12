@@ -85,7 +85,8 @@ mod python {
         threads: usize,
         annotation_tool: &str,
         min_coverage: f64,
-        compress_ratio: f64,
+        curve_ratio: f64,
+        bar_ratio: f64,
         circular: bool,
         create_indexes: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
@@ -95,7 +96,8 @@ mod python {
         let config = ProcessConfig {
             threads,
             min_coverage,
-            compress_ratio,
+            curve_ratio,
+            bar_ratio,
             circular,
         };
 
