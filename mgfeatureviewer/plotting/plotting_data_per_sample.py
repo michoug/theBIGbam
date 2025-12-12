@@ -300,7 +300,7 @@ def get_feature_data(cur, feature, contig_id, sample_id, contig_name=None, sampl
     return list_feature_dict
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=130, genbank_path=None):
+def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=100, genbank_path=None):
     """Generate a Bokeh plot for a single sample.
 
     Args:

@@ -5,7 +5,7 @@ import traceback
 
 from bokeh.layouts import column, row
 from bokeh.models import Div, InlineStyleSheet, Tooltip, CustomJS
-from bokeh.models.widgets import AutocompleteInput, CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup, Toggle, RangeSlider
+from bokeh.models.widgets import AutocompleteInput, CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup, Toggle, RangeSlider, Select, TextInput
 from bokeh.models.plots import GridPlot
 
 # Import the plotting function from the repo
@@ -41,6 +41,9 @@ def build_controls(conn):
                                       sizing_mode="stretch_width")
 
     # Modules and variables
+    cur.execute("SELECT DISTINCT Variable_name FROM Variable")
+    variables = [r[0] for r in cur.fetchall()]
+
     cur.execute("SELECT DISTINCT Module FROM Variable")
     modules = [r[0] for r in cur.fetchall()]
 
@@ -83,17 +86,14 @@ def build_controls(conn):
         'helps_widgets': helps_widgets,
         'variables_widgets': variables_widgets,
         'contigs': contigs,
-        'samples': samples
+        'samples': samples,
+        'variables': variables
     }
     return widgets
 
 def modify_doc_factory(db_path):
-    """Return a modify_doc(doc) function to be used by Bokeh server application.
+    """Return a modify_doc(doc) function to be used by Bokeh server application."""
 
-    Args:
-        db_path: Path to either a directory (Rust output with metadata.db + parquet files)
-                 or a .db file (Python output with Feature_* tables)
-    """
     # Load the CSS
     css_path = os.path.join(os.path.dirname(__file__), "..", "..", "static", "bokeh_styles.css")
     with open(css_path) as f:
@@ -105,7 +105,7 @@ def modify_doc_factory(db_path):
     views_title = Div(text="<b>View</b>")
     views = RadioButtonGroup(labels=["One sample", "All samples"], active=0, sizing_mode="stretch_width")
 
-    # Open SQLite database connection
+    # Open SQLite database connection to build widgets depending on data
     conn = sqlite3.connect(db_path)
     widgets = build_controls(conn)
 
@@ -125,7 +125,31 @@ def modify_doc_factory(db_path):
     for contig_name, sample_name in presence_cur.fetchall():
         sample_to_contigs.setdefault(sample_name, set()).add(contig_name)
         contig_to_samples.setdefault(contig_name, set()).add(sample_name)
+    # Helper function to create collapsible section toggle callbacks
+    def make_toggle_callback(btn, content):
+        def callback():
+            content.visible = not content.visible
+            if content.visible:
+                btn.label = "▼"
+            else:
+                btn.label = "▶"
+        return callback
+    # Build Sample section
+    sample_toggle_btn = Button(label="▼", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[stylesheet])
+    sample_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
+    sample_title = Div(text="<b>Samples</b>", align="center")
+    sample_header = row(sample_toggle_btn, sample_title, sizing_mode="stretch_width", align="center")
 
+    filter_samples = CheckboxGroup(labels=["Only show samples present with selected contig"], active=[])
+    sample_children = [filter_samples]
+
+    sample_content = column(
+        *sample_children,
+        visible=True, sizing_mode="stretch_width"
+    )
+    sample_toggle_btn.on_click(make_toggle_callback(sample_toggle_btn, sample_content))
+
+    # Build Contig section
     # Build contig lengths mapping for length filtering
     length_cur = conn.cursor()
     length_cur.execute('SELECT Contig_name, Contig_length FROM Contig')
@@ -137,7 +161,6 @@ def modify_doc_factory(db_path):
     orig_contigs = list(widgets['contigs'])
     orig_samples = list(widgets['samples'])
 
-    contigs_title = Div(text="<b>Contig</b>")
     filter_contigs = CheckboxGroup(labels=["Only show contigs present with selected sample"], active=[])
 
     # Length filter slider (only if multiple contigs)
@@ -145,10 +168,108 @@ def modify_doc_factory(db_path):
     if len(contig_lengths) > 1:
         length_slider = RangeSlider(start=min_len, end=max_len, value=(min_len, max_len), step=1, title="Contig Length")
 
-    samples_title = Div(text="<b>Sample</b>")
-    filter_samples = CheckboxGroup(labels=["Only show samples present with selected contig"], active=[])
+    # Initialize variable_filter_rows list early so it's available in filter functions
+    variable_filter_rows = []
 
     # Helper functions to refresh completions based on filters
+    def get_variable_filtered_contigs():
+        """Apply variable-based filters to get allowed contigs."""
+        if not variable_filter_rows:
+            return set(orig_contigs)
+        
+        allowed_contigs = set(orig_contigs)
+        
+        for filter_row in variable_filter_rows:
+            # Access widgets through children: [var_input, comparison_select, threshold_input, plus_btn, minus_btn]
+            var_name = filter_row.children[0].value
+            comparison = filter_row.children[1].value
+            threshold_str = filter_row.children[2].value
+            
+            # Skip invalid filters
+            if not var_name or not threshold_str:
+                continue
+            
+            try:
+                threshold = int(threshold_str)
+            except ValueError:
+                continue
+            
+            if threshold < 0:
+                continue
+            
+            # Query Summary table for contigs matching this filter
+            filter_cur = conn.cursor()
+            if comparison == "with more points than":
+                filter_cur.execute("""
+                    SELECT DISTINCT Contig.Contig_name 
+                    FROM Summary
+                    JOIN Contig ON Summary.Contig_id = Contig.Contig_id
+                    JOIN Variable ON Summary.Variable_id = Variable.Variable_id
+                    WHERE Variable.Variable_name = ? AND Summary.Row_count > ?
+                """, (var_name, threshold))
+            else:  # "with less points than"
+                filter_cur.execute("""
+                    SELECT DISTINCT Contig.Contig_name 
+                    FROM Summary
+                    JOIN Contig ON Summary.Contig_id = Contig.Contig_id
+                    JOIN Variable ON Summary.Variable_id = Variable.Variable_id
+                    WHERE Variable.Variable_name = ? AND Summary.Row_count < ?
+                """, (var_name, threshold))
+            
+            matching_contigs = {row[0] for row in filter_cur.fetchall()}
+            allowed_contigs &= matching_contigs  # AND logic: all filters must match
+        
+        return allowed_contigs
+    
+    def get_variable_filtered_samples():
+        """Apply variable-based filters to get allowed samples."""
+        if not variable_filter_rows:
+            return set(orig_samples)
+        
+        allowed_samples = set(orig_samples)
+        
+        for filter_row in variable_filter_rows:
+            # Access widgets through children: [var_input, comparison_select, threshold_input, plus_btn, minus_btn]
+            var_name = filter_row.children[0].value
+            comparison = filter_row.children[1].value
+            threshold_str = filter_row.children[2].value
+            
+            # Skip invalid filters
+            if not var_name or not threshold_str:
+                continue
+            
+            try:
+                threshold = int(threshold_str)
+            except ValueError:
+                continue
+            
+            if threshold < 0:
+                continue
+            
+            # Query Summary table for samples matching this filter
+            filter_cur = conn.cursor()
+            if comparison == "with more points than":
+                filter_cur.execute("""
+                    SELECT DISTINCT Sample.Sample_name 
+                    FROM Summary
+                    JOIN Sample ON Summary.Sample_id = Sample.Sample_id
+                    JOIN Variable ON Summary.Variable_id = Variable.Variable_id
+                    WHERE Variable.Variable_name = ? AND Summary.Row_count > ?
+                """, (var_name, threshold))
+            else:  # "with less points than"
+                filter_cur.execute("""
+                    SELECT DISTINCT Sample.Sample_name 
+                    FROM Summary
+                    JOIN Sample ON Summary.Sample_id = Sample.Sample_id
+                    JOIN Variable ON Summary.Variable_id = Variable.Variable_id
+                    WHERE Variable.Variable_name = ? AND Summary.Row_count < ?
+                """, (var_name, threshold))
+            
+            matching_samples = {row[0] for row in filter_cur.fetchall()}
+            allowed_samples &= matching_samples  # AND logic: all filters must match
+        
+        return allowed_samples
+    
     def refresh_contig_options():
         if 0 in filter_contigs.active and views.active == 0:
             sel_sample = widgets['sample_select'].value
@@ -161,6 +282,10 @@ def modify_doc_factory(db_path):
         if length_slider is not None:
             min_length, max_length = length_slider.value
             completions = [c for c in completions if min_length <= contig_lengths.get(c, 0) <= max_length]
+        
+        # Apply variable-based filters
+        var_allowed = get_variable_filtered_contigs()
+        completions = [c for c in completions if c in var_allowed]
 
         widgets['contig_select'].completions = completions
         # Auto-fill when only one option
@@ -176,6 +301,10 @@ def modify_doc_factory(db_path):
             completions = [s for s in orig_samples if s in allowed]
         else:
             completions = list(orig_samples)
+        
+        # Apply variable-based filters
+        var_allowed = get_variable_filtered_samples()
+        completions = [s for s in completions if s in var_allowed]
 
         widgets['sample_select'].completions = completions
         # Auto-fill when only one option
@@ -236,15 +365,15 @@ def modify_doc_factory(db_path):
     def on_view_change(attr, old, new):
         is_all = (new == 1)  # True means All samples
         
-        # Toggle sample-related controls
-        widgets['sample_select'].visible = not is_all
-        samples_title.visible = not is_all
-        
-        # Toggle filtering section
-        filtering_header.visible = not is_all
-        filtering_content.visible = not is_all
-        filter_contigs.visible = not is_all
+        # Toggle Sample section
+        sample_header.visible = not is_all
+        sample_content.visible = not is_all
         filter_samples.visible = not is_all
+
+        # Toggle Contig section
+        contig_header.visible = not is_all
+        contig_content.visible = not is_all
+        filter_contigs.visible = not is_all
         
         if is_all:
             filter_contigs.active = []
@@ -289,34 +418,100 @@ def modify_doc_factory(db_path):
     widgets['sample_select'].on_change('value', lambda attr, old, new: refresh_contig_options())
     widgets['contig_select'].on_change('value', lambda attr, old, new: refresh_sample_options())
 
-    # Helper function to create collapsible section toggle callbacks
-    def make_toggle_callback(btn, content):
-        def callback():
-            content.visible = not content.visible
-            if content.visible:
-                btn.label = "▼"
-            else:
-                btn.label = "▶"
-        return callback
-
     # Create collapsible Filtering section
-    filtering_toggle_btn = Button(label="▼", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[stylesheet])
-    filtering_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
-    filtering_title = Div(text="<b>Filtering among contigs/samples</b>", align="center")
-    filtering_header = row(filtering_toggle_btn, filtering_title, sizing_mode="stretch_width", align="center")
-    filtering_children = [filter_samples]
-    filtering_children.append(filter_contigs)
+    contig_toggle_btn = Button(label="▼", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[stylesheet])
+    contig_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
+    contig_title = Div(text="<b>Contigs</b>", align="center")
+    contig_header = row(contig_toggle_btn, contig_title, sizing_mode="stretch_width", align="center")
+    contig_children = [filter_contigs]
     if length_slider is not None:
-        filtering_children.append(length_slider)
-    filtering_content = column(
-        *filtering_children,
+        contig_children.append(length_slider)
+    
+    # Add "Per variable" filtering subsection
+    per_variable_title = Div(text="Per variable")
+    
+    # Store all variable filter rows for dynamic management (already initialized above)
+    variable_filters_column = column(sizing_mode="stretch_width")
+    
+    def create_variable_filter_row():
+        """Create a new row of variable filter widgets."""
+        var_input = AutocompleteInput(
+            completions=widgets['variables'],
+            placeholder="Select variable...",
+            min_characters=0,
+            case_sensitive=False,
+            restrict=False,
+            max_completions=20,
+            sizing_mode="stretch_width"
+        )
+        
+        comparison_select = Select(
+            options=[">", "<"],
+            value=">",
+            width=45
+        )
+        
+        threshold_input = TextInput(
+            value="0",
+            placeholder="Threshold",
+            width=60
+        )
+        
+        plus_btn = Button(label="+", width=30, height=30)
+        minus_btn = Button(label="−", width=30, height=30, visible=len(variable_filter_rows) > 0)
+        
+        filter_row = row(var_input, comparison_select, threshold_input, plus_btn, minus_btn, sizing_mode="stretch_width")
+        
+        def add_row_callback():
+            new_row = create_variable_filter_row()
+            variable_filter_rows.append(new_row)
+            variable_filters_column.children = list(variable_filters_column.children) + [new_row]
+            # Make minus buttons visible when there's more than one row
+            for row_widget in variable_filter_rows:
+                row_widget.children[-1].visible = True  # Last child is minus button
+            # Refresh options based on new filters
+            refresh_contig_options()
+            refresh_sample_options()
+        
+        def remove_row_callback():
+            if filter_row in variable_filter_rows:
+                variable_filter_rows.remove(filter_row)
+                variable_filters_column.children = [r for r in variable_filters_column.children if r != filter_row]
+                # Hide minus buttons if only one row remains
+                if len(variable_filter_rows) == 1:
+                    variable_filter_rows[0].children[-1].visible = False
+                # Refresh options after removing filter
+                refresh_contig_options()
+                refresh_sample_options()
+        
+        plus_btn.on_click(add_row_callback)
+        minus_btn.on_click(remove_row_callback)
+        
+        # Refresh on value changes
+        var_input.on_change('value', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
+        comparison_select.on_change('value', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
+        threshold_input.on_change('value', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
+        
+        return filter_row
+    
+    # Create initial filter row
+    initial_row = create_variable_filter_row()
+    variable_filter_rows.append(initial_row)
+    variable_filters_column.children = [initial_row]
+    
+    contig_children.append(per_variable_title)
+    contig_children.append(variable_filters_column)
+    
+    contig_content = column(
+        *contig_children,
         visible=True, sizing_mode="stretch_width"
     )
-    filtering_toggle_btn.on_click(make_toggle_callback(filtering_toggle_btn, filtering_content))
+    contig_toggle_btn.on_click(make_toggle_callback(contig_toggle_btn, contig_content))
 
     variables_title = Div(text="<b>Variables</b>")
     show_genemap = CheckboxGroup(labels=["Show gene map"], active=[0])
-    controls_children = [instructions, views_title, views, filtering_header, filtering_content, samples_title, widgets['sample_select'], contigs_title, widgets['contig_select'], variables_title, show_genemap]
+
+    controls_children = [instructions, views_title, views, sample_header, sample_content, widgets['sample_select'], contig_header, contig_content, widgets['contig_select'], variables_title, show_genemap]
     
     # Store toggle buttons and content containers for collapsible sections
     module_toggles = []
