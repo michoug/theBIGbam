@@ -17,8 +17,10 @@ def build_controls(conn):
     cur = conn.cursor()
 
     # Widget Selector for Contigs (autocomplete with max 20 suggestions)
-    cur.execute("SELECT Contig_name FROM Contig ORDER BY Contig_name")
-    contigs = [r[0] for r in cur.fetchall()]
+    cur.execute("SELECT Contig_name, Contig_length FROM Contig ORDER BY Contig_name")
+    rows = cur.fetchall()
+    contigs = [r[0] for r in rows]
+    contig_lengths = {r[0]: r[1] for r in rows}  # Dictionary mapping contig_name -> length
     contig_select = AutocompleteInput(value=contigs[0] if len(contigs) == 1 else "", 
                                       completions=contigs, 
                                       min_characters=0,
@@ -39,6 +41,18 @@ def build_controls(conn):
                                       max_completions=20,
                                       placeholder="Type to search samples...",
                                       sizing_mode="stretch_width")
+    
+    # Build presence mappings: sample -> contigs and contig -> samples
+    cur.execute("""
+    SELECT Contig.Contig_name, Sample.Sample_name FROM Presences
+      JOIN Contig ON Presences.Contig_id = Contig.Contig_id
+      JOIN Sample ON Presences.Sample_id = Sample.Sample_id
+    """)
+    sample_to_contigs = {}
+    contig_to_samples = {}
+    for contig_name, sample_name in cur.fetchall():
+        sample_to_contigs.setdefault(sample_name, set()).add(contig_name)
+        contig_to_samples.setdefault(contig_name, set()).add(sample_name)
 
     # Modules and variables
     cur.execute("SELECT DISTINCT Variable_name FROM Variable")
@@ -81,11 +95,14 @@ def build_controls(conn):
     widgets = {
         'sample_select': sample_select,
         'contig_select': contig_select,
+        'sample_to_contigs': sample_to_contigs,
+        'contig_to_samples': contig_to_samples,
         'module_names': module_names,
         'module_widgets': module_widgets,
         'helps_widgets': helps_widgets,
         'variables_widgets': variables_widgets,
         'contigs': contigs,
+        'contig_lengths': contig_lengths,
         'samples': samples,
         'variables': variables
     }
@@ -94,38 +111,8 @@ def build_controls(conn):
 def modify_doc_factory(db_path):
     """Return a modify_doc(doc) function to be used by Bokeh server application."""
 
-    # Load the CSS
-    css_path = os.path.join(os.path.dirname(__file__), "..", "..", "static", "bokeh_styles.css")
-    with open(css_path) as f:
-        css_text = f.read()
-    stylesheet = InlineStyleSheet(css=css_text)
-
-    instructions = Div(text="<b>Select elements to plot and click Apply:</b>")
-
-    views_title = Div(text="<b>View</b>")
-    views = RadioButtonGroup(labels=["One sample", "All samples"], active=0, sizing_mode="stretch_width")
-
-    # Open SQLite database connection to build widgets depending on data
-    conn = sqlite3.connect(db_path)
-    widgets = build_controls(conn)
-
-    # Header placeholders (populated below) so view-change callback can toggle them
-    header_with_checkbox = []
-    header_with_title = []
-
-    # Build presence mappings: sample -> contigs and contig -> samples
-    presence_cur = conn.cursor()
-    presence_cur.execute("""
-    SELECT Contig.Contig_name, Sample.Sample_name FROM Presences
-      JOIN Contig ON Presences.Contig_id = Contig.Contig_id
-      JOIN Sample ON Presences.Sample_id = Sample.Sample_id
-    """)
-    sample_to_contigs = {}
-    contig_to_samples = {}
-    for contig_name, sample_name in presence_cur.fetchall():
-        sample_to_contigs.setdefault(sample_name, set()).add(contig_name)
-        contig_to_samples.setdefault(contig_name, set()).add(sample_name)
-    # Helper function to create collapsible section toggle callbacks
+    ### Event functions
+    ## Helper function to create collapsible section toggle callbacks
     def make_toggle_callback(btn, content):
         def callback():
             content.visible = not content.visible
@@ -134,44 +121,32 @@ def modify_doc_factory(db_path):
             else:
                 btn.label = "▶"
         return callback
-    # Build Sample section
-    sample_toggle_btn = Button(label="▼", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[stylesheet])
-    sample_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
-    sample_title = Div(text="<b>Samples</b>", align="center")
-    sample_header = row(sample_toggle_btn, sample_title, sizing_mode="stretch_width", align="center")
-
-    filter_samples = CheckboxGroup(labels=["Only show samples present with selected contig"], active=[])
-    sample_children = [filter_samples]
-
-    sample_content = column(
-        *sample_children,
-        visible=True, sizing_mode="stretch_width"
-    )
-    sample_toggle_btn.on_click(make_toggle_callback(sample_toggle_btn, sample_content))
-
-    # Build Contig section
-    # Build contig lengths mapping for length filtering
-    length_cur = conn.cursor()
-    length_cur.execute('SELECT Contig_name, Contig_length FROM Contig')
-    contig_lengths = {name: length for name, length in length_cur.fetchall()}
-    min_len = min(contig_lengths.values()) if contig_lengths else 0
-    max_len = max(contig_lengths.values()) if contig_lengths else 100000
-
-    # Keep original full lists so we can restore when filters are off
-    orig_contigs = list(widgets['contigs'])
-    orig_samples = list(widgets['samples'])
-
-    filter_contigs = CheckboxGroup(labels=["Only show contigs present with selected sample"], active=[])
-
-    # Length filter slider (only if multiple contigs)
-    length_slider = None
-    if len(contig_lengths) > 1:
-        length_slider = RangeSlider(start=min_len, end=max_len, value=(min_len, max_len), step=1, title="Contig length")
-
-    # Initialize variable_filter_rows list early so it's available in filter functions
-    variable_filter_rows = []
-
-    # Helper functions to refresh completions based on filters
+    
+    ## Helper functions to refresh completions based on filters
+    def query_summary_filtered_items(entity_type, var_name, comparison, threshold):
+        """Query Summary table for filtered contig or sample names.
+        
+        Args:
+            entity_type: "Contig" or "Sample"
+            var_name: Variable name to filter by
+            comparison: ">" or "<"
+            threshold: Row count threshold
+        
+        Returns:
+            Set of matching entity names
+        """
+        operator = ">" if comparison == ">" else "<"
+        query = f"""
+            SELECT DISTINCT {entity_type}.{entity_type}_name 
+            FROM Summary
+            JOIN {entity_type} ON Summary.{entity_type}_id = {entity_type}.{entity_type}_id
+            JOIN Variable ON Summary.Variable_id = Variable.Variable_id
+            WHERE Variable.Variable_name = ? AND Summary.Row_count {operator} ?
+        """
+        cur = conn.cursor()
+        cur.execute(query, (var_name, threshold))
+        return {row[0] for row in cur.fetchall()}
+    
     def get_variable_filtered_contigs():
         """Apply variable-based filters to get allowed contigs."""
         if not variable_filter_rows:
@@ -180,44 +155,23 @@ def modify_doc_factory(db_path):
         allowed_contigs = set(orig_contigs)
         
         for filter_row in variable_filter_rows:
-            # Access widgets through children: [var_input, comparison_select, threshold_input, plus_btn, minus_btn]
             var_name = filter_row.children[0].value
             comparison = filter_row.children[1].value
             threshold_str = filter_row.children[2].value
             
-            # Skip invalid filters
-            if not var_name or not threshold_str:
+            # Skip invalid filters - only apply if variable name is valid and exists
+            if not var_name or not threshold_str or var_name not in widgets['variables']:
                 continue
             
             try:
                 threshold = int(threshold_str)
+                if threshold < 0:
+                    continue
             except ValueError:
                 continue
             
-            if threshold < 0:
-                continue
-            
-            # Query Summary table for contigs matching this filter
-            filter_cur = conn.cursor()
-            if comparison == ">":
-                filter_cur.execute("""
-                    SELECT DISTINCT Contig.Contig_name 
-                    FROM Summary
-                    JOIN Contig ON Summary.Contig_id = Contig.Contig_id
-                    JOIN Variable ON Summary.Variable_id = Variable.Variable_id
-                    WHERE Variable.Variable_name = ? AND Summary.Row_count > ?
-                """, (var_name, threshold))
-            else:  # "<"
-                filter_cur.execute("""
-                    SELECT DISTINCT Contig.Contig_name 
-                    FROM Summary
-                    JOIN Contig ON Summary.Contig_id = Contig.Contig_id
-                    JOIN Variable ON Summary.Variable_id = Variable.Variable_id
-                    WHERE Variable.Variable_name = ? AND Summary.Row_count < ?
-                """, (var_name, threshold))
-            
-            matching_contigs = {row[0] for row in filter_cur.fetchall()}
-            allowed_contigs &= matching_contigs  # AND logic: all filters must match
+            matching = query_summary_filtered_items("Contig", var_name, comparison, threshold)
+            allowed_contigs &= matching  # AND logic: all filters must match
         
         return allowed_contigs
     
@@ -229,7 +183,6 @@ def modify_doc_factory(db_path):
         allowed_samples = set(orig_samples)
         
         for filter_row in variable_filter_rows:
-            # Access widgets through children: [var_input, comparison_select, threshold_input, plus_btn, minus_btn]
             var_name = filter_row.children[0].value
             comparison = filter_row.children[1].value
             threshold_str = filter_row.children[2].value
@@ -240,40 +193,29 @@ def modify_doc_factory(db_path):
             
             try:
                 threshold = int(threshold_str)
+                if threshold < 0:
+                    continue
             except ValueError:
                 continue
             
-            if threshold < 0:
-                continue
-            
-            # Query Summary table for samples matching this filter
-            filter_cur = conn.cursor()
-            if comparison == ">":
-                filter_cur.execute("""
-                    SELECT DISTINCT Sample.Sample_name 
-                    FROM Summary
-                    JOIN Sample ON Summary.Sample_id = Sample.Sample_id
-                    JOIN Variable ON Summary.Variable_id = Variable.Variable_id
-                    WHERE Variable.Variable_name = ? AND Summary.Row_count > ?
-                """, (var_name, threshold))
-            else:  # "<"
-                filter_cur.execute("""
-                    SELECT DISTINCT Sample.Sample_name 
-                    FROM Summary
-                    JOIN Sample ON Summary.Sample_id = Sample.Sample_id
-                    JOIN Variable ON Summary.Variable_id = Variable.Variable_id
-                    WHERE Variable.Variable_name = ? AND Summary.Row_count < ?
-                """, (var_name, threshold))
-            
-            matching_samples = {row[0] for row in filter_cur.fetchall()}
-            allowed_samples &= matching_samples  # AND logic: all filters must match
+            matching = query_summary_filtered_items("Sample", var_name, comparison, threshold)
+            allowed_samples &= matching  # AND logic: all filters must match
         
         return allowed_samples
     
+    def update_widget_completions(widget, completions):
+        """Update widget completions and auto-fill if only one option."""
+        widget.completions = completions
+        if len(completions) == 1:
+            widget.value = completions[0]
+        elif widget.value not in completions:
+            widget.value = ""
+    
     def refresh_contig_options():
+        # Start with presence filter if active
         if 0 in filter_contigs.active and views.active == 0:
             sel_sample = widgets['sample_select'].value
-            allowed = sample_to_contigs.get(sel_sample, set())
+            allowed = widgets['sample_to_contigs'].get(sel_sample, set())
             completions = [c for c in orig_contigs if c in allowed]
         else:
             completions = list(orig_contigs)
@@ -281,47 +223,32 @@ def modify_doc_factory(db_path):
         # Apply length filter
         if length_slider is not None:
             min_length, max_length = length_slider.value
-            completions = [c for c in completions if min_length <= contig_lengths.get(c, 0) <= max_length]
+            completions = [c for c in completions if min_length <= widgets['contig_lengths'].get(c, 0) <= max_length]
         
-        # Apply variable-based filters
-        var_allowed = get_variable_filtered_contigs()
-        completions = [c for c in completions if c in var_allowed]
+        # Apply variable-based filters (only in "Per sample" view)
+        if views.active == 0:
+            var_allowed = get_variable_filtered_contigs()
+            completions = [c for c in completions if c in var_allowed]
 
-        widgets['contig_select'].completions = completions
-        # Auto-fill when only one option
-        if len(completions) == 1:
-            widgets['contig_select'].value = completions[0]
-        elif widgets['contig_select'].value not in completions:
-            widgets['contig_select'].value = ""
+        update_widget_completions(widgets['contig_select'], completions)
 
     def refresh_sample_options():
+        # Start with presence filter if active
         if 0 in filter_samples.active and views.active == 0:
             sel_contig = widgets['contig_select'].value
-            allowed = contig_to_samples.get(sel_contig, set())
+            allowed = widgets['contig_to_samples'].get(sel_contig, set())
             completions = [s for s in orig_samples if s in allowed]
         else:
             completions = list(orig_samples)
         
-        # Apply variable-based filters
-        var_allowed = get_variable_filtered_samples()
-        completions = [s for s in completions if s in var_allowed]
+        # Apply variable-based filters (only in "Per sample" view)
+        if views.active == 0:
+            var_allowed = get_variable_filtered_samples()
+            completions = [s for s in completions if s in var_allowed]
 
-        widgets['sample_select'].completions = completions
-        # Auto-fill when only one option
-        if len(completions) == 1:
-            widgets['sample_select'].value = completions[0]
-        elif widgets['sample_select'].value not in completions:
-            widgets['sample_select'].value = ""
+        update_widget_completions(widgets['sample_select'], completions)
 
-    # Wire up filter callbacks
-    filter_contigs.on_change('active', lambda attr, old, new: refresh_contig_options())
-    filter_samples.on_change('active', lambda attr, old, new: refresh_sample_options())
-    if length_slider is not None:
-        length_slider.on_change('value', lambda attr, old, new: refresh_contig_options())
-
-    # Global lock for toggles when enforcing single-variable mode
-    global_toggle_lock = {'locked': False}
-
+    ## Views function
     # Enforce single-variable selection when in "All samples" view
     def make_global_variable_callback(cbg):
         def callback(attr, old, new):
@@ -356,11 +283,7 @@ def modify_doc_factory(db_path):
                     other.active = []
             global_toggle_lock['locked'] = False
         return callback
-
-    # Attach global variable callbacks to all CheckboxButtonGroups
-    for cbg in widgets['variables_widgets']:
-        cbg.on_change('active', make_global_variable_callback(cbg))
-
+    
     # Views (One sample / All samples) callback: show/hide sample-related controls
     def on_view_change(attr, old, new):
         is_all = (new == 1)  # True means All samples
@@ -401,8 +324,8 @@ def modify_doc_factory(db_path):
         
         # Toggle header visibility: checkbox-header in One-sample, title-header in All-samples
         for i, mw in enumerate(widgets['module_widgets']):
-            hdr_cb = header_with_checkbox[i]
-            hdr_title = header_with_title[i]
+            hdr_cb = module_header_with_checkbox[i]
+            hdr_title = module_header_with_title[i]
             
             if mw is None:
                 # Single-variable module: always show title header
@@ -418,32 +341,13 @@ def modify_doc_factory(db_path):
         # Unlock callbacks
         global_toggle_lock['locked'] = False
         
-        # Only refresh when switching to One-sample (not needed for All-samples)
+        # Refresh options after view change
+        # In "All samples": clears presence and per-variable filters, keeps only length filter
+        # In "Per sample": applies all filters including presence and per-variable
+        refresh_contig_options()
         if not is_all:
-            refresh_contig_options()
             refresh_sample_options()
 
-    views.on_change('active', on_view_change)
-
-    # Wire up select/filter interactions
-    widgets['sample_select'].on_change('value', lambda attr, old, new: refresh_contig_options())
-    widgets['contig_select'].on_change('value', lambda attr, old, new: refresh_sample_options())
-
-    # Create collapsible Filtering section
-    contig_toggle_btn = Button(label="▼", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[stylesheet])
-    contig_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
-    contig_title = Div(text="<b>Contigs</b>", align="center")
-    contig_header = row(contig_toggle_btn, contig_title, sizing_mode="stretch_width", align="center")
-    contig_children = [filter_contigs]
-    if length_slider is not None:
-        contig_children.append(length_slider)
-    
-    # Add "Per variable" filtering subsection
-    per_variable_title = Div(text="Per variable:")
-    
-    # Store all variable filter rows for dynamic management (already initialized above)
-    variable_filters_column = column(sizing_mode="stretch_width")
-    
     def create_variable_filter_row():
         """Create a new row of variable filter widgets."""
         var_input = AutocompleteInput(
@@ -505,151 +409,7 @@ def modify_doc_factory(db_path):
         
         return filter_row
     
-    # Create initial filter row
-    initial_row = create_variable_filter_row()
-    variable_filter_rows.append(initial_row)
-    variable_filters_column.children = [initial_row]
-    
-    contig_children.append(per_variable_title)
-    contig_children.append(variable_filters_column)
-    
-    contig_content = column(
-        *contig_children,
-        visible=True, sizing_mode="stretch_width"
-    )
-    contig_toggle_btn.on_click(make_toggle_callback(contig_toggle_btn, contig_content))
-
-    variables_title = Div(text="<b>Variables</b>")
-    show_genemap = CheckboxGroup(labels=["Show gene map"], active=[0])
-
-    # Create visual separators (horizontal lines) using background color
-    separator_samples = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
-    separator_contigs = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
-    separator_variables = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
-
-    controls_children = [instructions, views_title, views, separator_samples, sample_header, sample_content, widgets['sample_select'], separator_contigs, contig_header, contig_content, widgets['contig_select'], separator_variables, variables_title, show_genemap]
-    
-    # Store toggle buttons and content containers for collapsible sections
-    module_toggles = []
-    module_contents = []
-    
-    # Append variable selectors. For modules that have a module-checkbox widget we
-    # show either the checkbox (One-sample) or the plain module title (All-samples).
-    # We create a container that holds both variants and toggle visibility.
-    for i, module_widget in enumerate(widgets['module_widgets']):
-        module_name = widgets['module_names'][i]
-        
-        help_btn = widgets['helps_widgets'][i]
-
-        # Create a small toggle button for collapsible section (just the arrow)
-        # Start with modules folded (collapsed)
-        toggle_btn = Button(label="▶", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[stylesheet])
-        toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
-        module_toggles.append(toggle_btn)
-
-        # Build two header variants: one with the checkbox (shows module name as label)
-        # and one with the plain title (used when checkbox is hidden). Both may include the help button.
-        if module_widget is not None:
-            # Create separate title div for the title-only header
-            module_title_div = Div(text=f"{module_name}", align="center")
-            
-            if help_btn is not None:
-                # Need separate help buttons for each header to avoid "already in doc" error
-                help_btn_cb = HelpButton(tooltip=help_btn.tooltip, width=20, height=20, align="center", stylesheets=[stylesheet])
-                help_btn_title = HelpButton(tooltip=help_btn.tooltip, width=20, height=20, align="center", stylesheets=[stylesheet])
-                hdr_cb = row(toggle_btn, module_widget, help_btn_cb, sizing_mode="stretch_width", align="center")
-                hdr_title = row(toggle_btn, module_title_div, help_btn_title, sizing_mode="stretch_width", align="center")
-            else:
-                hdr_cb = row(toggle_btn, module_widget, sizing_mode="stretch_width", align="center")
-                hdr_title = row(toggle_btn, module_title_div, sizing_mode="stretch_width", align="center")
-
-            # Default: show the checkbox header, hide the plain title header
-            hdr_cb.visible = True
-            hdr_title.visible = False
-            controls_children.append(hdr_cb)
-            controls_children.append(hdr_title)
-            
-            header_with_checkbox.append(hdr_cb)
-            header_with_title.append(hdr_title)
-        else:
-            # No module checkbox exists: show plain title (with help if available)
-            module_title_div = Div(text=f"{module_name}", align="center")
-            if help_btn is not None:
-                hdr = row(toggle_btn, module_title_div, help_btn, sizing_mode="stretch_width", align="center")
-            else:
-                hdr = row(toggle_btn, module_title_div, sizing_mode="stretch_width", align="center")
-            hdr.visible = True
-            controls_children.append(hdr)
-            
-            header_with_checkbox.append(None)
-            header_with_title.append(hdr)
-
-        # Add the module's CheckboxButtonGroup for variables (this will be collapsible)
-        # Start with modules folded (collapsed)
-        cbg = widgets['variables_widgets'][i]
-        cbg.visible = False
-        module_contents.append(cbg)
-        controls_children.append(cbg)
-
-    # Add callbacks for collapsible sections
-    for i, toggle_btn in enumerate(module_toggles):
-        content = module_contents[i]
-        toggle_btn.on_click(make_toggle_callback(toggle_btn, content))
-
-    apply_button = Button(label="Apply", button_type="primary", align="center")
-    controls_children.append(apply_button)
-
-    controls_column = column(*controls_children, width=350, sizing_mode="stretch_height", spacing=0)
-    controls_column.css_classes = ["left-col"]
-
-    main_placeholder = column(Div(text="<i>No plot yet. Select options and click Apply.</i>"), sizing_mode="stretch_both")
-
-    # Wrap everything in a Flex container
-    layout = row(controls_column, main_placeholder, sizing_mode="stretch_both", spacing = 0)
-    layout.stylesheets = [stylesheet]
-
-    ### Attach callbacks
-    for i, mc in enumerate(widgets['module_widgets']):
-        if mc is None:
-            continue
-
-        toggles = widgets['variables_widgets'][i]
-        lock = {"locked": False}  # per-module lock
-
-        # Module → toggles (CheckboxButtonGroup)
-        def make_module_callback(mc, toggles, lock):
-            def callback(attr, old, new):
-                if lock.get("locked", False):
-                    return
-                lock["locked"] = True
-                module_on = 0 in mc.active
-                if module_on:
-                    toggles.active = list(range(len(toggles.labels)))
-                else:
-                    toggles.active = []
-                lock["locked"] = False
-            return callback
-
-        mc.on_change("active", make_module_callback(mc, toggles, lock))
-
-        # Variable → module (update module checkbox only)
-        def make_variable_callback(mc, toggles, lock):
-            def callback(attr, old, new):
-                if lock.get("locked", False):
-                    return
-                total = len(toggles.labels)
-                active_count = len(toggles.active)
-
-                lock["locked"] = True
-                if active_count == total and total > 0:
-                    mc.active = [0]
-                else:
-                    mc.active = []
-                lock["locked"] = False
-            return callback
-
-        toggles.on_change("active", make_variable_callback(mc, toggles, lock))
-
+    ## Apply button function
     def apply_clicked():
         try:
             sample = widgets['sample_select'].value
@@ -706,7 +466,241 @@ def modify_doc_factory(db_path):
             print(f"[start_bokeh_server] Exception: {tb}", flush=True)
             main_placeholder.children = [Div(text=f"<pre>Error building plot:\n{tb}</pre>")]
 
+
+
+    ### Creating all DOM elements
+    # Open SQLite database connection to build widgets depending on data
+    conn = sqlite3.connect(db_path)
+    widgets = build_controls(conn)
+
+    # Load the CSS
+    css_path = os.path.join(os.path.dirname(__file__), "..", "..", "static", "bokeh_styles.css")
+    with open(css_path) as f:
+        css_text = f.read()
+    stylesheet = InlineStyleSheet(css=css_text)
+
+    # Create main elements
+    instructions = Div(text="<b>Select elements to plot and click Apply:</b>")
+
+
+    ## Views section
+    views_title = Div(text="<b>View</b>")
+    views = RadioButtonGroup(labels=["One sample", "All samples"], active=0, sizing_mode="stretch_width")
+
+    # Global lock for toggles when enforcing "All samples" view (single-variable mode)
+    global_toggle_lock = {'locked': False}
+    # Attach global variable callbacks to all CheckboxButtonGroups
+    for cbg in widgets['variables_widgets']:
+        cbg.on_change('active', make_global_variable_callback(cbg))
+    views.on_change('active', on_view_change)
+
+
+    ## Build Sample section
+    sample_toggle_btn = Button(label="▼", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[stylesheet])
+    sample_title = Div(text="<b>Samples</b>", align="center")
+    sample_header = row(sample_toggle_btn, sample_title, sizing_mode="stretch_width", align="center")
+
+    filter_samples = CheckboxGroup(labels=["Only show samples present with selected contig"], active=[])
+    filter_samples.on_change('active', lambda attr, old, new: refresh_sample_options())
+
+    sample_children = [filter_samples]
+    sample_content = column(
+        *sample_children,
+        visible=True, sizing_mode="stretch_width"
+    )
+
+    sample_toggle_btn.on_click(make_toggle_callback(sample_toggle_btn, sample_content))
+    widgets['sample_select'].on_change('value', lambda attr, old, new: refresh_contig_options())
+
+
+    ## Build Contig section
+    # Keep original full lists so we can restore when filters are off
+    orig_contigs = list(widgets['contigs'])
+    orig_samples = list(widgets['samples'])
+
+    filter_contigs = CheckboxGroup(labels=["Only show contigs present with selected sample"], active=[])
+    filter_contigs.on_change('active', lambda attr, old, new: refresh_contig_options())
+
+    # Length filter slider (only if multiple contigs)
+    min_len = min(widgets['contig_lengths'].values())
+    max_len = max(widgets['contig_lengths'].values())
+    length_slider = None
+    if len(widgets["contigs"]) > 1:
+        length_slider = RangeSlider(start=min_len, end=max_len, value=(min_len, max_len), step=1, title="Contig length")
+        length_slider.on_change('value', lambda attr, old, new: refresh_contig_options())
+
+    # Create collapsible Filtering section
+    contig_toggle_btn = Button(label="▼", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[stylesheet])
+    contig_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
+    contig_title = Div(text="<b>Contigs</b>", align="center")
+    contig_header = row(contig_toggle_btn, contig_title, sizing_mode="stretch_width", align="center")
+    contig_children = [filter_contigs]
+    if length_slider is not None:
+        contig_children.append(length_slider)
+    
+    # Add "Per variable" filtering subsection
+    per_variable_title = Div(text="Per variable:")
+
+    # Store all variable filter rows for dynamic management (already initialized above)
+    variable_filters_column = column(sizing_mode="stretch_width")
+    
+    # Create initial filter row
+    variable_filter_rows = []
+    initial_row = create_variable_filter_row()
+    variable_filter_rows.append(initial_row)
+    variable_filters_column.children = [initial_row]
+    
+    contig_children.append(per_variable_title)
+    contig_children.append(variable_filters_column)
+    
+    contig_content = column(
+        *contig_children,
+        visible=True, sizing_mode="stretch_width"
+    )
+    contig_toggle_btn.on_click(make_toggle_callback(contig_toggle_btn, contig_content))
+
+    widgets['contig_select'].on_change('value', lambda attr, old, new: refresh_sample_options())
+
+
+    ## Build Variables section
+    variables_title = Div(text="<b>Variables</b>")
+    show_genemap = CheckboxGroup(labels=["Show gene map"], active=[0])
+    
+    # Append variable selectors. For modules that have a module-checkbox widget we
+    # show either the checkbox (One-sample) or the plain module title (All-samples)
+    # We create a container that holds both variants and toggle visibility
+    module_header_with_checkbox = []
+    module_header_with_title = []
+    # Store toggle buttons and content containers for collapsible sections
+    module_toggles = []
+    module_contents = []
+
+    controls_variables = []
+    for i, module_widget in enumerate(widgets['module_widgets']):
+        module_name = widgets['module_names'][i]
+        
+        help_btn = widgets['helps_widgets'][i]
+
+        # Create a small toggle button for collapsible section (just the arrow)
+        # Start with modules folded (collapsed)
+        toggle_btn = Button(label="▶", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[stylesheet])
+        toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
+        module_toggles.append(toggle_btn)
+
+        # Build two header variants: one with the checkbox (shows module name as label)
+        # and one with the plain title (used when checkbox is hidden). Both may include the help button.
+        if module_widget is not None:
+            # Create separate title div for the title-only header
+            module_title_div = Div(text=f"{module_name}", align="center")
+            
+            if help_btn is not None:
+                # Need separate help buttons for each header to avoid "already in doc" error
+                help_btn_cb = HelpButton(tooltip=help_btn.tooltip, width=20, height=20, align="center", stylesheets=[stylesheet])
+                help_btn_title = HelpButton(tooltip=help_btn.tooltip, width=20, height=20, align="center", stylesheets=[stylesheet])
+                hdr_cb = row(toggle_btn, module_widget, help_btn_cb, sizing_mode="stretch_width", align="center")
+                hdr_title = row(toggle_btn, module_title_div, help_btn_title, sizing_mode="stretch_width", align="center")
+            else:
+                hdr_cb = row(toggle_btn, module_widget, sizing_mode="stretch_width", align="center")
+                hdr_title = row(toggle_btn, module_title_div, sizing_mode="stretch_width", align="center")
+
+            # Default: show the checkbox header, hide the plain title header
+            hdr_cb.visible = True
+            hdr_title.visible = False
+            controls_variables.append(hdr_cb)
+            controls_variables.append(hdr_title)
+            
+            module_header_with_checkbox.append(hdr_cb)
+            module_header_with_title.append(hdr_title)
+        else:
+            # No module checkbox exists: show plain title (with help if available)
+            module_title_div = Div(text=f"{module_name}", align="center")
+            if help_btn is not None:
+                hdr = row(toggle_btn, module_title_div, help_btn, sizing_mode="stretch_width", align="center")
+            else:
+                hdr = row(toggle_btn, module_title_div, sizing_mode="stretch_width", align="center")
+            hdr.visible = True
+            controls_variables.append(hdr)
+            
+            module_header_with_checkbox.append(None)
+            module_header_with_title.append(hdr)
+
+        # Add the module's CheckboxButtonGroup for variables (this will be collapsible)
+        # Start with modules folded (collapsed)
+        cbg = widgets['variables_widgets'][i]
+        cbg.visible = False
+        module_contents.append(cbg)
+        controls_variables.append(cbg)
+
+    # Add callbacks for collapsible sections
+    for i, toggle_btn in enumerate(module_toggles):
+        content = module_contents[i]
+        toggle_btn.on_click(make_toggle_callback(toggle_btn, content))
+
+
+    ### Attach callbacks
+    for i, mc in enumerate(widgets['module_widgets']):
+        if mc is None:
+            continue
+
+        toggles = widgets['variables_widgets'][i]
+        lock = {"locked": False}  # per-module lock
+
+        # Module → toggles (CheckboxButtonGroup)
+        def make_module_callback(mc, toggles, lock):
+            def callback(attr, old, new):
+                if lock.get("locked", False):
+                    return
+                lock["locked"] = True
+                module_on = 0 in mc.active
+                if module_on:
+                    toggles.active = list(range(len(toggles.labels)))
+                else:
+                    toggles.active = []
+                lock["locked"] = False
+            return callback
+
+        mc.on_change("active", make_module_callback(mc, toggles, lock))
+
+        # Variable → module (update module checkbox only)
+        def make_variable_callback(mc, toggles, lock):
+            def callback(attr, old, new):
+                if lock.get("locked", False):
+                    return
+                total = len(toggles.labels)
+                active_count = len(toggles.active)
+
+                lock["locked"] = True
+                if active_count == total and total > 0:
+                    mc.active = [0]
+                else:
+                    mc.active = []
+                lock["locked"] = False
+            return callback
+
+        toggles.on_change("active", make_variable_callback(mc, toggles, lock))
+
+
+    ## Create final Apply button
+    apply_button = Button(label="Apply", button_type="primary", align="center")
     apply_button.on_click(lambda: apply_clicked())
+
+
+    ## Put together all DOM elements
+    # Create visual separators (horizontal lines) using background color
+    separator_samples = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
+    separator_contigs = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
+    separator_variables = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
+
+    controls_children = [instructions, views_title, views, separator_samples, sample_header, sample_content, widgets['sample_select'], separator_contigs, contig_header, contig_content, widgets['contig_select'], separator_variables, variables_title, show_genemap] + controls_variables + [apply_button]
+
+    controls_column = column(*controls_children, width=350, sizing_mode="stretch_height", spacing=0)
+    controls_column.css_classes = ["left-col"]
+
+    main_placeholder = column(Div(text="<i>No plot yet. Select options and click Apply.</i>"), sizing_mode="stretch_both")
+
+    # Wrap everything in a Flex container
+    layout = row(controls_column, main_placeholder, sizing_mode="stretch_both", spacing = 0)
+    layout.stylesheets = [stylesheet]
 
     def modify_doc(doc):
         doc.add_root(layout)
