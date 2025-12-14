@@ -157,6 +157,8 @@ pub struct VariableConfig {
     pub size: f64,
     /// Human-readable title for legends
     pub title: &'static str,
+    /// Optional help text for tooltips
+    pub help: Option<&'static str>,
 }
 
 /// All variable configurations - single source of truth for the entire application.
@@ -177,25 +179,25 @@ pub struct VariableConfig {
 /// we're borrowing it (not owning it). Think of it like a Python list view.
 pub const VARIABLES: &[VariableConfig] = &[
     // Coverage module - basic read depth
-    VariableConfig { name: "primary_reads", subplot: "Primary alignments", module: "Coverage", plot_type: PlotType::Curve, color: "#333333", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Primary reads" },
-    VariableConfig { name: "secondary_reads", subplot: "Other alignments", module: "Coverage", plot_type: PlotType::Curve, color: "#1f77b4", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Secondary reads" },
-    VariableConfig { name: "supplementary_reads", subplot: "Other alignments", module: "Coverage", plot_type: PlotType::Curve, color: "#B45C1F", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Supplementary reads" },
+    VariableConfig { name: "primary_reads", subplot: "Primary alignments", module: "Coverage", plot_type: PlotType::Curve, color: "#333333", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Primary reads", help: None },
+    VariableConfig { name: "secondary_reads", subplot: "Other alignments", module: "Coverage", plot_type: PlotType::Curve, color: "#1f77b4", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Secondary reads", help: None },
+    VariableConfig { name: "supplementary_reads", subplot: "Other alignments", module: "Coverage", plot_type: PlotType::Curve, color: "#B45C1F", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Supplementary reads", help: None },
 
     // Phage termini module - for detecting phage DNA packaging sites
-    VariableConfig { name: "coverage_reduced", subplot: "Coverage reduced", module: "Phage termini", plot_type: PlotType::Curve, color: "#00c53b", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Coverage reduced" },
-    VariableConfig { name: "reads_starts", subplot: "Reads termini", module: "Phage termini", plot_type: PlotType::Bars, color: "#215732", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Read Starts" },
-    VariableConfig { name: "reads_ends", subplot: "Reads termini", module: "Phage termini", plot_type: PlotType::Bars, color: "#572146", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Read Ends" },
-    VariableConfig { name: "tau", subplot: "Tau", module: "Phage termini", plot_type: PlotType::Bars, color: "#44883e", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Tau" },
+    VariableConfig { name: "coverage_reduced", subplot: "Coverage reduced", module: "Phage termini", plot_type: PlotType::Curve, color: "#00c53b", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Coverage reduced", help: Some("Retains primary mappings starting with an exact match (and ending with an exact match for long reads)") },
+    VariableConfig { name: "reads_starts", subplot: "Reads termini", module: "Phage termini", plot_type: PlotType::Bars, color: "#215732", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Read Starts", help: None },
+    VariableConfig { name: "reads_ends", subplot: "Reads termini", module: "Phage termini", plot_type: PlotType::Bars, color: "#572146", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Read Ends", help: None },
+    VariableConfig { name: "tau", subplot: "Tau", module: "Phage termini", plot_type: PlotType::Bars, color: "#44883e", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Tau", help: None },
 
     // Assembly check module - for detecting assembly errors
-    VariableConfig { name: "read_lengths", subplot: "Read lengths", module: "Assembly check", plot_type: PlotType::Curve, color: "#ed8b00", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Read Lengths" },
-    VariableConfig { name: "insert_sizes", subplot: "Insert sizes", module: "Assembly check", plot_type: PlotType::Curve, color: "#ed8b00", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Insert Sizes" },
-    VariableConfig { name: "bad_orientations", subplot: "Bad orientations", module: "Assembly check", plot_type: PlotType::Bars, color: "#c94009", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Bad Orientations" },
-    VariableConfig { name: "left_clippings", subplot: "Clippings", module: "Assembly check", plot_type: PlotType::Bars, color: "#8e43e7", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Left Clippings" },
-    VariableConfig { name: "right_clippings", subplot: "Clippings", module: "Assembly check", plot_type: PlotType::Bars, color: "#9CE743", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Right Clippings" },
-    VariableConfig { name: "insertions", subplot: "Indels", module: "Assembly check", plot_type: PlotType::Bars, color: "#e50001", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Insertions" },
-    VariableConfig { name: "deletions", subplot: "Indels", module: "Assembly check", plot_type: PlotType::Bars, color: "#00E5E4", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Deletions" },
-    VariableConfig { name: "mismatches", subplot: "Mismatches", module: "Assembly check", plot_type: PlotType::Bars, color: "#5a0f0b", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Mismatches" },
+    VariableConfig { name: "read_lengths", subplot: "Read lengths", module: "Assembly check", plot_type: PlotType::Curve, color: "#ed8b00", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Read Lengths", help: None },
+    VariableConfig { name: "insert_sizes", subplot: "Insert sizes", module: "Assembly check", plot_type: PlotType::Curve, color: "#ed8b00", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Insert Sizes", help: None },
+    VariableConfig { name: "bad_orientations", subplot: "Bad orientations", module: "Assembly check", plot_type: PlotType::Bars, color: "#c94009", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Bad Orientations", help: None },
+    VariableConfig { name: "left_clippings", subplot: "Clippings", module: "Assembly check", plot_type: PlotType::Bars, color: "#8e43e7", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Left Clippings", help: None },
+    VariableConfig { name: "right_clippings", subplot: "Clippings", module: "Assembly check", plot_type: PlotType::Bars, color: "#9CE743", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Right Clippings", help: None },
+    VariableConfig { name: "insertions", subplot: "Indels", module: "Assembly check", plot_type: PlotType::Bars, color: "#e50001", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Insertions", help: None },
+    VariableConfig { name: "deletions", subplot: "Indels", module: "Assembly check", plot_type: PlotType::Bars, color: "#00E5E4", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Deletions", help: None },
+    VariableConfig { name: "mismatches", subplot: "Mismatches", module: "Assembly check", plot_type: PlotType::Bars, color: "#5a0f0b", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Mismatches", help: None },
 ];
 
 // ============================================================================

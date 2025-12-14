@@ -222,7 +222,7 @@ fn create_variable_tables(conn: &Connection, create_indexes: bool) -> Result<()>
                 v.fill_alpha,
                 v.size,
                 v.title,
-                "",
+                v.help,
                 &table_name
             ],
         )

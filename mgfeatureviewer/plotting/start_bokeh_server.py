@@ -4,8 +4,8 @@ import sqlite3
 import traceback
 
 from bokeh.layouts import column, row
-from bokeh.models import Div, InlineStyleSheet, Tooltip, CustomJS
-from bokeh.models.widgets import AutocompleteInput, CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup, Toggle, RangeSlider, Select, TextInput
+from bokeh.models import Div, InlineStyleSheet, Tooltip
+from bokeh.models.widgets import AutocompleteInput, CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup, RangeSlider, Select, TextInput
 from bokeh.models.plots import GridPlot
 
 # Import the plotting function from the repo
@@ -83,10 +83,9 @@ def build_controls(conn):
         combined_help = "\n".join([f"{lbl}: {ht}" for lbl, ht in zip(variables_checkbox, helps_checkbox) if ht and ht.strip() != ""])
         if combined_help:
             tooltip = Tooltip(content=combined_help, position="right")
-            help_button = HelpButton(tooltip=tooltip, width=30, height=30, align="center")
         else:
-            help_button = None
-        helps_widgets.append(help_button)
+            tooltip = None
+        helps_widgets.append(tooltip)
 
         # use a CheckboxButtonGroup for selecting individual variables in this module
         cbg = CheckboxButtonGroup(labels=variables_checkbox, active=[], sizing_mode="stretch_width", orientation="vertical")
@@ -303,7 +302,7 @@ def modify_doc_factory(db_path):
         # contig_header always visible
         # contig_content always visible
         filter_contigs.visible = not is_all
-        per_variable_title.visible = not is_all
+        per_variable_header.visible = not is_all
         variable_filters_column.visible = not is_all
         
         if is_all:
@@ -480,12 +479,8 @@ def modify_doc_factory(db_path):
     stylesheet = InlineStyleSheet(css=css_text)
 
     # Create main elements
-    instructions = Div(text="<b>Select elements to plot and click Apply:</b>")
-
-
     ## Views section
-    views_title = Div(text="<b>View</b>")
-    views = RadioButtonGroup(labels=["One sample", "All samples"], active=0, sizing_mode="stretch_width")
+    views = RadioButtonGroup(labels=["One sample", "All samples"], active=0, sizing_mode="stretch_width", button_type="primary")
 
     # Global lock for toggles when enforcing "All samples" view (single-variable mode)
     global_toggle_lock = {'locked': False}
@@ -539,7 +534,11 @@ def modify_doc_factory(db_path):
         contig_children.append(length_slider)
     
     # Add "Per variable" filtering subsection
+    combined_help = "Only suggest contigs where more (>) or less (<) than a specified number of points exist for the variable in the selected sample"
+    tooltip = Tooltip(content=combined_help, position="right")
+    help_per_variable = HelpButton(tooltip=tooltip, width=20, height=20, align="center", button_type="light", stylesheets=[stylesheet])
     per_variable_title = Div(text="Per variable:")
+    per_variable_header = row(per_variable_title, help_per_variable, sizing_mode="stretch_width")
 
     # Store all variable filter rows for dynamic management (already initialized above)
     variable_filters_column = column(sizing_mode="stretch_width")
@@ -550,7 +549,7 @@ def modify_doc_factory(db_path):
     variable_filter_rows.append(initial_row)
     variable_filters_column.children = [initial_row]
     
-    contig_children.append(per_variable_title)
+    contig_children.append(per_variable_header)
     contig_children.append(variable_filters_column)
     
     contig_content = column(
@@ -579,7 +578,7 @@ def modify_doc_factory(db_path):
     for i, module_widget in enumerate(widgets['module_widgets']):
         module_name = widgets['module_names'][i]
         
-        help_btn = widgets['helps_widgets'][i]
+        help_tooltip = widgets['helps_widgets'][i]
 
         # Create a small toggle button for collapsible section (just the arrow)
         # Start with modules folded (collapsed)
@@ -593,10 +592,10 @@ def modify_doc_factory(db_path):
             # Create separate title div for the title-only header
             module_title_div = Div(text=f"{module_name}", align="center")
             
-            if help_btn is not None:
+            if help_tooltip is not None:
                 # Need separate help buttons for each header to avoid "already in doc" error
-                help_btn_cb = HelpButton(tooltip=help_btn.tooltip, width=20, height=20, align="center", stylesheets=[stylesheet])
-                help_btn_title = HelpButton(tooltip=help_btn.tooltip, width=20, height=20, align="center", stylesheets=[stylesheet])
+                help_btn_cb = HelpButton(tooltip=help_tooltip, width=20, height=20, align="center", button_type="light", stylesheets=[stylesheet])
+                help_btn_title = HelpButton(tooltip=help_tooltip, width=20, height=20, align="center", button_type="light", stylesheets=[stylesheet])
                 hdr_cb = row(toggle_btn, module_widget, help_btn_cb, sizing_mode="stretch_width", align="center")
                 hdr_title = row(toggle_btn, module_title_div, help_btn_title, sizing_mode="stretch_width", align="center")
             else:
@@ -691,7 +690,7 @@ def modify_doc_factory(db_path):
     separator_contigs = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
     separator_variables = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
 
-    controls_children = [instructions, views_title, views, separator_samples, sample_header, sample_content, widgets['sample_select'], separator_contigs, contig_header, contig_content, widgets['contig_select'], separator_variables, variables_title, show_genemap] + controls_variables + [apply_button]
+    controls_children = [views, separator_samples, sample_header, sample_content, widgets['sample_select'], separator_contigs, contig_header, contig_content, widgets['contig_select'], separator_variables, variables_title, show_genemap] + controls_variables + [apply_button]
 
     controls_column = column(*controls_children, width=350, sizing_mode="stretch_height", spacing=0)
     controls_column.css_classes = ["left-col"]
