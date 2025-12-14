@@ -73,16 +73,14 @@ def build_controls(conn):
     modules = [r[0] for r in cur.fetchall()]
 
     # For each module get variables
+    module_names = []
     module_widgets = []
     variables_widgets = []
     helps_widgets = []
-    module_names = []
     for module in modules:
         module_names.append(module)
         cur.execute("SELECT DISTINCT Subplot, Help FROM Variable WHERE Module=?", (module,))
-        records = cur.fetchall()
-        variables_checkbox = [r[0] for r in records]
-        helps_checkbox = [r[1] for r in records]
+        variables_checkbox = [r[0] for r in cur.fetchall()]
 
         if len(variables_checkbox) > 1:
             module_checkbox = CheckboxGroup(labels=[module], active=[])
@@ -90,17 +88,24 @@ def build_controls(conn):
         else:
             module_widgets.append(None)
 
+        # use a CheckboxButtonGroup for selecting individual variables in this module
+        cbg = CheckboxButtonGroup(labels=variables_checkbox, active=[], sizing_mode="stretch_width", orientation="vertical")
+        variables_widgets.append(cbg)
+
         # Consolidate help texts for the module into a single HelpButton attached to module title
-        combined_help = "\n".join([f"{lbl}: {ht}" for lbl, ht in zip(variables_checkbox, helps_checkbox) if ht and ht.strip() != ""])
+        combined_help = ""
+        cur.execute("SELECT DISTINCT Subplot, Title, Help FROM Variable WHERE Module=?", (module,))
+        records = cur.fetchall()
+        for subplot, title, help_text in records:
+            if help_text is None or not help_text.strip():
+                continue  # Skip empty or None help texts
+            combined_help += f"{title} ({subplot} subplot): {help_text}\n"
+
         if combined_help:
             tooltip = Tooltip(content=combined_help, position="right")
         else:
             tooltip = None
         helps_widgets.append(tooltip)
-
-        # use a CheckboxButtonGroup for selecting individual variables in this module
-        cbg = CheckboxButtonGroup(labels=variables_checkbox, active=[], sizing_mode="stretch_width", orientation="vertical")
-        variables_widgets.append(cbg)
 
     widgets = {
         'sample_select': sample_select,
