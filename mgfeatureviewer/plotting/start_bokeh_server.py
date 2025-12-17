@@ -535,7 +535,6 @@ def modify_doc_factory(db_path):
         
         filter_row = row(type_select, var_input, comparison_select, threshold_input, \
                          plus_btn, minus_btn, sizing_mode="stretch_width")
-        filter_row.stylesheets = [stylesheet]
         
         # Adjust margins for better spacing
         # (top, right, bottom, left)
