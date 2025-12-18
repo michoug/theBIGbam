@@ -660,6 +660,24 @@ pub fn finalize_db(db_path: &Path) -> Result<()> {
     )
     .context("Failed to create primary_reads VIEW")?;
 
+    // Create a view joining Contig, Sample, and Presences for explicit metadata
+    conn.execute(
+        "CREATE VIEW IF NOT EXISTS Explicit_presences AS
+         SELECT
+             p.Presence_id,
+             c.Contig_name,
+             s.Sample_name,
+             p.Coverage_percentage,
+             p.Phage_packaging_mechanism,
+             p.Phage_left_terminus,
+             p.Phage_right_terminus
+         FROM Presences p
+         JOIN Contig c ON p.Contig_id = c.Contig_id
+         JOIN Sample s ON p.Sample_id = s.Sample_id",
+        [],
+    )
+    .context("Failed to create Explicit_presences VIEW")?;
+
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .context("Failed to checkpoint WAL")?;
 

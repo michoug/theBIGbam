@@ -123,14 +123,14 @@ fn filter_peaks_by_spc_and_clippings(
     let left_clips: Vec<u32> = left_clip_pos.iter().flatten().copied().collect();
     let right_clips: Vec<u32> = right_clip_pos.iter().flatten().copied().collect();
 
-    // filter reads_starts using right clipping
+    // filter reads_starts using left clipping only
     let filtered_starts: Vec<Run> = reads_starts
         .iter()
         .filter(|run| {
             run.value as f64 >= min_spc &&
             !has_nearby_clip(
                 run.start_pos,
-                &right_clips,
+                &left_clips,
                 min_distance,
                 genome_length,
                 circular,
@@ -139,14 +139,14 @@ fn filter_peaks_by_spc_and_clippings(
         .cloned()
         .collect();
 
-    // filter reads_ends using left clipping
+    // filter reads_ends using right clipping only
     let filtered_ends: Vec<Run> = reads_ends
         .iter()
         .filter(|run| {
             run.value as f64 >= min_spc &&
             !has_nearby_clip(
                 run.start_pos,
-                &left_clips,
+                &right_clips,
                 min_distance,
                 genome_length,
                 circular,
