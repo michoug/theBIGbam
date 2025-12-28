@@ -24,7 +24,7 @@ use crate::bam_reader::process_contig_streaming;
 use crate::compress::{
     compress_signal_with_reference, Run,
 };
-use crate::db::{DbWriter, CompletenessData};
+use crate::db::{DbWriter, CompletenessData, DuplicationData};
 use crate::features::{FeatureArrays, ModuleFlags};
 use crate::genbank::parse_genbank;
 use crate::types::{
@@ -83,6 +83,93 @@ fn circular_distance(pos1: i32, pos2: i32, genome_length: usize) -> i32 {
     dist_forward.min(dist_backward)
 }
 
+/// DTR region info for distance calculations.
+/// first_start/first_end: positions of the first (kept) duplicated region
+/// second_start/second_end: positions of the second (zeroed) duplicated region
+#[derive(Clone, Debug)]
+struct DtrRegion {
+    first_start: i32,
+    first_end: i32,
+    second_start: i32,
+    second_end: i32,
+}
+
+/// Calculate minimum distance between two positions, considering DTR equivalence.
+///
+/// If a position is near the second DTR region, it's treated as being near
+/// the equivalent position in the first DTR region.
+fn dtr_aware_distance(
+    pos1: i32,
+    pos2: i32,
+    genome_length: usize,
+    circular: bool,
+    dtr_regions: &[DtrRegion],
+    max_distance: i32,
+) -> i32 {
+    // Start with regular distance
+    let regular_dist = if circular {
+        circular_distance(pos1, pos2, genome_length)
+    } else {
+        (pos1 - pos2).abs()
+    };
+
+    // If no DTR regions or already close enough, return regular distance
+    if dtr_regions.is_empty() || regular_dist <= max_distance {
+        return regular_dist;
+    }
+
+    // Check if either position is near a second DTR region
+    // If so, calculate distance using the equivalent first region position
+    let mut min_dist = regular_dist;
+
+    for dtr in dtr_regions {
+        // Check if pos1 is near second region - calculate virtual position
+        let pos1_virtual = get_virtual_position(pos1, dtr, max_distance);
+        // Check if pos2 is near second region - calculate virtual position
+        let pos2_virtual = get_virtual_position(pos2, dtr, max_distance);
+
+        // Calculate distance using virtual positions
+        let virtual_dist = if circular {
+            circular_distance(pos1_virtual, pos2_virtual, genome_length)
+        } else {
+            (pos1_virtual - pos2_virtual).abs()
+        };
+
+        min_dist = min_dist.min(virtual_dist);
+    }
+
+    min_dist
+}
+
+/// Get the virtual position for a point near a DTR region.
+/// If the position is near the second DTR region, return the equivalent
+/// position near the first DTR region. Otherwise, return the original position.
+fn get_virtual_position(pos: i32, dtr: &DtrRegion, max_distance: i32) -> i32 {
+    // Distance from pos to the start of second region
+    let dist_to_second_start = (pos - dtr.second_start).abs();
+    // Distance from pos to the end of second region
+    let dist_to_second_end = (pos - dtr.second_end).abs();
+
+    if dist_to_second_start <= max_distance {
+        // Position is near second region's start
+        // Map to equivalent position near first region's start
+        let offset = pos - dtr.second_start;
+        dtr.first_start + offset
+    } else if dist_to_second_end <= max_distance {
+        // Position is near second region's end
+        // Map to equivalent position near first region's end
+        let offset = pos - dtr.second_end;
+        dtr.first_end + offset
+    } else if pos >= dtr.second_start && pos <= dtr.second_end {
+        // Position is inside second region
+        let offset = pos - dtr.second_start;
+        dtr.first_start + offset
+    } else {
+        // Position is not near second region, keep as is
+        pos
+    }
+}
+
 /// Filters out peaks that have clipping events within max_distance.
 fn has_nearby_clip(
     peak_pos: i32,
@@ -90,15 +177,19 @@ fn has_nearby_clip(
     min_distance: i32,
     genome_length: usize,
     circular: bool,
+    dtr_regions: &[DtrRegion],
 ) -> bool {
     for &clip in clip_positions {
         let clip_pos = clip as i32;
 
-        let dist = if circular {
-            circular_distance(peak_pos, clip_pos, genome_length)
-        } else {
-            (peak_pos - clip_pos).abs()
-        };
+        let dist = dtr_aware_distance(
+            peak_pos,
+            clip_pos,
+            genome_length,
+            circular,
+            dtr_regions,
+            min_distance,
+        );
 
         if dist <= min_distance {
             return true;
@@ -116,6 +207,7 @@ fn filter_peaks_by_spc_and_clippings(
     circular: bool,
     left_clip_pos: &Option<Vec<u32>>,
     right_clip_pos: &Option<Vec<u32>>,
+    dtr_regions: &[DtrRegion],
 ) -> (Vec<Run>, Vec<Run>) {
     // flatten clip positions once (cheaper & simpler)
     let left_clips: Vec<u32> = left_clip_pos.iter().flatten().copied().collect();
@@ -132,6 +224,7 @@ fn filter_peaks_by_spc_and_clippings(
                 min_distance,
                 genome_length,
                 circular,
+                dtr_regions,
             )
         })
         .cloned()
@@ -148,6 +241,7 @@ fn filter_peaks_by_spc_and_clippings(
                 min_distance,
                 genome_length,
                 circular,
+                dtr_regions,
             )
         })
         .cloned()
@@ -157,11 +251,13 @@ fn filter_peaks_by_spc_and_clippings(
 }
 
 /// Merge nearby peaks within max_distance, keeping the highest value peak.
+/// Considers DTR-equivalent positions when calculating distances.
 fn merge_peaks(
     runs: &[Run],
     max_distance: i32,
     genome_length: usize,
     circular: bool,
+    dtr_regions: &[DtrRegion],
 ) -> Vec<Peak> {
     if runs.is_empty() {
         return Vec::new();
@@ -183,11 +279,14 @@ fn merge_peaks(
     let mut current = peaks[0].clone();
 
     for peak in peaks.into_iter().skip(1) {
-        let dist = if circular {
-            circular_distance(current.position, peak.position, genome_length)
-        } else {
-            peak.position - current.position
-        };
+        let dist = dtr_aware_distance(
+            current.position,
+            peak.position,
+            genome_length,
+            circular,
+            dtr_regions,
+            max_distance,
+        );
 
         if dist <= max_distance {
             // keep strongest
@@ -201,12 +300,19 @@ fn merge_peaks(
     }
     merged.push(current);
 
-    // Circular wrap-around merge (first & last)
+    // Circular wrap-around merge (first & last) - also DTR-aware
     if circular && merged.len() > 1 {
         let first = &merged[0];
         let last = &merged[merged.len() - 1];
 
-        let wrap_dist = circular_distance(last.position, first.position, genome_length);
+        let wrap_dist = dtr_aware_distance(
+            last.position,
+            first.position,
+            genome_length,
+            circular,
+            dtr_regions,
+            max_distance,
+        );
 
         if wrap_dist <= max_distance {
             let keeper = if first.value >= last.value {
@@ -223,40 +329,80 @@ fn merge_peaks(
     merged
 }
 
+/// Expand a terminus position to include equivalent DTR positions.
+/// If the position is within a DTR region, adds the corresponding position from the other region.
+fn expand_terminus_with_dtr(pos: i32, dtr_regions: &[DtrRegion]) -> Vec<i32> {
+    let mut positions = vec![pos];
+
+    for dtr in dtr_regions {
+        // Check if pos is in first region
+        if pos >= dtr.first_start && pos <= dtr.first_end {
+            let offset = pos - dtr.first_start;
+            let equivalent = dtr.second_start + offset;
+            if !positions.contains(&equivalent) {
+                positions.push(equivalent);
+            }
+        }
+        // Check if pos is in second region
+        else if pos >= dtr.second_start && pos <= dtr.second_end {
+            let offset = pos - dtr.second_start;
+            let equivalent = dtr.first_start + offset;
+            if !positions.contains(&equivalent) {
+                positions.push(equivalent);
+            }
+        }
+    }
+
+    positions.sort();
+    positions
+}
+
 /// Classify phage packaging mechanism based on peak configuration.
+/// Returns mechanism name and lists of left/right terminus positions.
 fn classify_packaging(
     start_peaks: &[Peak],
     end_peaks: &[Peak],
     genome_length: usize,
     circular: bool,
-) -> (String, Option<i32>, Option<i32>) {
+    dtr_regions: &[DtrRegion],
+) -> (String, Vec<i32>, Vec<i32>) {
+    // print start and end peaks for debugging
+    for p in start_peaks {
+        println!("Start peak at position {} with value {}", p.position, p.value);
+    }
+    for p in end_peaks {
+        println!("End peak at position {} with value {}", p.position, p.value);
+    }
+
     match (start_peaks.len(), end_peaks.len()) {
-        (0, 0) => ("No_packaging".to_string(), None, None),
-        
+        (0, 0) => ("No_packaging".to_string(), vec![], vec![]),
+
         (1, 0) => {
             // Only start peak - PAC
-            ("PAC".to_string(), Some(start_peaks[0].position), None)
+            let left = expand_terminus_with_dtr(start_peaks[0].position, dtr_regions);
+            ("PAC".to_string(), left, vec![])
         }
-        
+
         (0, 1) => {
             // Only end peak - PAC
-            ("PAC".to_string(), None, Some(end_peaks[0].position))
+            let right = expand_terminus_with_dtr(end_peaks[0].position, dtr_regions);
+            ("PAC".to_string(), vec![], right)
         }
-        
+
         (1, 1) => {
             // Two peaks - classify based on distance and order
             let start_pos = start_peaks[0].position;
             let end_pos = end_peaks[0].position;
-            
+
             // Calculate actual genomic distance (shortest path in circular)
             let distance = if circular {
                 circular_distance(start_pos, end_pos, genome_length)
             } else {
                 (start_pos - end_pos).abs()
             };
-            
+
             let genome_10pct = (genome_length as f64 * 0.1) as i32;
-            
+
             // Determine order: which comes first going forward (clockwise in circular)
             // For linear: simply check positions
             // For circular: check which direction is shorter to go from start to end
@@ -274,46 +420,63 @@ fn classify_packaging(
             } else {
                 end_pos < start_pos
             };
-            
-            let (mechanism, left, right) = if distance < 2 {
+
+            let (mechanism, left_pos, right_pos) = if distance < 2 {
                 // Very close - cohesive ends
-                ("COS".to_string(), Some(start_pos.min(end_pos)), Some(start_pos.max(end_pos)))
+                ("COS".to_string(), start_pos.min(end_pos), start_pos.max(end_pos))
             } else if distance <= 20 {
                 // Close cohesive ends with directionality
                 if end_before_start {
-                    ("COS_3'".to_string(), Some(end_pos), Some(start_pos))
+                    ("COS_3'".to_string(), end_pos, start_pos)
                 } else {
-                    ("COS_5'".to_string(), Some(start_pos), Some(end_pos))
+                    ("COS_5'".to_string(), start_pos, end_pos)
                 }
             } else if distance <= 1000 {
                 // Short direct terminal repeats
                 if end_before_start {
-                    ("DTR_short_3'".to_string(), Some(end_pos), Some(start_pos))
+                    ("DTR_short_3'".to_string(), end_pos, start_pos)
                 } else {
-                    ("DTR_short_5'".to_string(), Some(start_pos), Some(end_pos))
+                    ("DTR_short_5'".to_string(), start_pos, end_pos)
                 }
             } else if distance <= genome_10pct {
                 // Long direct terminal repeats
                 if end_before_start {
-                    ("DTR_long_3'".to_string(), Some(end_pos), Some(start_pos))
+                    ("DTR_long_3'".to_string(), end_pos, start_pos)
                 } else {
-                    ("DTR_long_5'".to_string(), Some(start_pos), Some(end_pos))
+                    ("DTR_long_5'".to_string(), start_pos, end_pos)
                 }
             } else {
                 // Very distant - outlier
                 if end_before_start {
-                    ("DTR_outlier_3'".to_string(), Some(end_pos), Some(start_pos))
+                    ("DTR_outlier_3'".to_string(), end_pos, start_pos)
                 } else {
-                    ("DTR_outlier_5'".to_string(), Some(start_pos), Some(end_pos))
+                    ("DTR_outlier_5'".to_string(), start_pos, end_pos)
                 }
             };
-            
+
+            let left = expand_terminus_with_dtr(left_pos, dtr_regions);
+            let right = expand_terminus_with_dtr(right_pos, dtr_regions);
             (mechanism, left, right)
         }
-        
+
         _ => {
-            // Multiple peaks or other configurations
-            ("Unknown_packaging".to_string(), None, None)
+            // Multiple peaks or other configurations - collect all peak positions
+            let mut left_termini: Vec<i32> = start_peaks
+                .iter()
+                .flat_map(|p| expand_terminus_with_dtr(p.position, dtr_regions))
+                .collect();
+            let mut right_termini: Vec<i32> = end_peaks
+                .iter()
+                .flat_map(|p| expand_terminus_with_dtr(p.position, dtr_regions))
+                .collect();
+
+            // Remove duplicates and sort
+            left_termini.sort();
+            left_termini.dedup();
+            right_termini.sort();
+            right_termini.dedup();
+
+            ("Unknown_packaging".to_string(), left_termini, right_termini)
         }
     }
 }
@@ -673,18 +836,187 @@ fn add_compressed_feature_with_stats(
     runs
 }
 
+/// Apply terminal repeat merging for phagetermini analysis.
+///
+/// For duplications with ≥90% identity:
+/// - DTR (Direct Terminal Repeats): merge signals directly (position i → position i)
+/// - ITR (Inverted Terminal Repeats): merge signals reversed (position i → position len-1-i)
+///   and swap reads_starts ↔ reads_ends
+///
+/// Signals from second region are merged into first region, then second region is zeroed.
+/// This ensures termini detection isn't confused by duplicated regions.
+fn apply_dtr_merging(
+    arrays: &mut FeatureArrays,
+    contig_name: &str,
+    duplications: &[DuplicationData],
+) {
+    // Filter duplications for this contig with ≥90% identity
+    let mut relevant_dups: Vec<&DuplicationData> = duplications
+        .iter()
+        .filter(|d| d.contig_name == contig_name && d.pident >= 90.0)
+        .collect();
+
+    if relevant_dups.is_empty() {
+        return;
+    }
+
+    // Sort by first region's start position (process in reference order)
+    relevant_dups.sort_by_key(|d| d.position1.min(d.position2));
+
+    // Process each duplication pair
+    for dup in relevant_dups {
+        // Determine if this is a direct or inverted repeat
+        let is_direct = (dup.position1 < dup.position2 && dup.position1prime < dup.position2prime)
+            || (dup.position1 > dup.position2 && dup.position1prime > dup.position2prime);
+
+        // Determine first and second regions (first = lower start position in reference)
+        let (first_start, first_end, second_start, second_end) = if dup.position1 < dup.position1prime {
+            (
+                (dup.position1.min(dup.position2) - 1) as usize,
+                (dup.position1.max(dup.position2) - 1) as usize,
+                (dup.position1prime.min(dup.position2prime) - 1) as usize,
+                (dup.position1prime.max(dup.position2prime) - 1) as usize,
+            )
+        } else {
+            (
+                (dup.position1prime.min(dup.position2prime) - 1) as usize,
+                (dup.position1prime.max(dup.position2prime) - 1) as usize,
+                (dup.position1.min(dup.position2) - 1) as usize,
+                (dup.position1.max(dup.position2) - 1) as usize,
+            )
+        };
+
+        let region_len = first_end.saturating_sub(first_start) + 1;
+        let second_region_len = second_end.saturating_sub(second_start) + 1;
+
+        // Skip if regions are different lengths or out of bounds
+        if region_len != second_region_len || second_end >= arrays.coverage_reduced.len() {
+            continue;
+        }
+
+        if is_direct {
+            // DTR: direct mapping (position i → position i)
+            for i in 0..region_len {
+                let first_idx = first_start + i;
+                let second_idx = second_start + i;
+
+                // Merge coverage_reduced
+                if first_idx < arrays.coverage_reduced.len() && second_idx < arrays.coverage_reduced.len() {
+                    arrays.coverage_reduced[first_idx] += arrays.coverage_reduced[second_idx];
+                    arrays.coverage_reduced[second_idx] = 0;
+                }
+
+                // Merge reads_starts
+                if first_idx < arrays.reads_starts.len() && second_idx < arrays.reads_starts.len() {
+                    arrays.reads_starts[first_idx] += arrays.reads_starts[second_idx];
+                    arrays.reads_starts[second_idx] = 0;
+                }
+
+                // Merge reads_ends
+                if first_idx < arrays.reads_ends.len() && second_idx < arrays.reads_ends.len() {
+                    arrays.reads_ends[first_idx] += arrays.reads_ends[second_idx];
+                    arrays.reads_ends[second_idx] = 0;
+                }
+
+                // Left clippings: keep only if present at both
+                if first_idx < arrays.left_clipping_lengths.len() && second_idx < arrays.left_clipping_lengths.len() {
+                    let has_first = !arrays.left_clipping_lengths[first_idx].is_empty();
+                    let has_second = !arrays.left_clipping_lengths[second_idx].is_empty();
+                    if has_first && has_second {
+                        let second_clips: Vec<u32> = arrays.left_clipping_lengths[second_idx].drain(..).collect();
+                        arrays.left_clipping_lengths[first_idx].extend(second_clips);
+                    } else {
+                        arrays.left_clipping_lengths[first_idx].clear();
+                        arrays.left_clipping_lengths[second_idx].clear();
+                    }
+                }
+
+                // Right clippings: keep only if present at both
+                if first_idx < arrays.right_clipping_lengths.len() && second_idx < arrays.right_clipping_lengths.len() {
+                    let has_first = !arrays.right_clipping_lengths[first_idx].is_empty();
+                    let has_second = !arrays.right_clipping_lengths[second_idx].is_empty();
+                    if has_first && has_second {
+                        let second_clips: Vec<u32> = arrays.right_clipping_lengths[second_idx].drain(..).collect();
+                        arrays.right_clipping_lengths[first_idx].extend(second_clips);
+                    } else {
+                        arrays.right_clipping_lengths[first_idx].clear();
+                        arrays.right_clipping_lengths[second_idx].clear();
+                    }
+                }
+            }
+        } else {
+            // ITR: reversed mapping (position i → position len-1-i)
+            // Also swap reads_starts ↔ reads_ends due to strand inversion
+            for i in 0..region_len {
+                let first_idx = first_start + i;
+                let second_idx = second_start + (region_len - 1 - i);
+
+                // Merge coverage_reduced (no swap needed)
+                if first_idx < arrays.coverage_reduced.len() && second_idx < arrays.coverage_reduced.len() {
+                    arrays.coverage_reduced[first_idx] += arrays.coverage_reduced[second_idx];
+                    arrays.coverage_reduced[second_idx] = 0;
+                }
+
+                // Merge reads_starts with reads_ends (swapped due to inversion)
+                if first_idx < arrays.reads_starts.len() && second_idx < arrays.reads_ends.len() {
+                    arrays.reads_starts[first_idx] += arrays.reads_ends[second_idx];
+                    arrays.reads_ends[second_idx] = 0;
+                }
+
+                // Merge reads_ends with reads_starts (swapped due to inversion)
+                if first_idx < arrays.reads_ends.len() && second_idx < arrays.reads_starts.len() {
+                    arrays.reads_ends[first_idx] += arrays.reads_starts[second_idx];
+                    arrays.reads_starts[second_idx] = 0;
+                }
+
+                // Left clippings merge with right clippings (swapped due to inversion)
+                if first_idx < arrays.left_clipping_lengths.len() && second_idx < arrays.right_clipping_lengths.len() {
+                    let has_first = !arrays.left_clipping_lengths[first_idx].is_empty();
+                    let has_second = !arrays.right_clipping_lengths[second_idx].is_empty();
+                    if has_first && has_second {
+                        let second_clips: Vec<u32> = arrays.right_clipping_lengths[second_idx].drain(..).collect();
+                        arrays.left_clipping_lengths[first_idx].extend(second_clips);
+                    } else {
+                        arrays.left_clipping_lengths[first_idx].clear();
+                        arrays.right_clipping_lengths[second_idx].clear();
+                    }
+                }
+
+                // Right clippings merge with left clippings (swapped due to inversion)
+                if first_idx < arrays.right_clipping_lengths.len() && second_idx < arrays.left_clipping_lengths.len() {
+                    let has_first = !arrays.right_clipping_lengths[first_idx].is_empty();
+                    let has_second = !arrays.left_clipping_lengths[second_idx].is_empty();
+                    if has_first && has_second {
+                        let second_clips: Vec<u32> = arrays.left_clipping_lengths[second_idx].drain(..).collect();
+                        arrays.right_clipping_lengths[first_idx].extend(second_clips);
+                    } else {
+                        arrays.right_clipping_lengths[first_idx].clear();
+                        arrays.left_clipping_lengths[second_idx].clear();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Add features from FeatureArrays to output (optimized path).
 /// Returns a tuple of:
 /// - Optional packaging data for phagetermini module
 /// - Optional completeness data for assemblycheck module
 fn add_features_from_arrays(
-    arrays: &FeatureArrays,
+    arrays: &mut FeatureArrays,
     contig_name: &str,
     contig_length: usize,
     config: &ProcessConfig,
     flags: ModuleFlags,
+    duplications: &[DuplicationData],
     output: &mut Vec<FeaturePoint>,
 ) -> (Option<PackagingData>, Option<CompletenessData>) {
+    // Apply DTR merging if phagetermini is enabled and there are duplications
+    if flags.phagetermini && !duplications.is_empty() {
+        apply_dtr_merging(arrays, contig_name, duplications);
+    }
+
     let seq_type = config.sequencing_type;
     // Coverage (always compress self-referentially)
     let primary_reads_f64: Vec<f64> = arrays.primary_reads.iter().map(|&x| x as f64).collect();
@@ -946,6 +1278,30 @@ fn add_features_from_arrays(
         // Classify packaging mechanism
         let pt_config = config.phagetermini_config;
 
+        // Build DTR regions from duplications for this contig (≥90% identity)
+        let dtr_regions: Vec<DtrRegion> = duplications
+            .iter()
+            .filter(|d| d.contig_name == contig_name && d.pident >= 90.0)
+            .map(|d| {
+                // Determine first and second regions (first = lower start position)
+                if d.position1 < d.position1prime {
+                    DtrRegion {
+                        first_start: d.position1.min(d.position2),
+                        first_end: d.position1.max(d.position2),
+                        second_start: d.position1prime.min(d.position2prime),
+                        second_end: d.position1prime.max(d.position2prime),
+                    }
+                } else {
+                    DtrRegion {
+                        first_start: d.position1prime.min(d.position2prime),
+                        first_end: d.position1prime.max(d.position2prime),
+                        second_start: d.position1.min(d.position2),
+                        second_end: d.position1.max(d.position2),
+                    }
+                }
+            })
+            .collect();
+
         // Filter runs by minimum SPC threshold AND no clipping events within max_distance
         let (reads_starts_filtered, reads_ends_filtered) = filter_peaks_by_spc_and_clippings(
             &reads_starts_runs,
@@ -956,26 +1312,31 @@ fn add_features_from_arrays(
             config.circular,
             &left_clip_pos,
             &right_clip_pos,
+            &dtr_regions,
         );
 
         let start_peaks = merge_peaks(
             &reads_starts_filtered,
             pt_config.max_distance_peaks,
             contig_length,
-            config.circular
+            config.circular,
+            &dtr_regions,
         );
         let end_peaks = merge_peaks(
             &reads_ends_filtered,
             pt_config.max_distance_peaks,
             contig_length,
-            config.circular
+            config.circular,
+            &dtr_regions,
         );
 
-        let (mechanism, left_terminus, right_terminus) = classify_packaging(
+        println!("Contig: {}", contig_name);
+        let (mechanism, left_termini, right_termini) = classify_packaging(
             &start_peaks,
             &end_peaks,
             contig_length,
             config.circular,
+            &dtr_regions,
         );
 
         // Only return PackagingData if there's a detected mechanism (not "No_packaging")
@@ -983,8 +1344,8 @@ fn add_features_from_arrays(
             Some(PackagingData {
                 contig_name: contig_name.to_string(),
                 mechanism,
-                left_terminus,
-                right_terminus,
+                left_termini,
+                right_termini,
             })
         } else {
             None
@@ -1028,6 +1389,7 @@ pub fn process_sample(
     contigs: &[ContigInfo],
     modules: &[String],
     config: &ProcessConfig,
+    duplications: &[DuplicationData],
 ) -> Result<(Vec<FeaturePoint>, Vec<PresenceData>, Vec<PackagingData>, Vec<CompletenessData>, String)> {
     let sample_name = bam_path
         .file_stem()
@@ -1066,7 +1428,7 @@ pub fn process_sample(
 
             // Process contig using streaming - single pass over reads
             // Early coverage check happens inside process_contig_streaming
-            let (arrays, coverage_pct) = match process_contig_streaming(&mut bam, &ref_name, ref_length, config.sequencing_type, flags, config.circular, config.min_coverage) {
+            let (mut arrays, coverage_pct) = match process_contig_streaming(&mut bam, &ref_name, ref_length, config.sequencing_type, flags, config.circular, config.min_coverage) {
                 Ok(Some(result)) => result,
                 Ok(None) => return None,
                 Err(e) => {
@@ -1079,7 +1441,7 @@ pub fn process_sample(
 
             // Calculate features for this contig
             let mut features = Vec::new();
-            let (packaging_info, completeness_info) = add_features_from_arrays(&arrays, &ref_name, ref_length, config, flags, &mut features);
+            let (packaging_info, completeness_info) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, flags, duplications, &mut features);
 
             // Calculate Coverage-Weighted Total Variation (CWTV)
             // CWTV = 1/(n-1) * Σ|cov(i+1) - cov(i)| for i=1 to n (circular wrap-around)
@@ -1223,20 +1585,23 @@ pub fn run_all_samples(
     let db_writer = DbWriter::create(output_db, &contigs, &annotations)?;
 
     // Parse and write duplications from autoblast file (if provided)
-    if !autoblast_file.as_os_str().is_empty() && autoblast_file.exists() {
+    let duplications = if !autoblast_file.as_os_str().is_empty() && autoblast_file.exists() {
         eprintln!("\n### Parsing autoblast results...");
-        let duplications = crate::db::parse_autoblast_file(autoblast_file)?;
-        if !duplications.is_empty() {
-            db_writer.write_duplications(&duplications)?;
+        let dups = crate::db::parse_autoblast_file(autoblast_file)?;
+        if !dups.is_empty() {
+            db_writer.write_duplications(&dups)?;
         } else {
             eprintln!("No duplications found in autoblast file");
         }
-    }
+        dups
+    } else {
+        Vec::new()
+    };
 
     eprintln!("\n### Processing {} samples with {} threads", bam_files.len(), config.threads);
     eprintln!("Modules: {}\n", modules.join(", "));
 
-    let result = process_samples_parallel(&bam_files, &contigs, modules, config, db_writer, max_samples_in_memory)?;
+    let result = process_samples_parallel(&bam_files, &contigs, modules, config, db_writer, max_samples_in_memory, &duplications)?;
 
     print_summary(&result, output_db);
 
@@ -1259,6 +1624,7 @@ fn process_samples_parallel(
     config: &ProcessConfig,
     db_writer: DbWriter,
     max_samples_in_memory: usize,
+    duplications: &[DuplicationData],
 ) -> Result<ProcessResult> {
     let total = bam_files.len();
     let is_tty = atty::is(Stream::Stderr);
@@ -1266,7 +1632,7 @@ fn process_samples_parallel(
 
     // Sequential mode for single thread: process one → write one → repeat
     if config.threads == 1 {
-        return process_samples_sequential(bam_files, contigs, modules, config, db_writer, is_tty);
+        return process_samples_sequential(bam_files, contigs, modules, config, db_writer, is_tty, duplications);
     }
 
     // Parallel mode: producer-consumer with bounded channel
@@ -1374,7 +1740,7 @@ fn process_samples_parallel(
     bam_files.par_iter().for_each(|bam_path| {
         let sample_start = std::time::Instant::now();
 
-        match process_sample(bam_path, contigs, modules, config) {
+        match process_sample(bam_path, contigs, modules, config, duplications) {
             Ok((features, presences, packaging, completeness, sample_name)) => {
                 let sample_time = sample_start.elapsed().as_secs_f64();
                 completed_count.fetch_add(1, Ordering::SeqCst);
@@ -1444,6 +1810,7 @@ fn process_samples_sequential(
     config: &ProcessConfig,
     db_writer: DbWriter,
     is_tty: bool,
+    duplications: &[DuplicationData],
 ) -> Result<ProcessResult> {
     let total = bam_files.len();
     let start_time = std::time::Instant::now();
@@ -1471,7 +1838,7 @@ fn process_samples_sequential(
     for bam_path in bam_files {
         let sample_start = std::time::Instant::now();
 
-        match process_sample(bam_path, contigs, modules, config) {
+        match process_sample(bam_path, contigs, modules, config, duplications) {
             Ok((features, presences, packaging, completeness, sample_name)) => {
                 let process_elapsed = sample_start.elapsed();
                 processing_time_total += process_elapsed;

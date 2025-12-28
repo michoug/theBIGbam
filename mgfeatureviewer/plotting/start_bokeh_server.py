@@ -112,11 +112,12 @@ def build_controls(conn):
             # Table might not exist, skip it
             continue
 
-    # Check if Duplications table has data (special table, not in Variable table)
-    has_duplications = False
+    # Check if Duplications table has data
+    # Add Feature_duplications to tables_with_data so duplications variable is included
     try:
         cur.execute("SELECT COUNT(*) FROM Duplications")
-        has_duplications = cur.fetchone()[0] > 0
+        if cur.fetchone()[0] > 0:
+            tables_with_data.add("Feature_duplications")
     except Exception:
         pass
 
@@ -138,16 +139,12 @@ def build_controls(conn):
     for module in modules:
         # Get distinct subplots (deduplicate by subplot name only)
         cur.execute(
-            "SELECT DISTINCT Subplot FROM Variable WHERE Module=? AND Feature_table_name IN ({})".format(
+            "SELECT DISTINCT Subplot FROM Variable WHERE Module=? AND Feature_table_name IN ({}) ORDER BY Module_order".format(
                 ','.join('?' * len(tables_with_data))
             ),
             (module,) + tuple(tables_with_data)
         )
         variables_checkbox = [r[0] for r in cur.fetchall()]
-
-        # Add Duplications to Phage termini module if data exists
-        if module == "Phage termini" and has_duplications:
-            variables_checkbox.append("Duplications")
 
         # Skip this module if no variables with data
         if not variables_checkbox:
@@ -166,7 +163,7 @@ def build_controls(conn):
         # Consolidate help texts for the module into a single HelpButton attached to module title
         combined_help = ""
         cur.execute(
-            "SELECT DISTINCT Subplot, Title, Help FROM Variable WHERE Module=? AND Feature_table_name IN ({})".format(
+            "SELECT DISTINCT Subplot, Title, Help FROM Variable WHERE Module=? AND Feature_table_name IN ({}) ORDER BY Subplot".format(
                 ','.join('?' * len(tables_with_data))
             ),
             (module,) + tuple(tables_with_data)
@@ -784,7 +781,7 @@ def modify_doc_factory(db_path):
             min_characters=0,
             case_sensitive=False,
             restrict=False,
-            max_completions=20,
+            max_completions=10,
             sizing_mode="stretch_width"
         )
         

@@ -155,7 +155,18 @@ impl DbWriter {
 
         for pkg in packaging {
             if let Some(&contig_id) = self.contig_name_to_id.get(&pkg.contig_name) {
-                appender.append_row(params![contig_id, sample_id, &pkg.mechanism, pkg.left_terminus, pkg.right_terminus])?;
+                // Convert Vec<i32> to comma-separated strings (empty string if empty)
+                let left_str = if pkg.left_termini.is_empty() {
+                    String::new()
+                } else {
+                    pkg.left_termini.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
+                };
+                let right_str = if pkg.right_termini.is_empty() {
+                    String::new()
+                } else {
+                    pkg.right_termini.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
+                };
+                appender.append_row(params![contig_id, sample_id, &pkg.mechanism, &left_str, &right_str])?;
             }
         }
 
@@ -372,8 +383,8 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             Contig_id INTEGER,
             Sample_id INTEGER,
             Phage_packaging_mechanism TEXT,
-            Phage_left_terminus INTEGER,
-            Phage_right_terminus INTEGER
+            Phage_left_terminus TEXT,
+            Phage_right_terminus TEXT
         )",
         [],
     )
@@ -438,6 +449,7 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             Variable_name TEXT UNIQUE,
             Subplot TEXT,
             Module TEXT,
+            Module_order INTEGER,
             \"Type\" TEXT,
             Color TEXT,
             Alpha REAL,
@@ -521,13 +533,14 @@ fn create_variable_tables(conn: &Connection) -> Result<()> {
         let table_name = feature_table_name(v.name);
 
         conn.execute(
-            "INSERT INTO Variable (Variable_id, Variable_name, Subplot, Module, \"Type\", Color, Alpha, Fill_alpha, \"Size\", Title, Help, Feature_table_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO Variable (Variable_id, Variable_name, Subplot, Module, Module_order, \"Type\", Color, Alpha, Fill_alpha, \"Size\", Title, Help, Feature_table_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 (i + 1) as i64,
                 v.name,
                 v.subplot,
                 v.module,
+                v.module_order,
                 v.plot_type.as_str(),
                 v.color,
                 v.alpha,
