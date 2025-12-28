@@ -282,6 +282,37 @@ impl DbWriter {
         Ok(())
     }
 
+    /// Write duplication data to the database.
+    /// This is called once during database creation (not per-sample).
+    pub fn write_duplications(&self, duplications: &[DuplicationData]) -> Result<()> {
+        if duplications.is_empty() {
+            return Ok(());
+        }
+
+        let conn = self.conn.lock().unwrap();
+        let mut appender = conn.appender("Duplications")
+            .context("Failed to create Duplications appender")?;
+
+        for dup in duplications {
+            if let Some(&contig_id) = self.contig_name_to_id.get(&dup.contig_name) {
+                // Store pident as INTEGER (×100)
+                let pident_int = (dup.pident * 100.0).round() as i32;
+                appender.append_row(params![
+                    contig_id,
+                    dup.position1,
+                    dup.position2,
+                    dup.position1prime,
+                    dup.position2prime,
+                    pident_int
+                ])?;
+            }
+        }
+
+        appender.flush().context("Failed to flush Duplications appender")?;
+        eprintln!("Wrote {} duplications to database", duplications.len());
+        Ok(())
+    }
+
     /// Finalize the database after all samples are processed.
     pub fn finalize(self) -> Result<()> {
         let conn = self.conn.into_inner().unwrap();
@@ -347,6 +378,22 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
         [],
     )
     .context("Failed to create PhageMechanisms table")?;
+
+    // Duplications table - stores self-BLAST results for duplicated regions
+    // position1prime can be < position2prime if duplicated region is inverted
+    // Pident stored as INTEGER (×100)
+    conn.execute(
+        "CREATE TABLE Duplications (
+            Contig_id INTEGER,
+            Position1 INTEGER,
+            Position2 INTEGER,
+            Position1prime INTEGER,
+            Position2prime INTEGER,
+            Pident INTEGER
+        )",
+        [],
+    )
+    .context("Failed to create Duplications table")?;
 
     // Completeness table - prevalences stored as INTEGER (×100), totals as INTEGER
     conn.execute(
@@ -669,6 +716,23 @@ fn create_views(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Duplication data from self-BLAST results.
+/// Represents a duplicated region within a contig.
+#[derive(Clone, Debug)]
+pub struct DuplicationData {
+    pub contig_name: String,
+    /// Start position of the first copy (query start)
+    pub position1: i32,
+    /// End position of the first copy (query end)
+    pub position2: i32,
+    /// Start position of the second copy (subject start) - can be > position2prime if inverted
+    pub position1prime: i32,
+    /// End position of the second copy (subject end)
+    pub position2prime: i32,
+    /// Percentage identity
+    pub pident: f64,
+}
+
 /// Completeness data for a contig.
 /// Contains assembly completeness statistics computed from clipping events at reference ends.
 /// Individual score components are stored; score_completeness and score_contamination are computed in VIEW.
@@ -701,6 +765,72 @@ impl CompletenessData {
             || self.total_insertions.is_some() || self.total_reads_clipped.is_some()
             || self.total_reference_clipped.is_some()
     }
+}
+
+/// Parse BLAST outfmt 6 file and return duplication data.
+///
+/// BLAST outfmt 6 columns:
+/// 1. qseqid - query sequence id (contig name)
+/// 2. sseqid - subject sequence id (same as query for self-blast)
+/// 3. pident - percentage identity
+/// 4. length - alignment length
+/// 5. mismatch - number of mismatches
+/// 6. gapopen - number of gap openings
+/// 7. qstart - query start
+/// 8. qend - query end
+/// 9. sstart - subject start
+/// 10. send - subject end
+/// 11. evalue - e-value
+/// 12. bitscore - bit score
+pub fn parse_autoblast_file(path: &Path) -> Result<Vec<DuplicationData>> {
+    use std::fs::File;
+    use std::io::{BufRead, BufReader};
+
+    if !path.exists() || path.as_os_str().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let file = File::open(path).with_context(|| format!("Failed to open autoblast file: {}", path.display()))?;
+    let reader = BufReader::new(file);
+
+    let mut duplications = Vec::new();
+
+    for (line_num, line_result) in reader.lines().enumerate() {
+        let line = line_result.with_context(|| format!("Failed to read line {} of autoblast file", line_num + 1))?;
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 10 {
+            eprintln!("Warning: Skipping line {} with {} fields (expected 12)", line_num + 1, fields.len());
+            continue;
+        }
+
+        let contig_name = fields[0].to_string();
+        let pident: f64 = fields[2].parse().unwrap_or(0.0);
+        let qstart: i32 = fields[6].parse().unwrap_or(0);
+        let qend: i32 = fields[7].parse().unwrap_or(0);
+        let sstart: i32 = fields[8].parse().unwrap_or(0);
+        let send: i32 = fields[9].parse().unwrap_or(0);
+
+        // Skip self-hits (exact same region)
+        if qstart == sstart && qend == send {
+            continue;
+        }
+
+        duplications.push(DuplicationData {
+            contig_name,
+            position1: qstart,
+            position2: qend,
+            position1prime: sstart,
+            position2prime: send,
+            pident,
+        });
+    }
+
+    Ok(duplications)
 }
 
 // ============================================================================

@@ -207,6 +207,7 @@ pub const VARIABLES: &[VariableConfig] = &[
     VariableConfig { name: "reads_starts", subplot: "Reads termini", module: "Phage termini", plot_type: PlotType::Bars, color: "#215732", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Read Starts", help: None },
     VariableConfig { name: "reads_ends", subplot: "Reads termini", module: "Phage termini", plot_type: PlotType::Bars, color: "#572146", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Read Ends", help: None },
     VariableConfig { name: "tau", subplot: "Tau", module: "Phage termini", plot_type: PlotType::Bars, color: "#44883e", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Tau", help: None },
+    VariableConfig { name: "duplications", subplot: "Duplications", module: "Phage termini", plot_type: PlotType::Bars, color: "#c1121f", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Duplications", help: Some("Duplicated regions detected by self-BLAST (e.g., terminal repeats)") },
 ];
 
 // ============================================================================

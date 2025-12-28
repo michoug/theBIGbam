@@ -164,7 +164,13 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None, feature
                 # Only use variable width for rendering if this specific feature has width != 1
                 if any(w != 1 for w in data_feature["width"]):
                     data_dict["width"] = data_feature["width"]
-            
+
+            # Add duplication-specific fields if available
+            if data_feature.get("is_duplication", False):
+                data_dict["linked_start"] = data_feature["linked_start"]
+                data_dict["linked_end"] = data_feature["linked_end"]
+                data_dict["length"] = data_feature["length"]
+
             # Add statistics if available
             has_stats = data_feature.get("has_stats", False)
             if has_stats:
@@ -210,11 +216,22 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None, feature
                 )
 
     # Add hover with conditional tooltips based on whether statistics are available
-    # Check if any feature in feature_dict has statistics or variable width
+    # Check if any feature in feature_dict has statistics, variable width, or is duplication
     has_any_stats = any(d.get("has_stats", False) for d in feature_dict)
     has_variable_width = any("width" in d and any(w != 1 for w in d["width"]) for d in feature_dict)
+    is_duplication = any(d.get("is_duplication", False) for d in feature_dict)
 
-    if has_variable_width:
+    if is_duplication:
+        # Duplication-specific tooltips
+        tooltips = [
+            ("First position", "@first_pos{0,0}"),
+            ("Last position", "@last_pos{0,0}"),
+            ("Linked start", "@linked_start{0,0}"),
+            ("Linked end", "@linked_end{0,0}"),
+            ("Length", "@length{0,0}"),
+            ("Identity", "@y{0.1}%")
+        ]
+    elif has_variable_width:
         # For bars with spans, show first and last position
         tooltips = [
             ("First position", "@first_pos{0,0}"),
@@ -259,6 +276,87 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None, feature
     p.toolbar.active_scroll = wheel
 
     return p
+
+### Function to get duplications (contig-level, sample-independent)
+def get_duplication_data(cur, contig_id):
+    """Get duplication data for plotting, formatted for make_bokeh_subplot().
+
+    Args:
+        cur: DuckDB cursor
+        contig_id: Contig ID
+
+    Returns:
+        List with one feature dict formatted for make_bokeh_subplot()
+    """
+    # Get variable info from database
+    cur.execute(
+        "SELECT \"Type\", Color, Alpha, Fill_alpha, \"Size\", Title "
+        "FROM Variable WHERE Variable_name='duplications'"
+    )
+    var_row = cur.fetchone()
+    if not var_row:
+        return []  # Variable not found
+
+    type_picked, color, alpha, fill_alpha, size, title = var_row
+
+    # Check if Duplications table exists and has data
+    try:
+        cur.execute(
+            "SELECT Position1, Position2, Position1prime, Position2prime, Pident "
+            "FROM Duplications WHERE Contig_id=? ORDER BY Position1",
+            (contig_id,)
+        )
+        rows = cur.fetchall()
+    except Exception:
+        return []  # Table doesn't exist or no data
+
+    if not rows:
+        return []
+
+    x_coords = []
+    y_coords = []
+    width_coords = []
+    first_pos_coords = []
+    last_pos_coords = []
+    linked_start_coords = []
+    linked_end_coords = []
+    length_coords = []
+
+    for row in rows:
+        pos1, pos2, pos1p, pos2p, pident_int = row
+        # Pident stored as INTEGER (×100), convert back to percentage
+        pident = pident_int / 100.0 if pident_int is not None else 0.0
+        length = abs(pos2 - pos1) + 1
+        midpoint = (pos1 + pos2) / 2.0
+
+        x_coords.append(midpoint)
+        y_coords.append(pident)
+        width_coords.append(length)
+        first_pos_coords.append(min(pos1, pos2))
+        last_pos_coords.append(max(pos1, pos2))
+        linked_start_coords.append(pos1p)
+        linked_end_coords.append(pos2p)
+        length_coords.append(length)
+
+    return [{
+        "type": type_picked,
+        "color": color,
+        "alpha": alpha,
+        "fill_alpha": fill_alpha,
+        "size": size,
+        "title": title,
+        "x": x_coords,
+        "y": y_coords,
+        "width": width_coords,
+        "first_pos": first_pos_coords,
+        "last_pos": last_pos_coords,
+        "linked_start": linked_start_coords,
+        "linked_end": linked_end_coords,
+        "length": length_coords,
+        "has_stats": False,
+        "is_duplication": True,  # Flag for special tooltip handling
+    }]
+
 
 ### Function to get features of one variable
 def get_feature_data(cur, feature, contig_id, sample_id):
@@ -427,7 +525,7 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
     # --- Add one subplot per feature requested ---
     # Requested features are variables like 'coverage', 'reads_starts', etc.
     subplots = []
-    requested_features = parse_requested_features(list_features)
+    requested_features, include_duplications = parse_requested_features(list_features)
 
     for feature in requested_features:
         try:
@@ -437,6 +535,17 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
                 subplots.append(subplot_feature)
         except Exception as e:
             print(f"Error processing feature '{feature}': {e}", flush=True)
+
+    # Add Duplications subplot if requested (contig-level, sample-independent)
+    if include_duplications:
+        try:
+            dup_feature_dict = get_duplication_data(cur, contig_id)
+            if dup_feature_dict:
+                dup_subplot = make_bokeh_subplot(dup_feature_dict, subplot_size, shared_xrange)
+                if dup_subplot is not None:
+                    subplots.append(dup_subplot)
+        except Exception as e:
+            print(f"Error processing Duplications: {e}", flush=True)
 
     # --- Combine all figures in a single grid with one shared toolbar ---
     if annotation_fig:
@@ -466,36 +575,42 @@ def save_html_plot_per_sample(db_path, list_features, contig_name, sample_name, 
 ### Parsing features
 def parse_requested_features(list_features):
     """Parse requested features, expanding modules to individual features.
-    
+
     Accepts a mix of module names and individual feature names.
     Module names are case-insensitive and can include:
     - "coverage" or "Coverage" -> primary_reads, secondary_reads, supplementary_reads
-    - "phagetermini" or "Phage termini" -> coverage_reduced, reads_starts, reads_ends, tau
+    - "phagetermini" or "Phage termini" -> coverage_reduced, reads_starts, reads_ends, tau + Duplications
     - "assemblycheck" or "Assembly check" -> all assembly check features
-    
-    Returns deduplicated list of individual feature names.
+
+    Returns tuple of (deduplicated list of individual feature names, include_duplications bool).
     """
     features = []
+    include_duplications = False
+
     for item in list_features:
         item_lower = item.lower().strip()
-        
+
         # Module: Coverage
         if item_lower in ["coverage"]:
             features.extend(["Primary alignments", "Other alignments", "Other alignments"])
         # Module: Phage termini / phagetermini
         elif item_lower in ["phage termini", "phagetermini", "phage_termini"]:
             features.extend(["Coverage reduced", "Reads termini", "Tau"])
+            include_duplications = True
         # Module: Assembly check / assemblycheck
         elif item_lower in ["assembly check", "assemblycheck", "assembly_check"]:
             features.extend(["Clippings", "Indels", "Mismatches", "Read lengths", "Insert sizes", "Bad orientations"])
+        # Handle "Duplications" specifically
+        elif item_lower in ["duplications", "duplication"]:
+            include_duplications = True
         # Individual feature
         else:
             features.append(item)
-    
+
     # Deduplicate while preserving order
     seen = set()
     deduped_features = [f for f in features if not (f in seen or seen.add(f))]
-    return deduped_features
+    return deduped_features, include_duplications
 
 ### Main function
 def add_plot_per_sample_args(parser):

@@ -1,4 +1,6 @@
 import argparse, sys, os
+import tempfile
+from pathlib import Path
 from multiprocessing import cpu_count
 
 # Import Rust bindings (required)
@@ -10,7 +12,7 @@ except ImportError:
     _rust = None
 
 
-def calculating_all_features_parallel(list_modules, bam_files, output_db, min_coverage, curve_ratio, bar_ratio, circular=False, n_sample_cores=None, sequencing_type=None, genbank_path=None, annotation_tool="", max_samples_in_memory=10):
+def calculating_all_features_parallel(list_modules, bam_files, output_db, min_coverage, curve_ratio, bar_ratio, circular=False, n_sample_cores=None, sequencing_type=None, genbank_path=None, annotation_tool="", max_samples_in_memory=10, autoblast_file=None):
     """Process all BAM files in parallel using Rust bindings."""
     if not HAS_RUST:
         sys.exit("ERROR: Rust bindings (mgfeatureviewer_rs) are required but not available. Please install them first.")
@@ -35,6 +37,7 @@ def calculating_all_features_parallel(list_modules, bam_files, output_db, min_co
             circular=circular,
             create_indexes=True,
             max_samples_in_memory=max_samples_in_memory,
+            autoblast_file=autoblast_file if autoblast_file else "",
         )
     except Exception as e:
         print(f"ERROR: Rust processing failed: {e}", flush=True)
@@ -42,22 +45,14 @@ def calculating_all_features_parallel(list_modules, bam_files, output_db, min_co
         traceback.print_exc()
         sys.exit(1)
 
-    total_time = result.get("total_time", 0.0)
-    samples_processed = result.get("samples_processed", 0)
     samples_failed = result.get("samples_failed", 0)
-    processing_time = result.get("processing_time", 0.0)
-    writing_time = result.get("writing_time", 0.0)
-    print(f"Finished {samples_processed} samples in {total_time:.2f}s ({total_time/max(1, samples_processed):.2f}s per sample avg)", flush=True)
-    if total_time > 0:
-        processing_pct = (processing_time / total_time) * 100
-        writing_pct = (writing_time / total_time) * 100
-        print(f"{processing_pct:.1f}% of time spent calculating and {writing_pct:.1f}% writing the database", flush=True)
     if samples_failed > 0:
         print(f"Warning: {samples_failed} samples failed to process", flush=True)
 
 def add_calculate_args(parser):
     parser.add_argument("-t", "--threads", required=True, help="Number of threads available")
     parser.add_argument("-g", "--genbank", help="Path to genbank file (optional; if not provided, no gene annotations will be stored)")
+    parser.add_argument("-a", "--assembly", help="Path to assembly FASTA file (only needed for autoblast when genbank lacks sequence data)")
     parser.add_argument("-b", "--bam_files", required=True, help="Path to bam file or directory containing mapping files (BAM format)")
     parser.add_argument("-m", "--modules", required=True, help="List of modules to compute (comma-separated) (options allowed: coverage, phagetermini, assemblycheck)")
     parser.add_argument("-o", "--output", required=True, help="Output database file path (.db)")
@@ -72,6 +67,7 @@ def add_calculate_args(parser):
 def run_calculate_args(args):
     annotation_tool = args.annotation_tool
     genbank_path = getattr(args, 'genbank', None)
+    assembly_path = getattr(args, 'assembly', None)
 
     if os.path.isdir(args.bam_files):
         bam_files = [os.path.join(args.bam_files, f) for f in os.listdir(args.bam_files) if f.endswith(".bam")]
@@ -94,16 +90,62 @@ def run_calculate_args(args):
     if genbank_path and not os.path.exists(genbank_path):
         sys.exit(f"ERROR: GenBank file not found: {genbank_path}")
 
+    if assembly_path and not os.path.exists(assembly_path):
+        sys.exit(f"ERROR: Assembly file not found: {assembly_path}")
+
     max_samples_in_memory = getattr(args, 'max_samples_in_memory', 10)
 
-    print("Calculating values for all requested features from mapping files...", flush=True)
+    # Run autoblast if phagetermini module is requested
+    autoblast_file = None
+    if "phagetermini" in requested_modules:
+        from mgfeatureviewer.utils.autoblast import perform_autoblast, extract_fasta_from_genbank
+        print("Running autoblast for phagetermini analysis...", flush=True)
+
+        # Determine FASTA source: use assembly file if provided, otherwise extract from genbank
+        fasta_path = None
+        temp_fasta = None
+
+        if assembly_path:
+            fasta_path = Path(assembly_path)
+            print(f"  Using assembly file: {fasta_path}", flush=True)
+        elif genbank_path:
+            # Try to extract FASTA from genbank
+            temp_fasta = tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', delete=False)
+            temp_fasta.close()
+            temp_fasta_path = Path(temp_fasta.name)
+
+            if extract_fasta_from_genbank(Path(genbank_path), temp_fasta_path):
+                fasta_path = temp_fasta_path
+                print(f"  Extracted sequences from GenBank file", flush=True)
+            else:
+                os.unlink(temp_fasta_path)
+                print("  WARNING: Could not extract sequences from GenBank file (no sequence data found)", flush=True)
+                print("  Provide --assembly parameter for autoblast functionality", flush=True)
+
+        if fasta_path:
+            # Create autoblast output file next to the output database
+            output_dir = Path(output_db).parent
+            output_dir.mkdir(parents=True, exist_ok=True)
+            autoblast_output = output_dir / f"{Path(output_db).stem}_autoblast.tsv"
+
+            try:
+                perform_autoblast(n_cores, fasta_path, autoblast_output)
+                autoblast_file = str(autoblast_output)
+                print(f"  Autoblast results written to: {autoblast_file}", flush=True)
+            except Exception as e:
+                print(f"  WARNING: Autoblast failed: {e}", flush=True)
+                print("  Continuing without autoblast results...", flush=True)
+
+            # Clean up temp file if we created one
+            if temp_fasta and os.path.exists(temp_fasta.name):
+                os.unlink(temp_fasta.name)
+
+    print("\nCalculating values for all requested features from mapping files...", flush=True)
     calculating_all_features_parallel(
         requested_modules, bam_files, output_db, min_coverage, variation_percentage, coverage_percentage, circular, n_cores,
         sequencing_type=args.sequencing_type, genbank_path=genbank_path, annotation_tool=annotation_tool if genbank_path else "",
-        max_samples_in_memory=max_samples_in_memory
+        max_samples_in_memory=max_samples_in_memory, autoblast_file=autoblast_file
     )
-
-    print(f"\nOutput written to: {output_db}", flush=True)
 
 def main():
     print("Parsing arguments...", flush=True)

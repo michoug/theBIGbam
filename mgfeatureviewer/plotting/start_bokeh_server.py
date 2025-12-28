@@ -99,7 +99,7 @@ def build_controls(conn):
     # First, identify which feature tables have at least one row with non-zero value
     cur.execute("SELECT DISTINCT Feature_table_name FROM Variable")
     feature_tables = [r[0] for r in cur.fetchall()]
-    
+
     tables_with_data = set()
     for table_name in feature_tables:
         try:
@@ -111,7 +111,15 @@ def build_controls(conn):
         except Exception:
             # Table might not exist, skip it
             continue
-    
+
+    # Check if Duplications table has data (special table, not in Variable table)
+    has_duplications = False
+    try:
+        cur.execute("SELECT COUNT(*) FROM Duplications")
+        has_duplications = cur.fetchone()[0] > 0
+    except Exception:
+        pass
+
     # Get variables that have data (their feature table has rows)
     cur.execute("SELECT DISTINCT Variable_name, Feature_table_name FROM Variable")
     variables = [r[0] for r in cur.fetchall() if r[1] in tables_with_data]
@@ -132,15 +140,19 @@ def build_controls(conn):
         cur.execute(
             "SELECT DISTINCT Subplot FROM Variable WHERE Module=? AND Feature_table_name IN ({})".format(
                 ','.join('?' * len(tables_with_data))
-            ), 
+            ),
             (module,) + tuple(tables_with_data)
         )
         variables_checkbox = [r[0] for r in cur.fetchall()]
-        
+
+        # Add Duplications to Phage termini module if data exists
+        if module == "Phage termini" and has_duplications:
+            variables_checkbox.append("Duplications")
+
         # Skip this module if no variables with data
         if not variables_checkbox:
             continue
-        
+
         module_names.append(module)
 
         # Always create module checkbox (will be shown in "One sample" view)

@@ -1185,6 +1185,7 @@ pub fn run_all_samples(
     config: &ProcessConfig,
     _create_indexes: bool, // Ignored - DuckDB uses zone maps instead of indexes
     max_samples_in_memory: usize,
+    autoblast_file: &Path,
 ) -> Result<ProcessResult> {
     unsafe {
         htslib::hts_set_log_level(htslib::htsLogLevel_HTS_LOG_ERROR);
@@ -1195,7 +1196,7 @@ pub fn run_all_samples(
         .build_global()
         .ok();
 
-    eprintln!("### Parsing GenBank file...");
+    eprintln!("\n### Parsing input files...");
     let (contigs, annotations) = if genbank_path.as_os_str().is_empty() {
         eprintln!("No GenBank file provided - extracting contigs from BAM headers");
         let contigs = extract_contigs_from_bams(bam_files, config.circular)?;
@@ -1210,7 +1211,7 @@ pub fn run_all_samples(
         annotations.len()
     );
 
-    eprintln!("Found {} BAM files\n", bam_files.len());
+    eprintln!("Found {} BAM files", bam_files.len());
 
     if let Some(parent) = output_db.parent() {
         fs::create_dir_all(parent).context("Failed to create output directory")?;
@@ -1221,11 +1222,18 @@ pub fn run_all_samples(
     // Create database with schema and initial data
     let db_writer = DbWriter::create(output_db, &contigs, &annotations)?;
 
-    eprintln!(
-        "### Processing {} samples with {} threads",
-        bam_files.len(),
-        config.threads
-    );
+    // Parse and write duplications from autoblast file (if provided)
+    if !autoblast_file.as_os_str().is_empty() && autoblast_file.exists() {
+        eprintln!("\n### Parsing autoblast results...");
+        let duplications = crate::db::parse_autoblast_file(autoblast_file)?;
+        if !duplications.is_empty() {
+            db_writer.write_duplications(&duplications)?;
+        } else {
+            eprintln!("No duplications found in autoblast file");
+        }
+    }
+
+    eprintln!("\n### Processing {} samples with {} threads", bam_files.len(), config.threads);
     eprintln!("Modules: {}\n", modules.join(", "));
 
     let result = process_samples_parallel(&bam_files, &contigs, modules, config, db_writer, max_samples_in_memory)?;
@@ -1369,8 +1377,8 @@ fn process_samples_parallel(
         match process_sample(bam_path, contigs, modules, config) {
             Ok((features, presences, packaging, completeness, sample_name)) => {
                 let sample_time = sample_start.elapsed().as_secs_f64();
-                let done = completed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                let msg = format!("[{}/{}] {} ({:.2}s)", done, total, sample_name, sample_time);
+                completed_count.fetch_add(1, Ordering::SeqCst);
+                let msg = format!("{} ({:.2}s)", sample_name, sample_time);
                 process_pb.set_message(msg.clone());
                 process_pb.inc(1);
                 if !is_tty {
@@ -1389,9 +1397,9 @@ fn process_samples_parallel(
             Err(e) => {
                 eprintln!("\nError processing {}: {}", bam_path.display(), e);
                 let sample_time = sample_start.elapsed().as_secs_f64();
-                let done = completed_count.fetch_add(1, Ordering::SeqCst) + 1;
+                completed_count.fetch_add(1, Ordering::SeqCst);
                 failed_count.fetch_add(1, Ordering::SeqCst);
-                let msg = format!("[{}/{}] ERR ({:.2}s)", done, total, sample_time);
+                let msg = format!("ERR ({:.2}s)", sample_time);
                 process_pb.set_message(msg.clone());
                 process_pb.inc(1);
                 if !is_tty {
@@ -1495,7 +1503,7 @@ fn process_samples_sequential(
                 writing_time_total += write_start.elapsed();
 
                 let total_sample_time = sample_start.elapsed().as_secs_f64();
-                let msg = format!("[{}/{}] {} ({:.2}s)", processed + failed, total, sample_name, total_sample_time);
+                let msg = format!("{} ({:.2}s)", sample_name, total_sample_time);
                 pb.set_message(msg.clone());
                 pb.inc(1);
                 if !is_tty {
@@ -1506,7 +1514,7 @@ fn process_samples_sequential(
                 eprintln!("\nError processing {}: {}", bam_path.display(), e);
                 failed += 1;
                 processing_time_total += sample_start.elapsed();
-                let msg = format!("[{}/{}] ERR", processed + failed, total);
+                let msg = "ERR".to_string();
                 pb.set_message(msg.clone());
                 pb.inc(1);
                 if !is_tty {
@@ -1537,13 +1545,8 @@ fn print_summary(result: &ProcessResult, output_db: &Path) {
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     eprintln!("### Complete");
     eprintln!();
-    eprintln!(
-        "  Samples processed: {}/{}",
-        result.samples_processed,
-        result.samples_processed + result.samples_failed
-    );
+    eprintln!("  Samples processed: {}/{}", result.samples_processed, result.samples_processed + result.samples_failed);
     eprintln!("  Total time:        {:.2}s", result.total_time_secs);
     eprintln!();
     eprintln!("  Output: {:?}", output_db);
-    eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 }
