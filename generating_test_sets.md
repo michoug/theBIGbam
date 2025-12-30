@@ -283,3 +283,9 @@ To see cigars:
 ```bash
 samtools view tests/linear_bams/1000_long_reads.bam | awk '{print $1, $6}' | head -100
 ```
+
+To get coverages:
+```bash
+samtools depth -a linear_bams/1000_long_reads.bam > coverages/coverage_1000_long_reads.csv
+
+```
