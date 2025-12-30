@@ -474,23 +474,11 @@ pub fn process_read(
     let ref_length = arrays.ref_length();
     let raw_start = ref_start as usize;
     let raw_end = ref_end as usize;
-    let is_long = seq_type.is_long();
 
     // For circular genomes with doubled references, always apply modulo for array bounds.
     // Keep raw_end for increment_circular to detect wrapping correctly.
     let start = raw_start % ref_length;
     let end = raw_end;
-
-    // Helper macro: use increment_circular_long for long reads (handles reads >= genome)
-    macro_rules! inc_circ {
-        ($arr:expr, $s:expr, $e:expr, $d:expr) => {
-            if is_long {
-                increment_circular_long($arr, $s, $e, $d);
-            } else {
-                increment_circular($arr, $s, $e, $d);
-            }
-        };
-    }
 
     // -------------------------------------------------------------------------
     // Coverage module: primary mappings only
@@ -499,13 +487,21 @@ pub fn process_read(
         // Track secondary and supplementary reads separately
         if is_secondary {
             if circular {
-                inc_circ!(&mut arrays.secondary_reads, start, end, 1);
+                if seq_type.is_long() {
+                    increment_circular_long(&mut arrays.secondary_reads, raw_start, raw_end, 1);
+                } else {
+                    increment_circular(&mut arrays.secondary_reads, start, end, 1);
+                }
             } else {
                 increment_range(&mut arrays.secondary_reads, start, end, 1);
             }
         } else if is_supplementary {
             if circular {
-                inc_circ!(&mut arrays.supplementary_reads, start, end, 1);
+                if seq_type.is_long() {
+                    increment_circular_long(&mut arrays.supplementary_reads, raw_start, raw_end, 1);
+                } else {
+                    increment_circular(&mut arrays.supplementary_reads, start, end, 1);
+                }
             } else {
                 increment_range(&mut arrays.supplementary_reads, start, end, 1);
             }
@@ -513,13 +509,24 @@ pub fn process_read(
             // Only count primary mappings in main coverage
             let mapq_val = mapq as u64;
             if circular {
-                inc_circ!(&mut arrays.primary_reads, start, end, 1);
-                inc_circ!(&mut arrays.sum_mapq, start, end, mapq_val);
-                // Also track strand-specific coverage
-                if is_reverse {
-                    inc_circ!(&mut arrays.primary_reads_minus_only, start, end, 1);
+                if seq_type.is_long() {
+                    increment_circular_long(&mut arrays.primary_reads, raw_start, raw_end, 1);
+                    increment_circular_long(&mut arrays.sum_mapq, raw_start, raw_end, mapq_val);
+                    // Also track strand-specific coverage
+                    if is_reverse {
+                        increment_circular_long(&mut arrays.primary_reads_minus_only, raw_start, raw_end, 1);
+                    } else {
+                        increment_circular_long(&mut arrays.primary_reads_plus_only, raw_start, raw_end, 1);
+                    }
                 } else {
-                    inc_circ!(&mut arrays.primary_reads_plus_only, start, end, 1);
+                    increment_circular(&mut arrays.primary_reads, start, end, 1);
+                    increment_circular(&mut arrays.sum_mapq, start, end, mapq_val);
+                    // Also track strand-specific coverage
+                    if is_reverse {
+                        increment_circular(&mut arrays.primary_reads_minus_only, start, end, 1);
+                    } else {
+                        increment_circular(&mut arrays.primary_reads_plus_only, start, end, 1);
+                    }
                 }
             } else {
                 increment_range(&mut arrays.primary_reads, start, end, 1);
@@ -693,15 +700,20 @@ pub fn process_read(
 
         // Check if read has clean alignment at start (no clip/mismatch)
         // raw_has_match_at_position checks both CIGAR and MD tag
-        let start_matches = raw_has_match_at_position(cigar_raw, md_tag, true);
-        let end_matches = !check_end || raw_has_match_at_position(cigar_raw, md_tag, false);
+        let start_matches = raw_has_match_at_position(cigar_raw, md_tag, !is_reverse);
+        // For long reads also check if read has clean alignment at end (no clip/mismatch)
+        let end_matches = !check_end || raw_has_match_at_position(cigar_raw, md_tag, is_reverse);
 
         // Only count "clean" primary reads for phage termini detection
         if start_matches && end_matches {
             // Update coverage_reduced (clean coverage from primary mappings only)
             // Note: end is exclusive (one past last position), so use non-inclusive increment
             if circular {
-                inc_circ!(&mut arrays.coverage_reduced, start, end, 1);
+                if seq_type.is_long() {
+                    increment_circular_long(&mut arrays.coverage_reduced, raw_start, raw_end, 1);
+                } else {
+                    increment_circular(&mut arrays.coverage_reduced, start, end, 1);
+                }
             } else {
                 increment_range(&mut arrays.coverage_reduced, start, end, 1);
             }

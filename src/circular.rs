@@ -10,6 +10,7 @@ use std::ops::AddAssign;
 // ============================================================================
 
 /// Increment values in a circular range [start, end), handling wrap-around.
+/// /// Start should already be modulo'd, but end can exceed len for wrapped reads.
 #[inline]
 pub fn increment_circular<T>(arr: &mut [T], start: usize, end: usize, delta: T)
 where
@@ -20,61 +21,56 @@ where
     let end_mod = end % len;
 
     if start_mod < end_mod {
-        // Fast path: no wrapping
+        // Normal case: no wrapping, end within bounds
         for pos in start_mod..end_mod {
             arr[pos] += delta;
         }
     } else {
-        // Wrapped or edge case
-        let read_len = end - start;
-        if read_len == 0 {
-            return;
+        // Wrapped case: read spans the origin
+        // Increment from start to end of array
+        for pos in start_mod..len {
+            arr[pos] += delta;
         }
-        if read_len < len {
-            // Simple wrap
-            for pos in start_mod..len {
-                arr[pos] += delta;
-            }
-            for pos in 0..end_mod {
-                arr[pos] += delta;
-            }
-        } else {
-            // Read >= genome length (rare)
-            let full_laps = read_len / len;
-            let remaining = read_len % len;
-
-            for _ in 0..full_laps {
-                for pos in 0..len {
-                    arr[pos] += delta;
-                }
-            }
-
-            if remaining > 0 {
-                let rem_end = (start_mod + remaining) % len;
-                if start_mod < rem_end {
-                    for pos in start_mod..rem_end {
-                        arr[pos] += delta;
-                    }
-                } else {
-                    for pos in start_mod..len {
-                        arr[pos] += delta;
-                    }
-                    for pos in 0..rem_end {
-                        arr[pos] += delta;
-                    }
-                }
-            }
+        // Then from beginning to wrapped end position
+        for pos in 0..end_mod {
+            arr[pos] += delta;
         }
     }
 }
 
-/// Alias for increment_circular (for compatibility)
+/// Increment values in a circular range for long reads that may span multiple reference lengths.
+///
+/// For reads longer than the reference, this adds full_laps to all positions first,
+/// then handles the remaining partial coverage with increment_circular.
+///
+/// IMPORTANT: Pass raw_start and raw_end (before any modulo) to correctly calculate read length.
 #[inline]
-pub fn increment_circular_long<T>(arr: &mut [T], start: usize, end: usize, delta: T)
+pub fn increment_circular_long<T>(arr: &mut [T], raw_start: usize, raw_end: usize, delta: T)
 where
     T: AddAssign + Copy,
 {
-    increment_circular(arr, start, end, delta);
+    let len = arr.len();
+    let read_length = raw_end - raw_start;
+
+    // Calculate how many complete laps around the reference
+    let full_laps = read_length / len;
+
+    // Add full laps to all positions
+    if full_laps > 0 {
+        for pos in 0..len {
+            for _ in 0..full_laps {
+                arr[pos] += delta;
+            }
+        }
+    }
+
+    // Handle remaining partial coverage
+    let remaining = read_length % len;
+    if remaining > 0 {
+        let start_mod = raw_start % len;
+        let new_end = start_mod + remaining;
+        increment_circular(arr, start_mod, new_end, delta);
+    }
 }
 
 /// Increment values in a non-circular range [start, end).

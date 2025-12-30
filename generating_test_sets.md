@@ -63,7 +63,76 @@ END {
 ```
 
 # Paired short reads 2 (PSR2):
-Take 100 times the contig randomly permuted and split it in 50 pairs of reads of 100bp:
+Same but inverting strand + and -
+```bash
+awk '
+BEGIN {
+  READLEN = 100
+  INSERT  = 200
+  NPAIRS  = 50
+  R1FILE = "50_read_pairs_for_test_10kbp_inverted_R1.fastq"
+  R2FILE = "50_read_pairs_for_test_10kbp_inverted_R2.fastq"
+}
+# read single-contig FASTA - strip all whitespace
+!/^>/ {
+  gsub(/[[:space:]]/, "")
+  seq = seq $0
+}
+# reverse complement function
+function revcomp(s,    i, rc, c, comp) {
+  comp["A"] = "T"; comp["T"] = "A"
+  comp["G"] = "C"; comp["C"] = "G"
+  comp["N"] = "N"
+  rc = ""
+  for (i = length(s); i >= 1; i--) {
+    c = substr(s, i, 1)
+    rc = rc comp[c]
+  }
+  return rc
+}
+END {
+  L = length(seq)
+  need = NPAIRS * INSERT
+  if (L < need) {
+    print "ERROR: contig too short (" L "), need " need > "/dev/stderr"
+    exit 1
+  }
+
+  # pre-generate quality string (Q40)
+  qual = ""
+  for (i = 1; i <= READLEN; i++) qual = qual "I"
+
+  for (i = 0; i < NPAIRS; i++) {
+    start = i * INSERT + 1
+    frag  = substr(seq, start, INSERT)
+
+    # original forward reads
+    r1_fwd = substr(frag, 1, READLEN)
+    r2_fwd = substr(frag, READLEN + 1, READLEN)
+
+    # INVERT STRANDS
+    r1 = revcomp(r1_fwd)   # R1 now reverse-complement
+    r2 = r2_fwd            # R2 now forward
+
+    id = "@pair_" (i+1)
+
+    # R1 file
+    print id "/1" > R1FILE
+    print r1 > R1FILE
+    print "+" > R1FILE
+    print qual > R1FILE
+
+    # R2 file
+    print id "/2" > R2FILE
+    print r2 > R2FILE
+    print "+" > R2FILE
+    print qual > R2FILE
+  }
+}' test_10000bp.fasta
+```
+
+# Paired short reads 3 (PSR3):
+Take 100 times the contig with start circularly permuted and split it in 50 pairs of reads of 100bp:
 ```bash
 awk '
 BEGIN {
@@ -107,14 +176,14 @@ END {
     offset = int(rand() * L)
     perm = substr(seq, offset + 1) substr(seq, 1, offset)
     
-    # 2) draw 50 paired reads from rotated contig
-    for (p = 1; p <= NPAIRS; p++) {
-      start = int(rand() * (L - INSERT + 1)) + 1
+    # 2) draw 50 paired reads SYSTEMATICALLY (tiling) from rotated contig
+    for (p = 0; p < NPAIRS; p++) {
+      start = (p * INSERT) + 1  # systematic tiling, not random
       frag  = substr(perm, start, INSERT)
       r1 = substr(frag, 1, READLEN)
       r2_fwd = substr(frag, READLEN + 1, READLEN)
       r2 = revcomp(r2_fwd)  # R2 is reverse complement
-      id = "@iter" it "_pair" p
+      id = "@iter" it "_pair" (p+1)
       
       # R1 file
       print id "/1" > R1FILE

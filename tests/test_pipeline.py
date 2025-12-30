@@ -13,13 +13,11 @@ import duckdb
 TEST_DB_LINEAR = os.path.join(os.path.dirname(__file__), "test_10kbp_linear.db")
 TEST_DB_CIRCULAR = os.path.join(os.path.dirname(__file__), "test_10kbp_circular.db")
 
-
 def cleanup_dbs():
     """Remove test databases before test run."""
     for db in [TEST_DB_LINEAR, TEST_DB_CIRCULAR]:
         if os.path.exists(db):
             os.remove(db)
-
 
 def verify_database(db_path: str):
     """Verify database structure and content."""
@@ -60,7 +58,6 @@ def verify_database(db_path: str):
 
     conn.close()
 
-
 def run_calculate(bam_dir: str, output_db: str, circular: bool):
     """Run calculate command on BAM files."""
     cmd = [
@@ -85,7 +82,6 @@ def run_calculate(bam_dir: str, output_db: str, circular: bool):
 
     return result
 
-
 def test_calculate_linear_bams(test_bams, tests_dir):
     """
     Test running calculate on linear (non-circular) BAM files.
@@ -104,7 +100,6 @@ def test_calculate_linear_bams(test_bams, tests_dir):
 
     print(f"\nVerifying linear database: {TEST_DB_LINEAR}")
     verify_database(TEST_DB_LINEAR)
-
 
 def test_calculate_circular_bams(test_bams, tests_dir):
     """

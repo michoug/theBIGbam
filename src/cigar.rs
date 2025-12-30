@@ -263,7 +263,22 @@ impl<'a> MdTag<'a> {
     /// Returns true if the MD tag ends with a non-zero number.
     #[inline]
     pub fn has_match_at_end(&self) -> bool {
-        !self.bytes.is_empty() && self.bytes.last().map(|&b| b.is_ascii_digit() && b != b'0').unwrap_or(false)
+        if self.bytes.is_empty() {
+            return false;
+        }
+        // Find where the trailing number starts (parse backwards)
+        let mut i = self.bytes.len();
+        while i > 0 && self.bytes[i - 1].is_ascii_digit() {
+            i -= 1;
+        }
+        // If we found digits at the end, check if the number > 0
+        if i < self.bytes.len() {
+            // Number > 0 if any digit is non-zero (handles "50", "100", etc.)
+            self.bytes[i..].iter().any(|&b| b != b'0')
+        } else {
+            // No digits at end = ends with mismatch/deletion
+            false
+        }
     }
 
     /// Iterate over mismatch positions relative to reference start.

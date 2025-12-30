@@ -18,12 +18,12 @@ REFERENCE = os.path.join(TESTS_DIR, "test_10000bp.fasta")
 FASTQ_FILES = [
     # Paired-end short reads
     ("50_read_pairs_for_test_10kbp_R1.fastq", "50_read_pairs_for_test_10kbp_R2.fastq", "paired-short"),
+    ("50_read_pairs_for_test_10kbp_inverted_R1.fastq", "50_read_pairs_for_test_10kbp_inverted_R2.fastq", "paired-short"),
     ("5000_read_pairs_for_test_10kbp_concatenated_100_times_R1.fastq", "5000_read_pairs_for_test_10kbp_concatenated_100_times_R2.fastq", "paired-short"),
     # Long reads (single file)
     ("1000_long_reads_for_test_10kbp.fastq", None, "long"),
     ("100_long_reads_for_test_10kbp_concatenated_100_times.fastq", None, "long"),
 ]
-
 
 def get_bam_name(fastq_name: str, circular: bool) -> str:
     """Generate BAM filename from FASTQ name."""
@@ -34,7 +34,6 @@ def get_bam_name(fastq_name: str, circular: bool) -> str:
     base = base.replace("_for_test_10kbp", "").replace("_concatenated_100_times", "_concat")
     suffix = "_circular" if circular else ""
     return f"{base}{suffix}.bam"
-
 
 def generate_bam(r1_path: str, r2_path: str | None, seq_type: str, circular: bool, output_bam: str) -> None:
     """Generate a BAM file using mgfeatureviewer mapping-per-sample command."""
@@ -54,7 +53,6 @@ def generate_bam(r1_path: str, r2_path: str | None, seq_type: str, circular: boo
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"BAM generation failed: {result.stderr}")
-
 
 @pytest.fixture(scope="session")
 def test_bams():
@@ -99,12 +97,10 @@ def test_bams():
 
     return bam_files
 
-
 @pytest.fixture(scope="session")
 def tests_dir():
     """Return the tests directory path."""
     return TESTS_DIR
-
 
 @pytest.fixture(scope="session")
 def reference_fasta():
