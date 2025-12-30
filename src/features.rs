@@ -6,7 +6,7 @@
 //! All features are calculated in a single pass through the BAM reads for efficiency.
 
 use crate::cigar::{raw_cigar_consumes_ref, raw_cigar_is_clipping, raw_has_match_at_position, MdTag};
-use crate::circular::{increment_circular, increment_range};
+use crate::circular::{increment_circular, increment_circular_long, increment_range};
 use crate::types::{FeatureMap, SequencingType};
 use std::collections::HashMap;
 
@@ -474,11 +474,23 @@ pub fn process_read(
     let ref_length = arrays.ref_length();
     let raw_start = ref_start as usize;
     let raw_end = ref_end as usize;
+    let is_long = seq_type.is_long();
 
     // For circular genomes with doubled references, always apply modulo for array bounds.
     // Keep raw_end for increment_circular to detect wrapping correctly.
     let start = raw_start % ref_length;
     let end = raw_end;
+
+    // Helper macro: use increment_circular_long for long reads (handles reads >= genome)
+    macro_rules! inc_circ {
+        ($arr:expr, $s:expr, $e:expr, $d:expr) => {
+            if is_long {
+                increment_circular_long($arr, $s, $e, $d);
+            } else {
+                increment_circular($arr, $s, $e, $d);
+            }
+        };
+    }
 
     // -------------------------------------------------------------------------
     // Coverage module: primary mappings only
@@ -487,13 +499,13 @@ pub fn process_read(
         // Track secondary and supplementary reads separately
         if is_secondary {
             if circular {
-                increment_circular(&mut arrays.secondary_reads, start, end, 1);
+                inc_circ!(&mut arrays.secondary_reads, start, end, 1);
             } else {
                 increment_range(&mut arrays.secondary_reads, start, end, 1);
             }
         } else if is_supplementary {
             if circular {
-                increment_circular(&mut arrays.supplementary_reads, start, end, 1);
+                inc_circ!(&mut arrays.supplementary_reads, start, end, 1);
             } else {
                 increment_range(&mut arrays.supplementary_reads, start, end, 1);
             }
@@ -501,13 +513,13 @@ pub fn process_read(
             // Only count primary mappings in main coverage
             let mapq_val = mapq as u64;
             if circular {
-                increment_circular(&mut arrays.primary_reads, start, end, 1);
-                increment_circular(&mut arrays.sum_mapq, start, end, mapq_val);
+                inc_circ!(&mut arrays.primary_reads, start, end, 1);
+                inc_circ!(&mut arrays.sum_mapq, start, end, mapq_val);
                 // Also track strand-specific coverage
                 if is_reverse {
-                    increment_circular(&mut arrays.primary_reads_minus_only, start, end, 1);
+                    inc_circ!(&mut arrays.primary_reads_minus_only, start, end, 1);
                 } else {
-                    increment_circular(&mut arrays.primary_reads_plus_only, start, end, 1);
+                    inc_circ!(&mut arrays.primary_reads_plus_only, start, end, 1);
                 }
             } else {
                 increment_range(&mut arrays.primary_reads, start, end, 1);
@@ -689,7 +701,7 @@ pub fn process_read(
             // Update coverage_reduced (clean coverage from primary mappings only)
             // Note: end is exclusive (one past last position), so use non-inclusive increment
             if circular {
-                increment_circular(&mut arrays.coverage_reduced, start, end, 1);
+                inc_circ!(&mut arrays.coverage_reduced, start, end, 1);
             } else {
                 increment_range(&mut arrays.coverage_reduced, start, end, 1);
             }

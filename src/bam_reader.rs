@@ -114,6 +114,13 @@ pub fn process_contig_streaming(
             continue;
         }
 
+        // In circular mode, skip reads that start in the second half of the doubled reference.
+        // These are duplicate mappings to the concatenated copy - the same alignment would
+        // also appear in the first half. Only process reads starting in [0, ref_length).
+        if circular && (record.pos() as usize) >= ref_length {
+            continue;
+        }
+
         has_reads = true;
 
         // Parse CIGAR string and MD tag (if needed)

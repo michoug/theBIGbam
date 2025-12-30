@@ -87,9 +87,9 @@ def build_argparser():
     sp.add_argument('--circular', action='store_true', help='Treat assemblies as circular')
     sp.add_argument('-t', '--threads', type=int, default=4, help='Number of threads (default: 4)')
     
-    # Annotation inputs
-    sp.add_argument('--annotation_tool', required=True, choices=['pharokka', 'bakta'], help='Annotation tool')
-    sp.add_argument('--annotation_db', required=True, help='Annotation database path')
+    # Annotation inputs (optional - skip annotation step if not provided)
+    sp.add_argument('--annotation_tool', choices=['pharokka', 'bakta'], help='Annotation tool (optional - skip annotation if not provided)')
+    sp.add_argument('--annotation_db', help='Annotation database path (required if --annotation_tool is set)')
     sp.add_argument('--meta', action='store_true', help='Pass --meta to annotator for multi-organism assemblies')
     
     # Calculation inputs
@@ -151,13 +151,19 @@ def main(argv=None):
             return 2
 
     if args.cmd == 'run-pipeline':
-        # Run mapping -> annotation -> calculate sequentially
+        # Run mapping -> [annotation] -> calculate sequentially
+        # Annotation is optional - skip if --annotation_tool not provided
         try:
             output_dir = os.path.abspath(args.output)
             os.makedirs(output_dir, exist_ok=True)
-            
+
             # Mapping outputs go into a bams subdirectory
             map_outdir = os.path.join(output_dir, 'bams')
+
+            # Determine step count based on whether annotation is enabled
+            run_annotation = args.annotation_tool is not None
+            total_steps = 3 if run_annotation else 2
+            step = 1
 
             # Determine if single-sample or multi-sample mapping
             if args.csv:
@@ -170,16 +176,16 @@ def main(argv=None):
                     output_dir=map_outdir,
                     threads=args.threads,
                 )
-                print(f"[1/3] Mapping: multiple samples from CSV -> {map_outdir}")
+                print(f"[{step}/{total_steps}] Mapping: multiple samples from CSV -> {map_outdir}")
                 read_mapping.run_mapping_all(map_ns)
             else:
                 # Single-sample mapping using read1/read2
                 if not args.read1:
                     raise ValueError("Either --csv or --read1 must be provided")
-                
+
                 os.makedirs(map_outdir, exist_ok=True)
                 output_bam = os.path.join(map_outdir, f"{os.path.basename(args.assembly).split('.')[0]}.bam")
-                
+
                 map_ns = argparse.Namespace(
                     read1=args.read1,
                     read2=args.read2,
@@ -189,35 +195,42 @@ def main(argv=None):
                     output=output_bam,
                     threads=args.threads,
                 )
-                print(f"[1/3] Mapping: single sample -> {output_bam}")
+                print(f"[{step}/{total_steps}] Mapping: single sample -> {output_bam}")
                 read_mapping.run_mapping_per_sample(map_ns)
+            step += 1
 
-            # Annotation step
-            anno_target = os.path.join(output_dir, 'annotation.gbk')
-            anno_ns = argparse.Namespace(
-                csv=args.csv if args.csv else None,
-                assembly=args.assembly if not args.csv else None,
-                annotation_tool=args.annotation_tool,
-                annotation_db=args.annotation_db,
-                meta=args.meta,
-                threads=args.threads,
-                genbank=anno_target,
-            )
-            print(f"[2/3] Annotation: {args.annotation_tool} -> {anno_target}")
-            assembly_annotation.run_annotation(anno_ns)
+            # Annotation step (optional)
+            anno_target = ""
+            if run_annotation:
+                if not args.annotation_db:
+                    raise ValueError("--annotation_db is required when --annotation_tool is specified")
 
-            if not os.path.exists(anno_target):
-                raise FileNotFoundError(f"Annotation failed: {anno_target} not created")
+                anno_target = os.path.join(output_dir, 'annotation.gbk')
+                anno_ns = argparse.Namespace(
+                    csv=args.csv if args.csv else None,
+                    assembly=args.assembly if not args.csv else None,
+                    annotation_tool=args.annotation_tool,
+                    annotation_db=args.annotation_db,
+                    meta=args.meta,
+                    threads=args.threads,
+                    genbank=anno_target,
+                )
+                print(f"[{step}/{total_steps}] Annotation: {args.annotation_tool} -> {anno_target}")
+                assembly_annotation.run_annotation(anno_ns)
+
+                if not os.path.exists(anno_target):
+                    raise FileNotFoundError(f"Annotation failed: {anno_target} not created")
+                step += 1
 
             # Calculate step - use actual database path as output
             final_db = os.path.join(output_dir, 'features.db')
             calc_ns = argparse.Namespace(
                 threads=args.threads,
-                genbank=anno_target,
+                genbank=anno_target,  # Empty string if no annotation
                 bam_files=map_outdir,
                 modules=args.modules,
                 output=final_db,
-                annotation_tool=args.annotation_tool,
+                annotation_tool=args.annotation_tool if args.annotation_tool else "",
                 sequencing_type=args.sequencing_type,
                 min_coverage=args.min_coverage,
                 variation_percentage=args.variation_percentage,
@@ -225,9 +238,9 @@ def main(argv=None):
                 circular=args.circular,
             )
 
-            print(f"[3/3] Calculate: modules={args.modules} -> {final_db}")
+            print(f"[{step}/{total_steps}] Calculate: modules={args.modules} -> {final_db}")
             calculating_data.run_calculate_args(calc_ns)
-            
+
             print(f"\nPipeline complete! Output: {final_db}")
             return 0
         except Exception as e:

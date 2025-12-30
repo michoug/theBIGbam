@@ -34,7 +34,7 @@ pub mod types;
 // Re-export main types for library users
 pub use bam_reader::{detect_sequencing_type, process_contig_streaming};
 pub use cigar::{Cigar, CigarElement, CigarOp, MdTag};
-pub use circular::{increment_circular, increment_range};
+pub use circular::{increment_circular, increment_circular_long, increment_range};
 pub use compress::compress_signal_with_reference;
 pub use features::{process_read, FeatureArrays, ModuleFlags};
 pub use genbank::parse_genbank;
