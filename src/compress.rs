@@ -72,11 +72,11 @@ pub fn compress_signal_with_reference(
     }
 
     let mut runs = Vec::new();
+    curve_ratio *= 0.01; // Convert percentage to fraction
+    bar_ratio *= 0.01;   // Convert percentage to fraction
 
     // For bars with reference: save positions where value > coverage * bar_ratio
     // Each qualifying position is saved as a separate single-position bar
-    curve_ratio *= 0.01; // Convert percentage to fraction
-    bar_ratio *= 0.01;   // Convert percentage to fraction
     if matches!(plot_type, PlotType::Bars) && reference.is_some() {
         let coverage = reference.unwrap();
         for i in 0..n {

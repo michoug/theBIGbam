@@ -25,3 +25,5 @@ The packaging mechanism of a contig is determined through a multi-step peak dete
 - >2 peaks: Unknown_packaging
 
 The _3' or _5' suffix indicates directionality: which terminus comes first when traversing the genome in the forward direction.
+
+merging peaks is nice but if i do it before 

@@ -17,23 +17,34 @@ where
     T: AddAssign + Copy,
 {
     let len = arr.len();
-    let start_mod = start%len;
-    let end_mod = end%len;
-    
+    let start_mod = start % len;
+    let end_mod = end % len;
+
     if start_mod < end_mod {
-        // Normal case: no wrapping, end within bounds
+        // Normal case: no wrapping
         for pos in start_mod..end_mod {
             arr[pos] += delta;
         }
-    } else {
+    } else if end_mod < start_mod {
         // Wrapped case: read spans the origin
-        // Increment from start to end of array
         for pos in start_mod..len {
             arr[pos] += delta;
         }
-        // Then from beginning to wrapped end position
         for pos in 0..end_mod {
             arr[pos] += delta;
+        }
+    } else {
+        // start_mod == end_mod: either empty read or full genome(s)
+        // Check actual read length to distinguish
+        let read_length = end - start;
+        if read_length > 0 {
+            // Full genome coverage (one or more laps)
+            let full_laps = read_length / len;
+            for _ in 0..full_laps {
+                for pos in 0..len {
+                    arr[pos] += delta;
+                }
+            }
         }
     }
 }

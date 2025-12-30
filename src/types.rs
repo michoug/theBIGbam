@@ -191,11 +191,11 @@ pub const VARIABLES: &[VariableConfig] = &[
     // Per read metrics (long reads)
     VariableConfig { name: "read_lengths", subplot: "Read lengths", module: "Long-read metrics", module_order: 1, plot_type: PlotType::Curve, color: "#ed8b00", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Read Lengths", help: None },
 
-    // Per read metrics (paired-reads)
+    // Per read metrics (paired-reads)  
     VariableConfig { name: "insert_sizes", subplot: "Insert sizes", module: "Paired-read metrics", module_order: 1, plot_type: PlotType::Curve, color: "#ed8b00", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Insert Sizes", help: None },
-    VariableConfig { name: "non_inward_pairs", subplot: "Non-inward pairs", module: "Paired-read metrics", module_order: 2, plot_type: PlotType::Bars, color: "#c94009", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Non-inward pairs", help: None },
-    VariableConfig { name: "mate_not_mapped", subplot: "Mate not mapped", module: "Paired-read metrics", module_order: 3, plot_type: PlotType::Bars, color: "#302DD2", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Missing mates", help: None },
-    VariableConfig { name: "mate_on_another_contig", subplot: "Mate on another contig", module: "Paired-read metrics", module_order: 4, plot_type: PlotType::Bars, color: "#CFD22D", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Missing mates", help: None },
+    VariableConfig { name: "non_inward_pairs", subplot: "Non-inward pairs", module: "Paired-read metrics", module_order: 2, plot_type: PlotType::Curve, color: "#c94009", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Non-inward pairs", help: None },
+    VariableConfig { name: "mate_not_mapped", subplot: "Mate not mapped", module: "Paired-read metrics", module_order: 3, plot_type: PlotType::Curve, color: "#302DD2", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Missing mates", help: None },
+    VariableConfig { name: "mate_on_another_contig", subplot: "Mate on another contig", module: "Paired-read metrics", module_order: 4, plot_type: PlotType::Curve, color: "#CFD22D", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Missing mates", help: None },
     
     // Per position errors from reads (Assembly check)
     VariableConfig { name: "left_clippings", subplot: "Clippings", module: "Mapping metrics per position", module_order: 1, plot_type: PlotType::Bars, color: "#8e43e7", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Left Clippings", help: Some("Extra bases are missing on the left of the reference genome") },

@@ -249,9 +249,8 @@ fn add_features_from_arrays(
         
         if seq_type.is_short_paired() {
             let non_inward_f64: Vec<f64> = arrays.non_inward_pairs.iter().map(|&x| x as f64).collect();
-            let non_inward_runs = compress_signal_with_reference(&non_inward_f64, Some(&primary_reads_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio);
-            let non_inward_runs_merged = merge_identical_runs(non_inward_runs);
-            output.extend(non_inward_runs_merged.into_iter().map(|run| FeaturePoint {
+            let non_inward_runs = compress_signal_with_reference(&non_inward_f64, Some(&primary_reads_f64), PlotType::Curve, config.curve_ratio, config.bar_ratio);
+            output.extend(non_inward_runs.into_iter().map(|run| FeaturePoint {
                 contig_name: contig_name.to_string(),
                 feature: "non_inward_pairs".to_string(),
                 start_pos: run.start_pos,
@@ -263,9 +262,8 @@ fn add_features_from_arrays(
             }));
             
             let mate_unmapped_f64: Vec<f64> = arrays.mate_not_mapped.iter().map(|&x| x as f64).collect();
-            let mate_unmapped_runs = compress_signal_with_reference(&mate_unmapped_f64, Some(&primary_reads_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio);
-            let mate_unmapped_runs_merged = merge_identical_runs(mate_unmapped_runs);
-            output.extend(mate_unmapped_runs_merged.into_iter().map(|run| FeaturePoint {
+            let mate_unmapped_runs = compress_signal_with_reference(&mate_unmapped_f64, Some(&primary_reads_f64), PlotType::Curve, config.curve_ratio, config.bar_ratio);
+            output.extend(mate_unmapped_runs.into_iter().map(|run| FeaturePoint {
                 contig_name: contig_name.to_string(),
                 feature: "mate_not_mapped".to_string(),
                 start_pos: run.start_pos,
@@ -277,9 +275,8 @@ fn add_features_from_arrays(
             }));
             
             let mate_other_contig_f64: Vec<f64> = arrays.mate_on_another_contig.iter().map(|&x| x as f64).collect();
-            let mate_other_contig_runs = compress_signal_with_reference(&mate_other_contig_f64, Some(&primary_reads_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio);
-            let mate_other_contig_runs_merged = merge_identical_runs(mate_other_contig_runs);
-            output.extend(mate_other_contig_runs_merged.into_iter().map(|run| FeaturePoint {
+            let mate_other_contig_runs = compress_signal_with_reference(&mate_other_contig_f64, Some(&primary_reads_f64), PlotType::Curve, config.curve_ratio, config.bar_ratio);
+            output.extend(mate_other_contig_runs.into_iter().map(|run| FeaturePoint {
                 contig_name: contig_name.to_string(),
                 feature: "mate_on_another_contig".to_string(),
                 start_pos: run.start_pos,
