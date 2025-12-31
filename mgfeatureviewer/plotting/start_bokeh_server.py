@@ -41,9 +41,17 @@ def build_controls(conn):
         cur.execute("SELECT MIN(Coverage_variation), MAX(Coverage_variation) FROM Presences WHERE Coverage_variation IS NOT NULL")
         result = cur.fetchone()
         if result and result[0] is not None and result[1] is not None:
-            # Divide by 100 since values are stored as INTEGER ×100
-            coverage_variation_min = result[0] / 100.0
-            coverage_variation_max = result[1] / 100.0
+            coverage_variation_min = result[0]
+            coverage_variation_max = result[1]
+    except Exception:
+        pass
+
+    whole_contamination_max = 100.0
+    try:
+        cur.execute("SELECT MAX(Percentage_contamination) FROM Explicit_completeness WHERE Percentage_contamination IS NOT NULL")
+        result = cur.fetchone()
+        if result and result[0] is not None:
+            whole_contamination_max = result[0]
     except Exception:
         pass
 
@@ -198,7 +206,8 @@ def build_controls(conn):
         'phage_mechanisms': phage_mechanisms_list,
         'has_completeness': has_completeness,
         'coverage_variation_min': coverage_variation_min,
-        'coverage_variation_max': coverage_variation_max
+        'coverage_variation_max': coverage_variation_max,
+        'whole_contamination_max': whole_contamination_max
     }
     return widgets
 
@@ -387,105 +396,73 @@ def modify_doc_factory(db_path):
         allowed_contigs = set(orig_contigs)
         cur = conn.cursor()
 
-        # Apply coverage percentage filter (stored as INTEGER ×100)
+        # Apply coverage filters using Explicit_presences view (single combined query)
+        conditions = []
+        params = []
+
         if coverage_percentage_slider is not None:
             min_val, max_val = coverage_percentage_slider.value
             if min_val > 0 or max_val < 100:
-                # Multiply by 100 to match stored INTEGER values
-                query = """
-                    SELECT DISTINCT Contig.Contig_name
-                    FROM Presences p
-                    JOIN Contig ON p.Contig_id = Contig.Contig_id
-                    WHERE p.Coverage_percentage >= ? AND p.Coverage_percentage <= ?
-                """
-                cur.execute(query, (int(min_val * 100), int(max_val * 100)))
-                matching = {row[0] for row in cur.fetchall()}
-                allowed_contigs &= matching
+                conditions.append("Coverage_percentage >= ? AND Coverage_percentage <= ?")
+                params.extend([min_val, max_val])
 
-        # Apply coverage variation filter (stored as INTEGER ×100)
         if coverage_variation_slider is not None:
             min_val, max_val = coverage_variation_slider.value
             cov_var_min = widgets['coverage_variation_min']
             cov_var_max = widgets['coverage_variation_max']
             if min_val > cov_var_min or max_val < cov_var_max:
-                # Multiply by 100 to match stored INTEGER values
-                query = """
-                    SELECT DISTINCT Contig.Contig_name
-                    FROM Presences p
-                    JOIN Contig ON p.Contig_id = Contig.Contig_id
-                    WHERE p.Coverage_variation >= ? AND p.Coverage_variation <= ?
-                """
-                cur.execute(query, (int(min_val * 100), int(max_val * 100)))
-                matching = {row[0] for row in cur.fetchall()}
-                allowed_contigs &= matching
+                conditions.append("Coverage_variation >= ? AND Coverage_variation <= ?")
+                params.extend([min_val, max_val])
 
-        # Apply completeness filters (range sliders) - prevalence stored as INTEGER ×100
+        if conditions:
+            query = f"SELECT DISTINCT Contig_name FROM Explicit_presences WHERE {' AND '.join(conditions)}"
+            cur.execute(query, params)
+            matching = {row[0] for row in cur.fetchall()}
+            allowed_contigs &= matching
+
+        # Apply completeness filters using Explicit_completeness view (single combined query)
+        conditions = []
+        params = []
+
         if prevalence_left_slider is not None:
             min_val, max_val = prevalence_left_slider.value
             if min_val > 0 or max_val < 100:
-                # Multiply by 100 to match stored INTEGER values
-                query = """
-                    SELECT DISTINCT Contig.Contig_name
-                    FROM Completeness comp
-                    JOIN Contig ON comp.Contig_id = Contig.Contig_id
-                    WHERE comp.Prevalence_completeness_left >= ? AND comp.Prevalence_completeness_left <= ?
-                """
-                cur.execute(query, (int(min_val * 100), int(max_val * 100)))
-                matching = {row[0] for row in cur.fetchall()}
-                allowed_contigs &= matching
+                conditions.append("Prevalence_completeness_left >= ? AND Prevalence_completeness_left <= ?")
+                params.extend([min_val, max_val])
 
         if prevalence_right_slider is not None:
             min_val, max_val = prevalence_right_slider.value
             if min_val > 0 or max_val < 100:
-                # Multiply by 100 to match stored INTEGER values
-                query = """
-                    SELECT DISTINCT Contig.Contig_name
-                    FROM Completeness comp
-                    JOIN Contig ON comp.Contig_id = Contig.Contig_id
-                    WHERE comp.Prevalence_completeness_right >= ? AND comp.Prevalence_completeness_right <= ?
-                """
-                cur.execute(query, (int(min_val * 100), int(max_val * 100)))
-                matching = {row[0] for row in cur.fetchall()}
-                allowed_contigs &= matching
+                conditions.append("Prevalence_completeness_right >= ? AND Prevalence_completeness_right <= ?")
+                params.extend([min_val, max_val])
 
         if pct_completeness_slider is not None:
             min_val, max_val = pct_completeness_slider.value
             if min_val > 0 or max_val < 100:
-                query = """
-                    SELECT DISTINCT c.Contig_name
-                    FROM Completeness comp
-                    JOIN Contig c ON comp.Contig_id = c.Contig_id
-                    WHERE (100 - ((COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_insertions, 0) + COALESCE(comp.Total_reads_clipped, 0)) * 100.0 / c.Contig_length)) >= ?
-                      AND (100 - ((COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_insertions, 0) + COALESCE(comp.Total_reads_clipped, 0)) * 100.0 / c.Contig_length)) <= ?
-                """
-                cur.execute(query, (min_val, max_val))
-                matching = {row[0] for row in cur.fetchall()}
-                allowed_contigs &= matching
+                conditions.append("Percentage_completeness >= ? AND Percentage_completeness <= ?")
+                params.extend([min_val, max_val])
 
         if pct_contamination_slider is not None:
             min_val, max_val = pct_contamination_slider.value
-            if min_val > 0 or max_val < 100:
-                query = """
-                    SELECT DISTINCT c.Contig_name
-                    FROM Completeness comp
-                    JOIN Contig c ON comp.Contig_id = c.Contig_id
-                    WHERE ((COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_deletions, 0) + COALESCE(comp.Total_reference_clipped, 0)) * 100.0 / c.Contig_length) >= ?
-                      AND ((COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_deletions, 0) + COALESCE(comp.Total_reference_clipped, 0)) * 100.0 / c.Contig_length) <= ?
-                """
-                cur.execute(query, (min_val, max_val))
-                matching = {row[0] for row in cur.fetchall()}
-                allowed_contigs &= matching
+            conta_max = widgets['whole_contamination_max']
+            if min_val > 0 or max_val < conta_max:
+                conditions.append("Percentage_contamination >= ? AND Percentage_contamination <= ?")
+                params.extend([min_val, max_val])
 
-        # Apply phage mechanism filter if a mechanism is selected (not "No_packaging")
-        if phage_mechanism_filter is not None and phage_mechanism_filter.value != "No_packaging":
-            selected_mechanism = phage_mechanism_filter.value
+        if conditions:
+            query = f"SELECT DISTINCT Contig_name FROM Explicit_completeness WHERE {' AND '.join(conditions)}"
+            cur.execute(query, params)
+            matching = {row[0] for row in cur.fetchall()}
+            allowed_contigs &= matching
+
+        # Apply phage mechanism filter using Explicit_phage_mechanisms view
+        if phage_mechanism_filter is not None and phage_mechanism_filter.value:
             query = """
-                SELECT DISTINCT Contig.Contig_name
-                FROM PhageMechanisms pm
-                JOIN Contig ON pm.Contig_id = Contig.Contig_id
-                WHERE pm.Phage_packaging_mechanism = ?
+                SELECT DISTINCT Contig_name
+                FROM Explicit_phage_mechanisms
+                WHERE Phage_packaging_mechanism = ?
             """
-            cur.execute(query, (selected_mechanism,))
+            cur.execute(query, (phage_mechanism_filter.value,))
             matching = {row[0] for row in cur.fetchall()}
             allowed_contigs &= matching
 
@@ -496,107 +473,73 @@ def modify_doc_factory(db_path):
         allowed_samples = set(orig_samples)
         cur = conn.cursor()
 
-        # Apply coverage percentage filter (stored as INTEGER ×100)
+        # Apply coverage filters using Explicit_presences view (single combined query)
+        conditions = []
+        params = []
+
         if coverage_percentage_slider is not None:
             min_val, max_val = coverage_percentage_slider.value
             if min_val > 0 or max_val < 100:
-                # Multiply by 100 to match stored INTEGER values
-                query = """
-                    SELECT DISTINCT Sample.Sample_name
-                    FROM Presences p
-                    JOIN Sample ON p.Sample_id = Sample.Sample_id
-                    WHERE p.Coverage_percentage >= ? AND p.Coverage_percentage <= ?
-                """
-                cur.execute(query, (int(min_val * 100), int(max_val * 100)))
-                matching = {row[0] for row in cur.fetchall()}
-                allowed_samples &= matching
+                conditions.append("Coverage_percentage >= ? AND Coverage_percentage <= ?")
+                params.extend([min_val, max_val])
 
-        # Apply coverage variation filter (stored as INTEGER ×100)
         if coverage_variation_slider is not None:
             min_val, max_val = coverage_variation_slider.value
             cov_var_min = widgets['coverage_variation_min']
             cov_var_max = widgets['coverage_variation_max']
             if min_val > cov_var_min or max_val < cov_var_max:
-                # Multiply by 100 to match stored INTEGER values
-                query = """
-                    SELECT DISTINCT Sample.Sample_name
-                    FROM Presences p
-                    JOIN Sample ON p.Sample_id = Sample.Sample_id
-                    WHERE p.Coverage_variation >= ? AND p.Coverage_variation <= ?
-                """
-                cur.execute(query, (int(min_val * 100), int(max_val * 100)))
-                matching = {row[0] for row in cur.fetchall()}
-                allowed_samples &= matching
+                conditions.append("Coverage_variation >= ? AND Coverage_variation <= ?")
+                params.extend([min_val, max_val])
 
-        # Apply completeness filters (range sliders) - prevalence stored as INTEGER ×100
+        if conditions:
+            query = f"SELECT DISTINCT Sample_name FROM Explicit_presences WHERE {' AND '.join(conditions)}"
+            cur.execute(query, params)
+            matching = {row[0] for row in cur.fetchall()}
+            allowed_samples &= matching
+
+        # Apply completeness filters using Explicit_completeness view (single combined query)
+        conditions = []
+        params = []
+
         if prevalence_left_slider is not None:
             min_val, max_val = prevalence_left_slider.value
             if min_val > 0 or max_val < 100:
-                # Multiply by 100 to match stored INTEGER values
-                query = """
-                    SELECT DISTINCT Sample.Sample_name
-                    FROM Completeness comp
-                    JOIN Sample ON comp.Sample_id = Sample.Sample_id
-                    WHERE comp.Prevalence_completeness_left >= ? AND comp.Prevalence_completeness_left <= ?
-                """
-                cur.execute(query, (int(min_val * 100), int(max_val * 100)))
-                matching = {row[0] for row in cur.fetchall()}
-                allowed_samples &= matching
+                conditions.append("Prevalence_completeness_left >= ? AND Prevalence_completeness_left <= ?")
+                params.extend([min_val, max_val])
 
         if prevalence_right_slider is not None:
             min_val, max_val = prevalence_right_slider.value
             if min_val > 0 or max_val < 100:
-                # Multiply by 100 to match stored INTEGER values
-                query = """
-                    SELECT DISTINCT Sample.Sample_name
-                    FROM Completeness comp
-                    JOIN Sample ON comp.Sample_id = Sample.Sample_id
-                    WHERE comp.Prevalence_completeness_right >= ? AND comp.Prevalence_completeness_right <= ?
-                """
-                cur.execute(query, (int(min_val * 100), int(max_val * 100)))
-                matching = {row[0] for row in cur.fetchall()}
-                allowed_samples &= matching
+                conditions.append("Prevalence_completeness_right >= ? AND Prevalence_completeness_right <= ?")
+                params.extend([min_val, max_val])
 
         if pct_completeness_slider is not None:
             min_val, max_val = pct_completeness_slider.value
             if min_val > 0 or max_val < 100:
-                query = """
-                    SELECT DISTINCT s.Sample_name
-                    FROM Completeness comp
-                    JOIN Sample s ON comp.Sample_id = s.Sample_id
-                    JOIN Contig c ON comp.Contig_id = c.Contig_id
-                    WHERE (100 - ((COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_insertions, 0) + COALESCE(comp.Total_reads_clipped, 0)) * 100.0 / c.Contig_length)) >= ?
-                      AND (100 - ((COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_insertions, 0) + COALESCE(comp.Total_reads_clipped, 0)) * 100.0 / c.Contig_length)) <= ?
-                """
-                cur.execute(query, (min_val, max_val))
-                matching = {row[0] for row in cur.fetchall()}
-                allowed_samples &= matching
+                conditions.append("Percentage_completeness >= ? AND Percentage_completeness <= ?")
+                params.extend([min_val, max_val])
 
         if pct_contamination_slider is not None:
             min_val, max_val = pct_contamination_slider.value
-            if min_val > 0 or max_val < 100:
-                query = """
-                    SELECT DISTINCT s.Sample_name
-                    FROM Completeness comp
-                    JOIN Sample s ON comp.Sample_id = s.Sample_id
-                    JOIN Contig c ON comp.Contig_id = c.Contig_id
-                    WHERE ((COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_deletions, 0) + COALESCE(comp.Total_reference_clipped, 0)) * 100.0 / c.Contig_length) >= ?
-                      AND ((COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_deletions, 0) + COALESCE(comp.Total_reference_clipped, 0)) * 100.0 / c.Contig_length) <= ?
-                """
-                cur.execute(query, (min_val, max_val))
-                matching = {row[0] for row in cur.fetchall()}
-                allowed_samples &= matching
+            conta_max = widgets['whole_contamination_max']
+            if min_val > 0 or max_val < conta_max:
+                conditions.append("Percentage_contamination >= ? AND Percentage_contamination <= ?")
+                params.extend([min_val, max_val])
 
-        # Apply phage mechanism filter if a mechanism is selected (not "No_packaging")
-        if phage_mechanism_filter is not None and phage_mechanism_filter.value != "No_packaging":
-            selected_mechanism = phage_mechanism_filter.value
+        if conditions:
+            query = f"SELECT DISTINCT Sample_name FROM Explicit_completeness WHERE {' AND '.join(conditions)}"
+            cur.execute(query, params)
+            matching = {row[0] for row in cur.fetchall()}
+            allowed_samples &= matching
+
+        # Apply phage mechanism filter using Explicit_phage_mechanisms view
+        if phage_mechanism_filter is not None and phage_mechanism_filter.value:
             query = """
-                SELECT DISTINCT Sample.Sample_name
-                FROM PhageMechanisms pm
-                JOIN Sample ON pm.Sample_id = Sample.Sample_id
-                WHERE pm.Phage_packaging_mechanism = ?
+                SELECT DISTINCT Sample_name
+                FROM Explicit_phage_mechanisms
+                WHERE Phage_packaging_mechanism = ?
             """
-            cur.execute(query, (selected_mechanism,))
+            cur.execute(query, (phage_mechanism_filter.value,))
             matching = {row[0] for row in cur.fetchall()}
             allowed_samples &= matching
 
@@ -977,13 +920,12 @@ def modify_doc_factory(db_path):
         coverage_percentage_slider.on_change('value', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
         filtering_children.append(coverage_percentage_slider)
 
-        cov_var_min = widgets['coverage_variation_min']
-        cov_var_max = widgets['coverage_variation_max']
+        cov_var_min = min(0, widgets['coverage_variation_min'])
+        cov_var_max = max(100, widgets['coverage_variation_max'])
         # Round for nice slider values
-        cov_var_step = max(0.01, (cov_var_max - cov_var_min) / 100)
         coverage_variation_slider = RangeSlider(
-            start=cov_var_min, end=cov_var_max, value=(cov_var_min, cov_var_max), step=cov_var_step,
-            title="Coverage variation",
+            start=cov_var_min, end=cov_var_max, value=(cov_var_min, cov_var_max), step=1,
+            title="Coverage variation (%)",
             sizing_mode="stretch_width"
         )
         coverage_variation_slider.on_change('value', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
@@ -1012,8 +954,9 @@ def modify_doc_factory(db_path):
             )
             pct_completeness_slider.on_change('value', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
 
+            conta_max = max(100, widgets['whole_contamination_max'])
             pct_contamination_slider = RangeSlider(
-                start=0, end=100, value=(0, 100), step=1,
+                start=0, end=conta_max, value=(0, conta_max), step=1,
                 title="Whole contamination (%)",
                 sizing_mode="stretch_width"
             )
@@ -1030,8 +973,8 @@ def modify_doc_factory(db_path):
         if widgets['phage_mechanisms']:
             phage_label = Div(text="Phage mechanism:", margin=(5, 0, 0, 10))
             phage_mechanism_filter = Select(
-                options=["No_packaging"] + widgets['phage_mechanisms'],
-                value="No_packaging",   # default = no filter
+                options=[""] + widgets['phage_mechanisms'],
+                value="",   # default = no filter (empty = all)
                 sizing_mode="stretch_width",
             )
             phage_mechanism_filter.on_change('value', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))

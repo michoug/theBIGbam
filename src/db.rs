@@ -139,8 +139,8 @@ impl DbWriter {
         for p in presences {
             if let Some(&contig_id) = self.contig_name_to_id.get(&p.contig_name) {
                 // Store coverage_percentage and coverage_variation as integers (×100)
-                let cov_pct = (p.coverage_pct * 100.0).round() as i32;
-                let cov_var = (p.coverage_variation * 100.0).round() as i32;
+                let cov_pct = p.coverage_pct.round() as i32;
+                let cov_var = p.coverage_variation.round() as i32;
                 appender.append_row(params![contig_id, sample_id, cov_pct, cov_var])?;
             }
         }
@@ -181,9 +181,9 @@ impl DbWriter {
         for data in completeness {
             if data.has_data() {
                 if let Some(&contig_id) = self.contig_name_to_id.get(&data.contig_name) {
-                    // Store prevalences as integers (×100)
-                    let prev_left = data.prevalence_left.map(|v| (v * 100.0).round() as i32);
-                    let prev_right = data.prevalence_right.map(|v| (v * 100.0).round() as i32);
+                    // Store prevalences as integers (already percentages)
+                    let prev_left = data.prevalence_left.map(|v| v.round() as i32);
+                    let prev_right = data.prevalence_right.map(|v| v.round() as i32);
                     // Store totals as integers (already counts or small values)
                     let total_mm = data.total_mismatches.map(|v| v.round() as i32);
                     let total_del = data.total_deletions.map(|v| v.round() as i32);
@@ -408,15 +408,17 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
     )
     .context("Failed to create Duplications table")?;
 
-    // Completeness table - prevalences stored as INTEGER (×100), totals as INTEGER
+    // Completeness table - clipping prevalences stored as INTEGER (×100), totals as INTEGER
+    // Note: Prevalence_clippings_* stores clipping_count/coverage (raw clipping prevalence)
+    // The Explicit_completeness VIEW derives completeness as: 1 - clipping_prevalence
     conn.execute(
         "CREATE TABLE Completeness (
             Contig_id INTEGER,
             Sample_id INTEGER,
-            Prevalence_completeness_left INTEGER,
+            Prevalence_clippings_left INTEGER,
             Distance_contaminated_left INTEGER,
             Min_missing_left INTEGER,
-            Prevalence_completeness_right INTEGER,
+            Prevalence_clippings_right INTEGER,
             Distance_contaminated_right INTEGER,
             Min_missing_right INTEGER,
             Total_mismatches INTEGER,
@@ -673,8 +675,8 @@ fn create_views(conn: &Connection) -> Result<()> {
          SELECT
              c.Contig_name,
              s.Sample_name,
-             p.Coverage_percentage / 100.0 AS Coverage_percentage,
-             p.Coverage_variation / 100.0 AS Coverage_variation
+             p.Coverage_percentage AS Coverage_percentage,
+             p.Coverage_variation AS Coverage_variation
          FROM Presences p
          JOIN Contig c ON p.Contig_id = c.Contig_id
          JOIN Sample s ON p.Sample_id = s.Sample_id",
@@ -688,7 +690,7 @@ fn create_views(conn: &Connection) -> Result<()> {
          SELECT
              c.Contig_name,
              s.Sample_name,
-             p.Coverage_percentage / 100.0 AS Coverage_percentage,
+             p.Coverage_percentage AS Coverage_percentage,
              m.Phage_packaging_mechanism,
              m.Phage_left_terminus,
              m.Phage_right_terminus,
@@ -703,16 +705,17 @@ fn create_views(conn: &Connection) -> Result<()> {
     )
     .context("Failed to create Explicit_phage_mechanisms VIEW")?;
 
-    // Explicit_completeness VIEW - divide prevalences by 100.0
+    // Explicit_completeness VIEW - derives completeness from clipping prevalence
+    // Completeness = 1 - clipping_prevalence (higher clipping = lower completeness)
     conn.execute(
         "CREATE VIEW Explicit_completeness AS
          SELECT
              c.Contig_name,
              s.Sample_name,
-             comp.Prevalence_completeness_left / 100.0 AS Prevalence_completeness_left,
+             100 - comp.Prevalence_clippings_left AS Prevalence_completeness_left,
              comp.Distance_contaminated_left,
              comp.Min_missing_left,
-             comp.Prevalence_completeness_right / 100.0 AS Prevalence_completeness_right,
+             100 - comp.Prevalence_clippings_right AS Prevalence_completeness_right,
              comp.Distance_contaminated_right,
              comp.Min_missing_right,
              comp.Total_mismatches,
@@ -721,9 +724,15 @@ fn create_views(conn: &Connection) -> Result<()> {
              comp.Total_reads_clipped,
              comp.Total_reference_clipped,
              COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_insertions, 0) + COALESCE(comp.Total_reads_clipped, 0) AS Score_completeness,
-             CASE WHEN c.Contig_length > 0 THEN 100.0 - ((COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_insertions, 0) + COALESCE(comp.Total_reads_clipped, 0)) * 100.0 / c.Contig_length) ELSE NULL END AS Percentage_completeness,
+             CASE WHEN c.Contig_length > 0 THEN ROUND(
+                100 - (
+                    (COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_insertions, 0) + COALESCE(comp.Total_reads_clipped, 0)) * 100 / c.Contig_length
+                )
+             )::INTEGER ELSE NULL END AS Percentage_completeness,
              COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_deletions, 0) + COALESCE(comp.Total_reference_clipped, 0) AS Score_contamination,
-             CASE WHEN c.Contig_length > 0 THEN (COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_deletions, 0) + COALESCE(comp.Total_reference_clipped, 0)) * 100.0 / c.Contig_length ELSE NULL END AS Percentage_contamination
+             CASE WHEN c.Contig_length > 0 THEN ROUND(
+                (COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_deletions, 0) + COALESCE(comp.Total_reference_clipped, 0)) * 100 / c.Contig_length
+             )::INTEGER ELSE NULL END AS Percentage_contamination
          FROM Completeness comp
          JOIN Contig c ON comp.Contig_id = c.Contig_id
          JOIN Sample s ON comp.Sample_id = s.Sample_id",
@@ -849,22 +858,4 @@ pub fn parse_autoblast_file(path: &Path) -> Result<Vec<DuplicationData>> {
     }
 
     Ok(duplications)
-}
-
-// ============================================================================
-// Legacy API - for backward compatibility during migration
-// ============================================================================
-
-/// Create the main database with schema and initial data.
-/// This is the legacy API - prefer using DbWriter::create() for new code.
-pub fn create_metadata_db(
-    db_path: &Path,
-    contigs: &[ContigInfo],
-    annotations: &[FeatureAnnotation],
-    _create_indexes: bool, // Ignored - DuckDB doesn't need explicit indexes
-) -> Result<()> {
-    // Just create an empty database with schema
-    let writer = DbWriter::create(db_path, contigs, annotations)?;
-    writer.finalize()?;
-    Ok(())
 }

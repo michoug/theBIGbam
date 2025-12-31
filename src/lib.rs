@@ -38,7 +38,7 @@ pub use circular::{increment_circular, increment_range};
 pub use compress::compress_signal_with_reference;
 pub use features::{process_read, FeatureArrays, ModuleFlags};
 pub use genbank::parse_genbank;
-pub use processing::{process_sample, run_all_samples, ProcessConfig, ProcessResult};
+pub use processing::{run_all_samples, ProcessConfig};
 pub use processing_phage_packaging::PhageTerminiConfig;
 pub use types::{
     mean_std, ContigInfo, FeaturePoint, PlotType, PresenceData, SequencingType,
