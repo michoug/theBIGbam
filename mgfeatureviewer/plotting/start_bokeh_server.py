@@ -15,6 +15,7 @@ from .plotting_data_per_sample import generate_bokeh_plot_per_sample
 from .plotting_data_all_samples import generate_bokeh_plot_all_samples
 
 def build_controls(conn):
+
     """Query DB and return widgets and helper mappings."""
     cur = conn.cursor()
 
@@ -29,8 +30,8 @@ def build_controls(conn):
     # Check if Completeness table exists and has data
     has_completeness = False
     try:
-        cur.execute("SELECT COUNT(*) FROM Completeness")
-        has_completeness = cur.fetchone()[0] > 0
+        cur.execute("SELECT 1 FROM Completeness LIMIT 1")
+        has_completeness = cur.fetchone() is not None
     except Exception:
         pass
 
@@ -110,21 +111,23 @@ def build_controls(conn):
 
     tables_with_data = set()
     for table_name in feature_tables:
-        try:
-            # Check if table has any rows with non-zero values (not just any rows)
-            cur.execute(f"SELECT COUNT(*) FROM {table_name} WHERE Value > 0")
-            count = cur.fetchone()[0]
-            if count > 0:
-                tables_with_data.add(table_name)
-        except Exception:
-            # Table might not exist, skip it
-            continue
+        tables_with_data.add(table_name)
+        # TO-DO: it takes a lot of time and memory to check each table for non-zero values, so skip this check for now
+        #try:
+        #    # Check if table has any rows with non-zero values (not just any rows)
+        #    cur.execute(f"SELECT 1 FROM {table_name} WHERE Value > 0 LIMIT 1")
+        #    count = cur.fetchone() is not None
+        #    if count:
+        #        tables_with_data.add(table_name)
+        #except Exception:
+        #    # Table might not exist, skip it
+        #    continue
 
     # Check if Duplications table has data
     # Add Feature_duplications to tables_with_data so duplications variable is included
     try:
-        cur.execute("SELECT COUNT(*) FROM Duplications")
-        if cur.fetchone()[0] > 0:
+        cur.execute("SELECT 1 FROM Duplications LIMIT 1")
+        if cur.fetchone() is not None:
             tables_with_data.add("Feature_duplications")
     except Exception:
         pass
