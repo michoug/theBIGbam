@@ -695,45 +695,97 @@ pub fn process_read(
     // Phagetermini module - primary mappings only
     // -------------------------------------------------------------------------
     if flags.phagetermini && !is_secondary && !is_supplementary {
-        // For long reads, we also check the end for clipping/mismatches
-        let check_end = seq_type.is_long();
-
         // Check if read has clean alignment at start (no clip/mismatch)
         // raw_has_match_at_position checks both CIGAR and MD tag
         let start_matches = raw_has_match_at_position(cigar_raw, md_tag, !is_reverse);
-        // For long reads also check if read has clean alignment at end (no clip/mismatch)
-        let end_matches = !check_end || raw_has_match_at_position(cigar_raw, md_tag, is_reverse);
 
-        // Only count "clean" primary reads for phage termini detection
-        if start_matches && end_matches {
-            // Update coverage_reduced (clean coverage from primary mappings only)
-            // Note: end is exclusive (one past last position), so use non-inclusive increment
-            if circular {
-                if seq_type.is_long() {
-                    increment_circular_long(&mut arrays.coverage_reduced, raw_start, raw_end, 1);
-                } else {
-                    increment_circular(&mut arrays.coverage_reduced, start, end, 1);
+        if seq_type.is_long() {
+            // Long reads: split read in half and check each terminus independently
+            // This avoids losing ~80% of reads that have clipping at one end
+            let end_matches = raw_has_match_at_position(cigar_raw, md_tag, is_reverse);
+            let midpoint = (raw_start as usize + raw_end as usize) / 2;
+
+            // Coverage: split based on which termini match
+            // - Both match: full read coverage
+            // - Only start: coverage from start to midpoint
+            // - Only end: coverage from midpoint to end
+            match (start_matches, end_matches) {
+                (true, true) => {
+                    // Both termini match: count full read coverage
+                    if circular {
+                        increment_circular_long(&mut arrays.coverage_reduced, raw_start, raw_end, 1);
+                    } else {
+                        increment_range(&mut arrays.coverage_reduced, start, end, 1);
+                    }
                 }
-            } else {
-                increment_range(&mut arrays.coverage_reduced, start, end, 1);
+                (true, false) => {
+                    // Only start matches: count first half coverage
+                    if circular {
+                        increment_circular_long(&mut arrays.coverage_reduced, raw_start, midpoint, 1);
+                    } else {
+                        increment_range(&mut arrays.coverage_reduced, start, midpoint, 1);
+                    }
+                }
+                (false, true) => {
+                    // Only end matches: count second half coverage
+                    if circular {
+                        increment_circular_long(&mut arrays.coverage_reduced, midpoint, raw_end, 1);
+                    } else {
+                        increment_range(&mut arrays.coverage_reduced, midpoint % ref_length, end, 1);
+                    }
+                }
+                (false, false) => {
+                    // Neither matches: no coverage counted
+                }
             }
 
-            // Track start/end positions by strand
-            // We separate strands here; they're combined in finalize_strands()
-            // Note: 'end' is exclusive, so the actual last position is end-1
-            let end_pos = if end > 0 {
-                let pos = end - 1;
-                if circular { pos % ref_length } else { pos }
-            } else {
-                0
-            };
+            // Count start position only if start matches
+            if start_matches {
+                if is_reverse {
+                    arrays.start_minus[start] += 1;
+                } else {
+                    arrays.start_plus[start] += 1;
+                }
+            }
 
-            if is_reverse {
-                arrays.start_minus[start] += 1;
-                arrays.end_minus[end_pos] += 1;
-            } else {
-                arrays.start_plus[start] += 1;
-                arrays.end_plus[end_pos] += 1;
+            // Count end position only if end matches
+            if end_matches {
+                let end_pos = if end > 0 {
+                    let pos = end - 1;
+                    if circular { pos % ref_length } else { pos }
+                } else {
+                    0
+                };
+
+                if is_reverse {
+                    arrays.end_minus[end_pos] += 1;
+                } else {
+                    arrays.end_plus[end_pos] += 1;
+                }
+            }
+        } else {
+            // Short reads: only check start, count both positions if valid
+            if start_matches {
+                if circular {
+                    increment_circular(&mut arrays.coverage_reduced, start, end, 1);
+                } else {
+                    increment_range(&mut arrays.coverage_reduced, start, end, 1);
+                }
+
+                let end_pos = if end > 0 {
+                    let pos = end - 1;
+                    if circular { pos % ref_length } else { pos }
+                } else {
+                    0
+                };
+
+                if is_reverse {
+                    arrays.start_minus[start] += 1;
+                    arrays.end_minus[end_pos] += 1;
+                } else {
+                    arrays.start_plus[start] += 1;
+                    arrays.end_plus[end_pos] += 1;
+                }
             }
         }
     }
