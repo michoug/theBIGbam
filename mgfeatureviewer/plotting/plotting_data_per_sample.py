@@ -368,6 +368,51 @@ def get_repeats_data(cur, contig_id, variable_name="direct_repeats"):
     }]
 
 
+def merge_rle_segments(plus_rows, minus_rows):
+    """Merge two RLE-encoded arrays by summing overlapping values.
+
+    Args:
+        plus_rows: List of (first, last, value) tuples from plus strand
+        minus_rows: List of (first, last, value) tuples from minus strand
+
+    Returns:
+        List of (first, last, combined_value) tuples with merged segments
+    """
+    # Collect all boundaries from both sources
+    boundaries = set()
+    for first, last, _ in plus_rows:
+        boundaries.add(first)
+        boundaries.add(last + 1)
+    for first, last, _ in minus_rows:
+        boundaries.add(first)
+        boundaries.add(last + 1)
+
+    if not boundaries:
+        return []
+
+    # Create segments from sorted boundaries
+    sorted_bounds = sorted(boundaries)
+    result = []
+
+    for i in range(len(sorted_bounds) - 1):
+        seg_start = sorted_bounds[i]
+        seg_end = sorted_bounds[i + 1] - 1
+
+        # Sum values from both strands that cover this segment
+        value = 0
+        for first, last, val in plus_rows:
+            if first <= seg_start and last >= seg_end:
+                value += val
+        for first, last, val in minus_rows:
+            if first <= seg_start and last >= seg_end:
+                value += val
+
+        if value > 0:
+            result.append((seg_start, seg_end, value))
+
+    return result
+
+
 ### Function to get features of one variable
 def get_feature_data(cur, feature, contig_id, sample_id):
     """Get feature data for plotting.
@@ -410,20 +455,39 @@ def get_feature_data(cur, feature, contig_id, sample_id):
         scaled_features = ["Feature_tau", "Feature_mapq"]
         is_scaled = feature_table in scaled_features
 
+        # Special handling for primary_reads: combine strand tables in Python
+        # This avoids the OOM issues from the complex VIEW that computes on-the-fly
+        if feature_table == "Feature_primary_reads":
+            cur.execute(
+                "SELECT First_position, Last_position, Value FROM Feature_primary_reads_plus_only "
+                "WHERE Sample_id=? AND Contig_id=? ORDER BY First_position",
+                (sample_id, contig_id)
+            )
+            plus_rows = cur.fetchall()
+
+            cur.execute(
+                "SELECT First_position, Last_position, Value FROM Feature_primary_reads_minus_only "
+                "WHERE Sample_id=? AND Contig_id=? ORDER BY First_position",
+                (sample_id, contig_id)
+            )
+            minus_rows = cur.fetchall()
+
+            data_rows = merge_rle_segments(plus_rows, minus_rows)
         # Query Feature_* table (RLE format: First_position, Last_position, Value, and optionally Mean, Median, Std)
-        if has_stats:
+        elif has_stats:
             cur.execute(
                 f"SELECT First_position, Last_position, Value, Mean, Median, Std FROM {feature_table} "
                 "WHERE Sample_id=? AND Contig_id=? ORDER BY First_position",
                 (sample_id, contig_id)
             )
+            data_rows = cur.fetchall()
         else:
             cur.execute(
                 f"SELECT First_position, Last_position, Value FROM {feature_table} "
                 "WHERE Sample_id=? AND Contig_id=? ORDER BY First_position",
                 (sample_id, contig_id)
             )
-        data_rows = cur.fetchall()
+            data_rows = cur.fetchall()
 
         # Expand RLE runs into individual points for plotting
         x_coords = []

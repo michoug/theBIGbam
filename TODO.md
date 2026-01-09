@@ -4,6 +4,7 @@
 
 ## On computation:
 - Threads param from calculate do not seem to work it is overriden by number threads i give with cluster
+- Erase table if no data in it it takes a lot of time and memory to check each table for non-zero values, so skip this check for now?
 
 ## On compressing:
 - Check RLE acts symmetrically if I turn a contig around: there should be no difference in compression
@@ -37,9 +38,6 @@ contig likely microdiverse (clippings, insertions, deletions, mismatches that do
 - Allow inner autocomplete, not only for works starting with words typed?
 
 ## On phage termini:
-- To avoid losing so many reads at the termini spot, find a way to keep reads if one end starts with a match (rather than both ends). Maybe a way is to split long reads in 2? or keep only first 1000 bp on both sides?
-- Why so many clippings for long reads at the termini spot? would help to keep only first 1000bp of long reads?
-- Maybe I should accept tiny clippings for long reads, instead of having exact_read_match -> relax a bit the threshold
 - I should understand where all reads start, sometimes weird that starts+clippings do not bring all answers
 - Problem when start_reads one bp away from other start_reads but on the other side and in a duplication -> becomes one duplication away and thus not merged
 - Phage packaging determination affected by coverage_percentage maybe should not
@@ -47,6 +45,11 @@ contig likely microdiverse (clippings, insertions, deletions, mismatches that do
 - Normally reads covering a position RP = reads starting with a match RM + reads starting with a clipping RC -> I could a check like that telling how reads start of average
 - For long reads i lose SO MANY of the reads by forcing the read to start with a match: about 80% of the reads lost because of that for nanopore! Need to be more tolerant with reads i consider and allow some clippings?
 - Plutôt que de regarder zones de départ pourquoi ne pas regarder reads qui crossent tel/tel endroit -> I should be able to know how each read is starting and based on that i can have view to calculate percentage or reads passing each spot (number starting there divided by number continuing-ish)
+- Instead of only coverage_reduced i could separate between + and - strands as well
+- Coverage_percentage should be close to 100% to establish termini!
+subsampled_illumina_random_P1_SRR5042723_1_mapped_on_combined_assemblies     │ NC_000929.1_Mu            │ DTR_long_5' because phage termini inferred despite low coverage (coverage_percentage=56%)
+- Separate params phageterm de compression parameters
+- Say that if too much coverage variation I cannot conclude safely on phage packaging: raise warning or stop?
 
 # Utils:
 
@@ -74,13 +77,18 @@ contig likely microdiverse (clippings, insertions, deletions, mismatches that do
 
 # On visualization:
 - Small bug per-variable -> if i click directly on Contig field list of contigs is not actualised
-- Sometimes autocomplete for Contig field (and others?) do not work at first use but work after clicking away and coming back
+- Sometimes autocomplete for Contig field (and others?) do not work at first use but work after clicking away and coming back: when bugged if i pick again a sample it works in visualisation?
 - Non_inward_pairs, mate_not_mapped, mate_on_another_contig are Curves in plots, can we see it when small range from from far away?
 - If no genbank provided you should not show gene map option
 - Filter to only show part of the contig possible (from bp x to bp y) -> could be very useful for eukaryotic contigs
 - Filter contigs by genes present to look for a specific function for example
 - Make 2 buttons instead of just Apply: "Peruse" and "Plot". Peruse lets you see one tables with as many columns as plots requested. Plus show general statistics associated to this contig in this sample at the top. Similarly adapted for All-samples view with table showing differents statistics per samples as well
 - Possibility to extract tables with data as well
+- Be able to slide down in lists contigs and samples -> pagination
+- Flavobacterium147_T9_12_phage2 -> no sites kept because many small site -> i could plot sites post termini classification via view? idea highlight on plot of phagetermini via point or similar?
+- When i click on gene also have gray associated areas in subplots?
+- Show loading logo when waiting for plot to be generated
+- Change title Bokeh Application in the web page
 
 # On publication: 
 
@@ -96,3 +104,5 @@ contig likely microdiverse (clippings, insertions, deletions, mismatches that do
 - Beware what is what is written in sam: is mapping from read or contig point of view? refer to SAM documentation
 - Specify that you need MD tag in mappings for phagetermini, add warming if MD not found
 - Docu on metrics like coverage variation (how calculated?), completeness, contamination...
+- Beware to keep circular option for both mapping and calculate!
+- Say circular necessary for phagetermini because?

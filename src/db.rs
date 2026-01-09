@@ -642,6 +642,9 @@ fn create_variable_tables(conn: &Connection) -> Result<()> {
 /// Create views after all data is inserted.
 fn create_views(conn: &Connection) -> Result<()> {
     // Create a VIEW that computes primary_reads as sum of plus and minus strands
+    // NOTE: The Bokeh server now bypasses this VIEW by computing in Python
+    // (merging Feature_primary_reads_plus_only + Feature_primary_reads_minus_only)
+    // to avoid OOM issues. This VIEW is kept for backward compatibility.
     conn.execute(
         "CREATE VIEW Feature_primary_reads AS
          WITH
