@@ -1207,20 +1207,17 @@ def modify_doc_factory(db_path):
     if genome_index_one is not None:
         # Get Genome module info
         genome_help_tooltip = widgets['helps_widgets'][genome_index_one]
-        genome_module_widget = widgets['module_widgets_one'][genome_index_one]
 
-        # Build single Genome section (shared between One Sample and All Samples views)
-        genome_toggle_btn = Button(label="▶", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
-        genome_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
-
+        # Build simple Genome section header (no collapse needed - Contigs section handles that)
+        genome_title = Div(text="<b>Plot genomic features:</b>", align="center")
+        
         if genome_help_tooltip is not None:
             help_btn = HelpButton(tooltip=genome_help_tooltip, width=20, height=20, align="center", button_type="light", stylesheets=[toggle_stylesheet])
-            genome_hdr = row(genome_toggle_btn, genome_module_widget, help_btn, sizing_mode="stretch_width", align="center")
+            genome_hdr = row(genome_title, help_btn, sizing_mode="stretch_width", align="center")
         else:
-            genome_hdr = row(genome_toggle_btn, genome_module_widget, sizing_mode="stretch_width", align="center")
+            genome_hdr = genome_title
 
-        genome_cbg_one.visible = False
-        genome_toggle_btn.on_click(make_toggle_callback(genome_toggle_btn, genome_cbg_one))
+        genome_cbg_one.visible = True
         genome_section = column(genome_hdr, genome_cbg_one, visible=True, sizing_mode="stretch_width")
 
     # Add Genome section to contig_content
