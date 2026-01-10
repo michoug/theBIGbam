@@ -122,16 +122,6 @@ def build_controls(conn):
     tables_with_data = set()
     for table_name in feature_tables:
         tables_with_data.add(table_name)
-        # TO-DO: it takes a lot of time and memory to check each table for non-zero values, so skip this check for now
-        #try:
-        #    # Check if table has any rows with non-zero values (not just any rows)
-        #    cur.execute(f"SELECT 1 FROM {table_name} WHERE Value > 0 LIMIT 1")
-        #    count = cur.fetchone() is not None
-        #    if count:
-        #        tables_with_data.add(table_name)
-        #except Exception:
-        #    # Table might not exist, skip it
-        #    continue
 
     # Check if repeat tables have data
     # Add table names to tables_with_data so repeat variables are included
