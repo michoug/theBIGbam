@@ -701,7 +701,7 @@ def modify_doc_factory(db_path):
         # Toggle Sample section - hide entirely in All Samples view
         separator_samples.visible = not is_all
         sample_header.visible = not is_all
-        sample_content.visible = not is_all
+        above_sample_content.visible = not is_all
         filter_samples.visible = not is_all
         widgets['sample_select'].visible = not is_all
 
@@ -1060,13 +1060,13 @@ def modify_doc_factory(db_path):
     filter_samples = CheckboxGroup(labels=["Only show samples present with selected contig"], active=[])
     filter_samples.on_change('active', lambda attr, old, new: refresh_sample_options())
 
-    sample_children = [filter_samples]
-    sample_content = column(
-        *sample_children,
+    above_sample_children = [filter_samples]
+    above_sample_content = column(
+        *above_sample_children,
         visible=True, sizing_mode="stretch_width"
     )
 
-    sample_toggle_btn.on_click(make_toggle_callback(sample_toggle_btn, sample_content))
+    sample_toggle_btn.on_click(make_toggle_callback(sample_toggle_btn, above_sample_content))
     widgets['sample_select'].on_change('value', lambda attr, old, new: refresh_contig_options())
 
 
@@ -1091,15 +1091,15 @@ def modify_doc_factory(db_path):
     contig_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
     contig_title = Div(text="<b>Contigs</b>", align="center")
     contig_header = row(contig_toggle_btn, contig_title, sizing_mode="stretch_width", align="center")
-    contig_children = [filter_contigs]
+    above_contig_children = [filter_contigs]
     if length_slider is not None:
-        contig_children.append(length_slider)
+        above_contig_children.append(length_slider)
     
-    contig_content = column(
-        *contig_children,
+    above_contig_content = column(
+        *above_contig_children,
         visible=True, sizing_mode="stretch_width"
     )
-    contig_toggle_btn.on_click(make_toggle_callback(contig_toggle_btn, contig_content))
+    contig_toggle_btn.on_click(make_toggle_callback(contig_toggle_btn, above_contig_content))
 
     widgets['contig_select'].on_change('value', lambda attr, old, new: refresh_sample_options())
 
@@ -1200,6 +1200,7 @@ def modify_doc_factory(db_path):
     variables_section_one = column(variables_title_one, *controls_variables_one, visible=True, sizing_mode="stretch_width")
     variables_section_all = column(variables_title_all, *controls_variables_all, visible=False, sizing_mode="stretch_width")
 
+
     ## Build Genome module controls (placed in Contigs section, shared between views)
     genome_section = None
 
@@ -1223,8 +1224,16 @@ def modify_doc_factory(db_path):
         genome_section = column(genome_hdr, genome_cbg_one, visible=True, sizing_mode="stretch_width")
 
     # Add Genome section to contig_content
+    below_contig_children = []
     if genome_section is not None:
-        contig_content.children = list(contig_content.children) + [genome_section]
+        below_contig_children = list(below_contig_children) + [genome_section]
+
+    below_contig_content = column(
+        *below_contig_children,
+        visible=True, sizing_mode="stretch_width"
+    )
+    contig_toggle_btn.on_click(make_toggle_callback(contig_toggle_btn, below_contig_content))
+
 
     ### Attach callbacks for One Sample view (module checkbox ↔ variable bidirectional sync)
     for i, mc in enumerate(widgets['module_widgets_one']):
@@ -1280,8 +1289,8 @@ def modify_doc_factory(db_path):
     # Gene map is now part of the Genome module's CheckboxButtonGroup
     # Include both variables sections - visibility is toggled by on_view_change
     controls_children = [logo, views, separator_filtering, filtering_header, filtering_content,
-                         separator_contigs, contig_header, widgets['contig_select'], contig_content,
-                         separator_samples, sample_header, widgets['sample_select'], sample_content, 
+                         separator_contigs, contig_header, above_contig_content, widgets['contig_select'], below_contig_content,
+                         separator_samples, sample_header, above_sample_content, widgets['sample_select'], 
                          separator_variables,
                          variables_section_one,  # One Sample view (with module checkboxes)
                          variables_section_all,  # All Samples view (title headers only)
