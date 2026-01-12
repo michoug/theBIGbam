@@ -76,6 +76,148 @@ pub struct ProcessResult {
     pub processing_time_secs: f64,
     pub writing_time_secs: f64,
 }
+
+/// Check if a BAM file is missing MD tags by sampling first few reads.
+/// Returns true if MD tags are missing, false otherwise.
+fn check_missing_md_tags(bam: &mut IndexedReader) -> bool {
+    let header = bam.header().clone();
+    let target_names = header.target_names();
+    let first_tid = target_names.first();
+
+    if first_tid.is_none() {
+        return false;
+    }
+
+    let contig_name = match std::str::from_utf8(first_tid.unwrap()) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    if bam.fetch(contig_name).is_err() {
+        return false;
+    }
+
+    let mut checked = 0;
+    let mut missing_md = 0;
+
+    for result in bam.records() {
+        let record = match result {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        if record.is_unmapped() {
+            continue;
+        }
+
+        checked += 1;
+        if record.aux(b"MD").is_err() {
+            missing_md += 1;
+        }
+
+        if checked >= 10 {
+            break;
+        }
+    }
+
+    checked > 0 && missing_md == checked
+}
+
+/// Check for circularity mismatch between BAM and GenBank/FASTA.
+/// Returns Some(warning_message) if mismatch detected, None otherwise.
+fn check_circularity_mismatch(
+    bam: &IndexedReader,
+    contigs: &[ContigInfo],
+    circular: bool,
+    sample_name: &str,
+) -> Option<String> {
+    let header = bam.header();
+
+    // Check first contig only to avoid spam
+    if header.target_count() == 0 {
+        return None;
+    }
+
+    let ref_name = match std::str::from_utf8(header.tid2name(0)) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    let bam_length = header.target_len(0).unwrap_or(0) as usize;
+
+    // Find matching contig in GenBank/FASTA
+    let contig_info = contigs.iter().find(|c| c.name == ref_name)?;
+    let genbank_length = contig_info.length;
+
+    if circular {
+        // --circular used: expect bam_length = 2 * genbank_length
+        if bam_length == genbank_length {
+            return Some(format!(
+                "Warning: in sample '{}', BAM references are the same size as the FASTA contigs, \
+                 you likely did a normal mapping and should not use the --circular flag",
+                sample_name
+            ));
+        }
+    } else {
+        // --circular NOT used: expect bam_length = genbank_length
+        if bam_length == genbank_length * 2 {
+            return Some(format!(
+                "Warning: in sample '{}', BAM references are twice the size of FASTA contigs, \
+                 you likely did a circular mapping and should use the --circular flag",
+                sample_name
+            ));
+        }
+    }
+
+    None
+}
+
+/// Run validation checks on all BAM files before processing.
+/// Prints warnings for MD tags and circularity mismatches.
+fn validate_all_samples(
+    bam_files: &[PathBuf],
+    contigs: &[ContigInfo],
+    modules: &[String],
+    circular: bool,
+) {
+    let flags = ModuleFlags::from_modules(modules);
+    let needs_md = flags.needs_md();
+
+    for bam_path in bam_files {
+        let sample_name = bam_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .replace("_with_MD", "");
+
+        // Open BAM for checks
+        let bam = match IndexedReader::from_path(bam_path) {
+            Ok(b) => b,
+            Err(_) => continue, // Skip, will fail later during processing
+        };
+
+        // Circularity check
+        if let Some(warning) = check_circularity_mismatch(&bam, contigs, circular, &sample_name) {
+            eprintln!("{}", warning);
+        }
+
+        // MD tag check
+        if needs_md {
+            let mut check_bam = match IndexedReader::from_path(bam_path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if check_missing_md_tags(&mut check_bam) {
+                eprintln!(
+                    "Warning: in sample '{}', BAM file is missing MD tags. \
+                     MD tags are required for: Mapping metrics per position, Phage termini. \
+                     Consider using 'samtools calmd' to add them.",
+                    sample_name
+                );
+            }
+        }
+    }
+}
+
 /// Add features from FeatureArrays to output (optimized path).
 /// Returns a tuple of:
 /// - Optional packaging data for phagetermini module
@@ -708,6 +850,9 @@ pub fn run_all_samples(
     eprintln!("\n### Processing {} samples with {} threads", bam_files.len(), config.threads);
     eprintln!("Modules: {}\n", modules.join(", "));
 
+    // Pre-validation: check all samples for warnings before processing starts
+    validate_all_samples(bam_files, &contigs, modules, config.circular);
+
     let result = process_samples_parallel(&bam_files, &contigs, modules, config, db_writer, max_samples_in_memory, &repeats)?;
 
     print_summary(&result, output_db);
@@ -835,10 +980,7 @@ fn process_samples_parallel(
 
         // Finalize database
         db_writer.finalize()?;
-        write_pb_clone.finish_with_message("Done");
-        if !is_tty_writer {
-            eprintln!("Writing:    Done ({:.2}s)", write_start.elapsed().as_secs_f64());
-        }
+        write_pb_clone.finish();
 
         Ok((written_count, write_start.elapsed()))
     });
@@ -887,16 +1029,16 @@ fn process_samples_parallel(
     // Drop sender to signal writer thread that processing is complete
     drop(tx);
 
-    process_pb.finish_with_message("Done");
+    process_pb.finish();
     let processing_time = start_time.elapsed();
-    if !is_tty {
-        eprintln!("Processing: Done ({:.2}s)", processing_time.as_secs_f64());
-    }
 
     // Wait for writer thread to finish
     let (written_count, writing_time) = writer_handle
         .join()
         .map_err(|_| anyhow::anyhow!("Writer thread panicked"))??;
+
+    // Clear MultiProgress to avoid duplicate bar display
+    mp.clear().ok();
 
     let elapsed = start_time.elapsed();
     let failed = failed_count.load(Ordering::SeqCst);

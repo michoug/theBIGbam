@@ -85,7 +85,7 @@ def map_with_mapper(threads: int, assembly_file: Path, sequencing_type: str, rea
                 mapper_cmd.append(str(read2))
 
         sorted_bam = Path(tempfile.mkstemp(prefix=output_file.stem + "_sorted_", suffix=".bam")[1])
-        temp_files.append(sorted_bam)
+        #temp_files.append(sorted_bam)
 
         # Pipe: mapper | samtools view -bS -F 4 | samtools sort -o sorted_bam
         view_cmd = ["samtools", "view", "-@", str(threads), "-F", "4", "-bS", "-"]

@@ -107,11 +107,11 @@ def run_calculate_args(args):
 
     # Warn if "Phage termini" is requested without genbank
     if "Phage termini" in requested_modules and not genbank_path:
-        print("WARNING: No annotation file was provided: phage packaging will not be determined properly for contigs harboring a terminal repeat at both ends. Rerun with an annotation file to perform the \"Phage termini\" module properly.", flush=True)
+        print("WARNING: No annotation file was provided: phage packaging will not be determined properly for contigs harboring a terminal repeat at both ends. Rerun with an annotation file or at least an assembly file to perform the \"Phage termini\" module properly.", flush=True)
 
     # Run autoblast if Phage termini module is requested
     autoblast_file = None
-    if "Phage termini" in requested_modules:
+    if "Phage termini" in requested_modules and genbank_path:
         from mgfeatureviewer.utils.autoblast import perform_autoblast, extract_fasta_from_genbank
         print("Running autoblast for Phage termini analysis...", flush=True)
 

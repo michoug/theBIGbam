@@ -407,8 +407,7 @@ def merge_rle_segments(plus_rows, minus_rows):
             if first <= seg_start and last >= seg_end:
                 value += val
 
-        if value > 0:
-            result.append((seg_start, seg_end, value))
+        result.append((seg_start, seg_end, value))
 
     return result
 
