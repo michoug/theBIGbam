@@ -46,10 +46,10 @@ def build_controls(conn):
     except Exception:
         pass
 
-    # Get Coverage_variation min/max from Presences table (stored as INTEGER ×100)
-    coverage_variation_max = 100.0
+    # Get Coverage_variation min/max from Explicit_presences view (already divided by 100)
+    coverage_variation_max = 1.0
     try:
-        cur.execute("SELECT MIN(Coverage_variation), MAX(Coverage_variation) FROM Presences WHERE Coverage_variation IS NOT NULL")
+        cur.execute("SELECT MIN(Coverage_variation), MAX(Coverage_variation) FROM Explicit_presences WHERE Coverage_variation IS NOT NULL")
         result = cur.fetchone()
         if result and result[0] is not None and result[1] is not None:
             coverage_variation_min = result[0]
@@ -412,6 +412,20 @@ def modify_doc_factory(db_path):
         
         return allowed_contigs
 
+    ## Helper function to get coverage mean column based on correction selection
+    def get_coverage_mean_column():
+        """Return appropriate Coverage_mean column based on correction_filter selection."""
+        try:
+            if correction_filter is not None and hasattr(correction_filter, 'value'):
+                val = correction_filter.value
+                if val == "Correct by number of reads":
+                    return "Coverage_mean_corrected_by_read_number"
+                elif val == "Correct by number of mapped reads":
+                    return "Coverage_mean_corrected_by_read_mapped"
+        except NameError:
+            pass
+        return "Coverage_mean"
+
     ## Helper functions for module-based filtering (phage mechanisms, completeness, coverage)
     def get_module_filtered_contigs():
         """Apply module-based filters (coverage, completeness, phage mechanism) to get allowed contigs."""
@@ -430,9 +444,10 @@ def modify_doc_factory(db_path):
 
         if coverage_mean_slider is not None:
             min_val, max_val = coverage_mean_slider.value
-            cov_mean_max = widgets['coverage_mean_max']
+            cov_mean_max = coverage_mean_slider.end
             if min_val > 0 or max_val < cov_mean_max:
-                conditions.append("Coverage_mean >= ? AND Coverage_mean <= ?")
+                cov_col = get_coverage_mean_column()
+                conditions.append(f"{cov_col} >= ? AND {cov_col} <= ?")
                 params.extend([min_val, max_val])
 
         if coverage_variation_slider is not None:
@@ -513,9 +528,10 @@ def modify_doc_factory(db_path):
 
         if coverage_mean_slider is not None:
             min_val, max_val = coverage_mean_slider.value
-            cov_mean_max = widgets['coverage_mean_max']
+            cov_mean_max = coverage_mean_slider.end
             if min_val > 0 or max_val < cov_mean_max:
-                conditions.append("Coverage_mean >= ? AND Coverage_mean <= ?")
+                cov_col = get_coverage_mean_column()
+                conditions.append(f"{cov_col} >= ? AND {cov_col} <= ?")
                 params.extend([min_val, max_val])
 
         if coverage_variation_slider is not None:
@@ -975,15 +991,16 @@ def modify_doc_factory(db_path):
         per_module_title = Div(text="<b>Per module:</b>")
         filtering_children.append(per_module_title)
 
-        # Coverage patterns sliders (always available from Presences table)
-        coverage_percentage_slider = RangeSlider(
-            start=0, end=100, value=(0, 100), step=1,
-            title="Coverage percentage (%)",
-            sizing_mode="stretch_width"
-        )
-        coverage_percentage_slider.on_change('value_throttled', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
-        filtering_children.append(coverage_percentage_slider)
+        correction_label = Div(text="Harmonise coverage mean between samples:", margin=(5, 0, 0, 10))
+        correction_filter = Select(
+                options=["No correction", "Correct by number of mapped reads", "Correct by number of reads"],
+                value="No correction",   # default = no filter (empty = all)
+                sizing_mode="stretch_width",
+            )
+        filtering_children.append(correction_label)
+        filtering_children.append(correction_filter)
 
+        # Coverage patterns sliders (always available from Presences table)
         cov_mean_min = 0
         cov_mean_max = max(100, widgets['coverage_mean_max'])
         coverage_mean_slider = RangeSlider(
@@ -994,12 +1011,38 @@ def modify_doc_factory(db_path):
         coverage_mean_slider.on_change('value_throttled', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
         filtering_children.append(coverage_mean_slider)
 
-        cov_var_min = 0
-        cov_var_max = max(100, widgets['coverage_variation_max'])
-        # Round for nice slider values
+        # Function to update coverage_mean_slider range when correction method changes
+        def update_coverage_mean_slider():
+            cov_col = get_coverage_mean_column()
+            cur = conn.cursor()
+            cur.execute(f"SELECT MIN({cov_col}), MAX({cov_col}) FROM Explicit_presences WHERE {cov_col} IS NOT NULL")
+            result = cur.fetchone()
+            if result and result[0] is not None and result[1] is not None:
+                new_max = max(100, result[1])
+                coverage_mean_slider.start = 0
+                coverage_mean_slider.end = new_max
+                coverage_mean_slider.value = (0, new_max)
+            refresh_contig_options()
+            refresh_sample_options()
+
+        # Wire up correction_filter to update slider when changed
+        if hasattr(correction_filter, 'on_change'):
+            correction_filter.on_change('value', lambda attr, old, new: update_coverage_mean_slider())
+
+        coverage_percentage_slider = RangeSlider(
+            start=0, end=100, value=(0, 100), step=1,
+            title="Coverage percentage (%)",
+            sizing_mode="stretch_width"
+        )
+        coverage_percentage_slider.on_change('value_throttled', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
+        filtering_children.append(coverage_percentage_slider)
+
+        cov_var_min = 0.0
+        cov_var_max = widgets['coverage_variation_max']
+        # Slider shows normalized variance (stored value / 100)
         coverage_variation_slider = RangeSlider(
-            start=cov_var_min, end=cov_var_max, value=(cov_var_min, cov_var_max), step=1,
-            title="Coverage variation (%)",
+            start=cov_var_min, end=cov_var_max, value=(cov_var_min, cov_var_max), step=0.01,
+            title="Coverage variation",
             sizing_mode="stretch_width"
         )
         coverage_variation_slider.on_change('value_throttled', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))

@@ -215,8 +215,8 @@ pub const VARIABLES: &[VariableConfig] = &[
     // Per read metrics (paired-reads)  
     VariableConfig { name: "insert_sizes", subplot: "Insert sizes", module: "Paired-read metrics", module_order: 1, plot_type: PlotType::Curve, color: "#ed8b00", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Insert sizes", help: None },
     VariableConfig { name: "non_inward_pairs", subplot: "Non-inward pairs", module: "Paired-read metrics", module_order: 2, plot_type: PlotType::Curve, color: "#c94009", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Non-inward pairs", help: None },
-    VariableConfig { name: "mate_not_mapped", subplot: "Mate not mapped", module: "Paired-read metrics", module_order: 3, plot_type: PlotType::Curve, color: "#302DD2", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Missing mates", help: None },
-    VariableConfig { name: "mate_on_another_contig", subplot: "Mate on another contig", module: "Paired-read metrics", module_order: 4, plot_type: PlotType::Curve, color: "#CFD22D", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Missing mates", help: None },
+    VariableConfig { name: "mate_not_mapped", subplot: "Missing mates", module: "Paired-read metrics", module_order: 3, plot_type: PlotType::Curve, color: "#302DD2", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Missing mates", help: None },
+    VariableConfig { name: "mate_on_another_contig", subplot: "Missing mates", module: "Paired-read metrics", module_order: 4, plot_type: PlotType::Curve, color: "#CFD22D", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Missing mates", help: None },
 
     // Phage termini module - for detecting phage DNA packaging sites
     VariableConfig { name: "reads_starts", subplot: "Reads termini", module: "Phage termini", module_order: 2, plot_type: PlotType::Bars, color: "#215732", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Read starts", help: None },

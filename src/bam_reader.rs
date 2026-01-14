@@ -77,7 +77,7 @@ pub fn detect_sequencing_type(bam_path: &Path) -> Result<SequencingType> {
 
 /// Process all reads for a contig using single-pass streaming.
 ///
-/// Returns FeatureArrays with calculated features, or None if contig has no reads.
+/// Returns (FeatureArrays, coverage_pct, primary_count) or None if contig has no reads.
 pub fn process_contig_streaming(
     bam: &mut bam::IndexedReader,
     contig_name: &str,
@@ -86,7 +86,7 @@ pub fn process_contig_streaming(
     flags: ModuleFlags,
     circular: bool,
     min_coverage: f64,
-) -> Result<Option<(FeatureArrays, f64)>> {
+) -> Result<Option<(FeatureArrays, f64, u64)>> {
     // -------------------------------------------------------------------------
     // Step 1: Check if this contig exists in the BAM file
     // -------------------------------------------------------------------------
@@ -102,6 +102,7 @@ pub fn process_contig_streaming(
     let mut arrays = FeatureArrays::new(ref_length);
     let need_md = flags.needs_md();
     let mut has_reads = false;
+    let mut primary_count: u64 = 0;
     let mut cigar_buf: Vec<(u32, u32)> = Vec::with_capacity(16);
 
     for result in bam.records() {
@@ -115,6 +116,11 @@ pub fn process_contig_streaming(
         }
 
         has_reads = true;
+
+        // Count primary alignments (not secondary, not supplementary)
+        if !record.is_secondary() && !record.is_supplementary() {
+            primary_count += 1;
+        }
 
         // Parse CIGAR string and MD tag (if needed)
         let cigar_view = record.cigar();
@@ -201,5 +207,24 @@ pub fn process_contig_streaming(
         arrays.finalize_strands(seq_type);
     }
 
-    Ok(Some((arrays, coverage_pct)))
+    Ok(Some((arrays, coverage_pct, primary_count)))
+}
+
+// ============================================================================
+// Read Count Statistics
+// ============================================================================
+
+/// Get total read count from BAM index (fast, no iteration needed).
+/// Returns total reads (mapped + unmapped) from index_stats().
+pub fn get_total_read_count(bam_path: &Path) -> Result<u64> {
+    let mut bam = bam::IndexedReader::from_path(bam_path)
+        .with_context(|| format!("Failed to open indexed BAM: {}", bam_path.display()))?;
+
+    let stats = bam.index_stats()
+        .with_context(|| format!("Failed to get index stats from: {}", bam_path.display()))?;
+
+    // Sum mapped + unmapped across all entries (including tid=-1 for unmapped)
+    let total: u64 = stats.iter().map(|(_, _, mapped, unmapped)| mapped + unmapped).sum();
+
+    Ok(total)
 }

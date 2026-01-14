@@ -81,7 +81,7 @@ impl DbWriter {
     }
 
     /// Insert a sample and return its ID.
-    pub fn insert_sample(&self, sample_name: &str, sequencing_type: &str) -> Result<i64> {
+    pub fn insert_sample(&self, sample_name: &str, sequencing_type: &str, total_reads: u64, mapped_reads: u64) -> Result<i64> {
         // Get next sample ID
         let sample_id = {
             let mut next_id = self.next_sample_id.lock().unwrap();
@@ -92,8 +92,8 @@ impl DbWriter {
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO Sample (Sample_id, Sample_name, Sequencing_type) VALUES (?1, ?2, ?3)",
-            params![sample_id, sample_name, sequencing_type],
+            "INSERT INTO Sample (Sample_id, Sample_name, Sequencing_type, Number_of_reads, Number_of_mapped_reads) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![sample_id, sample_name, sequencing_type, total_reads as i64, mapped_reads as i64],
         )?;
         drop(conn);
 
@@ -397,7 +397,9 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
         "CREATE TABLE Sample (
             Sample_id INTEGER PRIMARY KEY,
             Sample_name TEXT UNIQUE,
-            Sequencing_type TEXT
+            Sequencing_type TEXT,
+            Number_of_reads INTEGER,
+            Number_of_mapped_reads INTEGER
         )",
         [],
     )
@@ -741,15 +743,19 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
         .context("Failed to create primary_reads VIEW")?;
     }
 
-    // Explicit_presences VIEW - note: divide by 100.0 to get original values for pct/variation
+    // Explicit_presences VIEW with correction ratios for normalizing across samples
     conn.execute(
         "CREATE VIEW Explicit_presences AS
          SELECT
              c.Contig_name,
              s.Sample_name,
-             p.Coverage_percentage AS Coverage_percentage,
-             p.Coverage_variation AS Coverage_variation,
-             p.Coverage_mean AS Coverage_mean
+             p.Coverage_percentage,
+             p.Coverage_variation / 1000000.0 AS Coverage_variation,
+             p.Coverage_mean,
+             CAST(s.Number_of_reads AS REAL) / (SELECT MIN(Number_of_reads) FROM Sample WHERE Number_of_reads > 0) AS Read_number_correction_ratio,
+             CAST(s.Number_of_mapped_reads AS REAL) / (SELECT MIN(Number_of_mapped_reads) FROM Sample WHERE Number_of_mapped_reads > 0) AS Read_mapped_correction_ratio,
+             p.Coverage_mean / (CAST(s.Number_of_reads AS REAL) / (SELECT MIN(Number_of_reads) FROM Sample WHERE Number_of_reads > 0)) AS Coverage_mean_corrected_by_read_number,
+             p.Coverage_mean / (CAST(s.Number_of_mapped_reads AS REAL) / (SELECT MIN(Number_of_mapped_reads) FROM Sample WHERE Number_of_mapped_reads > 0)) AS Coverage_mean_corrected_by_read_mapped
          FROM Presences p
          JOIN Contig c ON p.Contig_id = c.Contig_id
          JOIN Sample s ON p.Sample_id = s.Sample_id",

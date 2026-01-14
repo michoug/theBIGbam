@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::thread;
 
-use crate::bam_reader::{detect_sequencing_type, process_contig_streaming};
+use crate::bam_reader::{detect_sequencing_type, get_total_read_count, process_contig_streaming};
 use crate::compress::{
     compress_signal_with_reference, Run,
     add_compressed_feature, add_compressed_feature_with_reference,
@@ -622,13 +622,14 @@ fn add_features_from_arrays(
 
 /// Process one BAM file using streaming (single-pass, optimized).
 /// Parallelizes at the contig level for samples with many contigs.
+/// Returns (features, presences, packaging, completeness, sample_name, seq_type, total_reads, mapped_reads)
 pub fn process_sample(
     bam_path: &Path,
     contigs: &[ContigInfo],
     modules: &[String],
     config: &ProcessConfig,
     repeats: &[RepeatsData],
-) -> Result<(Vec<FeaturePoint>, Vec<PresenceData>, Vec<PackagingData>, Vec<CompletenessData>, String, SequencingType)> {
+) -> Result<(Vec<FeaturePoint>, Vec<PresenceData>, Vec<PackagingData>, Vec<CompletenessData>, String, SequencingType, u64, u64)> {
     let sample_name = bam_path
         .file_stem()
         .unwrap_or_default()
@@ -649,6 +650,9 @@ pub fn process_sample(
         None => detect_sequencing_type(bam_path)
             .with_context(|| format!("Failed to detect sequencing type from {}", bam_path.display()))?,
     };
+
+    // Get total read count from BAM index (fast, no iteration)
+    let total_reads = get_total_read_count(bam_path)?;
 
     // Process contigs in parallel - each gets its own BAM reader
     // This is critical for samples with many contigs (e.g., 50,000 contigs with 1 sample)
@@ -673,7 +677,7 @@ pub fn process_sample(
 
             // Process contig using streaming - single pass over reads
             // Early coverage check happens inside process_contig_streaming
-            let (mut arrays, coverage_pct) = match process_contig_streaming(&mut bam, &ref_name, ref_length, seq_type, flags, config.circular, config.min_coverage) {
+            let (mut arrays, coverage_pct, primary_count) = match process_contig_streaming(&mut bam, &ref_name, ref_length, seq_type, flags, config.circular, config.min_coverage) {
                 Ok(Some(result)) => result,
                 Ok(None) => return None,
                 Err(e) => {
@@ -688,22 +692,26 @@ pub fn process_sample(
             let mut features = Vec::new();
             let (packaging_info, completeness_info) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, seq_type, flags, repeats, &mut features);
 
-            // Calculate Coverage-Weighted Total Variation (CWTV)
-            // CWTV = 1/(n-1) * Σ|cov(i+1) - cov(i)| for i=1 to n (circular wrap-around)
-            let coverage_variation = if arrays.primary_reads.len() > 1 {
+            // Calculate mean coverage depth
+            let coverage_mean = arrays.coverage_mean() as f32;
+
+            // Calculate normalized coverage variation (mean squared relative difference)
+            // Formula: 1000000 × (1/(n-1)) × Σ((cov(i+1) - cov(i)) / mean_cov)²
+            // Multiplied by 1000000 for 6 decimal digits precision when stored as integer
+            let coverage_variation = if arrays.primary_reads.len() > 1 && coverage_mean > 0.0 {
                 let n = arrays.primary_reads.len();
-                // Sum of consecutive differences (n-1 terms)
-                let total_variation: f64 = arrays.primary_reads
+                let mean_cov = coverage_mean as f64;
+                let sum_squared_diff: f64 = arrays.primary_reads
                     .windows(2)
-                    .map(|w| (w[1] as f64 - w[0] as f64).abs())
+                    .map(|w| {
+                        let diff = (w[1] as f64 - w[0] as f64) / mean_cov;
+                        diff * diff
+                    })
                     .sum();
-                (total_variation / (n - 1) as f64) as f32
+                (1000000.0 * sum_squared_diff / (n - 1) as f64) as f32
             } else {
                 0.0
             };
-
-            // Calculate mean coverage depth
-            let coverage_mean = arrays.coverage_mean() as f32;
 
             let presence = PresenceData {
                 contig_name: ref_name.clone(),
@@ -712,7 +720,7 @@ pub fn process_sample(
                 coverage_mean,
             };
 
-            Some((features, presence, packaging_info, completeness_info))
+            Some((features, presence, packaging_info, completeness_info, primary_count))
         })
         .collect();
 
@@ -721,10 +729,12 @@ pub fn process_sample(
     let mut all_presences = Vec::new();
     let mut all_packaging = Vec::new();
     let mut all_completeness = Vec::new();
+    let mut mapped_reads: u64 = 0;
 
-    for (features, presence, packaging, completeness) in results {
+    for (features, presence, packaging, completeness, primary_count) in results {
         all_features.extend(features);
         all_presences.push(presence);
+        mapped_reads += primary_count;
         if let Some(pkg) = packaging {
             all_packaging.push(pkg);
         }
@@ -733,7 +743,7 @@ pub fn process_sample(
         }
     }
 
-    Ok((all_features, all_presences, all_packaging, all_completeness, sample_name, seq_type))
+    Ok((all_features, all_presences, all_packaging, all_completeness, sample_name, seq_type, total_reads, mapped_reads))
 }
 
 /// Extract contig information from BAM file headers.
@@ -864,6 +874,8 @@ pub fn run_all_samples(
 struct SampleResult {
     sample_name: String,
     sequencing_type: SequencingType,
+    total_reads: u64,
+    mapped_reads: u64,
     features: Vec<FeaturePoint>,
     presences: Vec<PresenceData>,
     packaging: Vec<PackagingData>,
@@ -944,7 +956,7 @@ fn process_samples_parallel(
             written_count += 1;
 
             // Insert sample
-            if let Err(e) = db_writer.insert_sample(&result.sample_name, result.sequencing_type.as_str()) {
+            if let Err(e) = db_writer.insert_sample(&result.sample_name, result.sequencing_type.as_str(), result.total_reads, result.mapped_reads) {
                 eprintln!("\nError inserting sample {}: {}", result.sample_name, e);
                 let msg = format!("ERR: {}", result.sample_name);
                 write_pb_clone.set_message(msg.clone());
@@ -991,7 +1003,7 @@ fn process_samples_parallel(
         let sample_start = std::time::Instant::now();
 
         match process_sample(bam_path, contigs, modules, config, repeats) {
-            Ok((features, presences, packaging, completeness, sample_name, sequencing_type)) => {
+            Ok((features, presences, packaging, completeness, sample_name, sequencing_type, total_reads, mapped_reads)) => {
                 let sample_time = sample_start.elapsed().as_secs_f64();
                 completed_count.fetch_add(1, Ordering::SeqCst);
                 let msg = format!("{} ({:.2}s)", sample_name, sample_time);
@@ -1005,6 +1017,8 @@ fn process_samples_parallel(
                 let _ = tx.send(SampleResult {
                     sample_name,
                     sequencing_type,
+                    total_reads,
+                    mapped_reads,
                     features,
                     presences,
                     packaging,
@@ -1090,14 +1104,14 @@ fn process_samples_sequential(
         let sample_start = std::time::Instant::now();
 
         match process_sample(bam_path, contigs, modules, config, repeats) {
-            Ok((features, presences, packaging, completeness, sample_name, sequencing_type)) => {
+            Ok((features, presences, packaging, completeness, sample_name, sequencing_type, total_reads, mapped_reads)) => {
                 let process_elapsed = sample_start.elapsed();
                 processing_time_total += process_elapsed;
 
                 let write_start = std::time::Instant::now();
 
                 // Insert sample
-                if let Err(e) = db_writer.insert_sample(&sample_name, sequencing_type.as_str()) {
+                if let Err(e) = db_writer.insert_sample(&sample_name, sequencing_type.as_str(), total_reads, mapped_reads) {
                     eprintln!("\nError inserting sample {}: {}", sample_name, e);
                     failed += 1;
                     pb.inc(1);
