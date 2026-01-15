@@ -26,3 +26,15 @@
     padding-bottom: 0 !important;
     font-size: 10px;
 }
+
+/* Style for TextInputs next to RangeSliders */
+.bk-Row > .bk-input-group {
+    margin-top: auto;
+    margin-bottom: 5px;
+}
+
+.bk-Row > .bk-input-group input[type="text"] {
+    text-align: center;
+    padding: 2px 4px;
+    font-size: 11px;
+}

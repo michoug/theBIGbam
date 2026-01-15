@@ -692,11 +692,13 @@ pub fn process_sample(
             let mut features = Vec::new();
             let (packaging_info, completeness_info) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, seq_type, flags, repeats, &mut features);
 
-            // Calculate mean coverage depth
+            // Calculate mean and median coverage depth
             let coverage_mean = arrays.coverage_mean() as f32;
+            let coverage_median = arrays.coverage_median() as f32;
 
-            // Calculate normalized coverage variation (mean squared relative difference)
-            // Formula: 1000000 × (1/(n-1)) × Σ((cov(i+1) - cov(i)) / mean_cov)²
+            // Calculate coverage variation using Fano factor style normalization
+            // Formula: 1000000 × (1/(n-1)) × Σ(cov(i+1) - cov(i))² / mean_cov
+            // Divides by mean (not mean²) to remove spurious correlation with coverage depth
             // Multiplied by 1000000 for 6 decimal digits precision when stored as integer
             let coverage_variation = if arrays.primary_reads.len() > 1 && coverage_mean > 0.0 {
                 let n = arrays.primary_reads.len();
@@ -704,8 +706,8 @@ pub fn process_sample(
                 let sum_squared_diff: f64 = arrays.primary_reads
                     .windows(2)
                     .map(|w| {
-                        let diff = (w[1] as f64 - w[0] as f64) / mean_cov;
-                        diff * diff
+                        let diff = w[1] as f64 - w[0] as f64;
+                        diff * diff / mean_cov
                     })
                     .sum();
                 (1000000.0 * sum_squared_diff / (n - 1) as f64) as f32
@@ -718,6 +720,7 @@ pub fn process_sample(
                 coverage_pct: coverage_pct as f32,
                 coverage_variation,
                 coverage_mean,
+                coverage_median,
             };
 
             Some((features, presence, packaging_info, completeness_info, primary_count))

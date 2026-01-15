@@ -423,11 +423,13 @@ pub struct PresenceData {
     pub contig_name: String,
     /// Percentage of bases with at least 1x coverage (0-100)
     pub coverage_pct: f32,
-    /// Coverage-Weighted Total Variation: 1/(n-1) * Σ|cov(i+1) - cov(i)|
-    /// Measures coverage smoothness (low = uniform, high = variable)
+    /// Coverage variation (Fano factor style): 1/(n-1) * Σ(cov(i+1) - cov(i))² / mean_cov
+    /// Measures coverage smoothness normalized by mean (low = uniform, high = variable)
     pub coverage_variation: f32,
     /// Mean coverage depth across all positions
     pub coverage_mean: f32,
+    /// Median coverage depth across all positions
+    pub coverage_median: f32,
 }
 
 /// Phage packaging mechanism data for a contig in a sample.

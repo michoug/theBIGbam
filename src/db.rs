@@ -142,11 +142,12 @@ impl DbWriter {
         for p in presences {
             if let Some(&contig_id) = self.contig_name_to_id.get(&p.contig_name) {
                 // Store coverage_percentage and coverage_variation as integers (×100)
-                // Store coverage_mean as integer (rounded)
+                // Store coverage_mean and coverage_median as integers (rounded)
                 let cov_pct = p.coverage_pct.round() as i32;
                 let cov_var = p.coverage_variation.round() as i32;
                 let cov_mean = p.coverage_mean.round() as i32;
-                appender.append_row(params![contig_id, sample_id, cov_pct, cov_var, cov_mean])?;
+                let cov_median = p.coverage_median.round() as i32;
+                appender.append_row(params![contig_id, sample_id, cov_pct, cov_var, cov_mean, cov_median])?;
             }
         }
 
@@ -406,7 +407,7 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
     .context("Failed to create Sample table")?;
 
     // Coverage_percentage and Coverage_variation stored as INTEGER (×100)
-    // Coverage_mean stored as INTEGER (rounded)
+    // Coverage_mean and Coverage_median stored as INTEGER (rounded)
     // No Presence_id needed - (Contig_id, Sample_id) is the natural key
     conn.execute(
         "CREATE TABLE Presences (
@@ -415,6 +416,7 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             Coverage_percentage INTEGER,
             Coverage_variation INTEGER,
             Coverage_mean INTEGER,
+            Coverage_median INTEGER,
             PRIMARY KEY (Contig_id, Sample_id)
         )",
         [],
@@ -752,10 +754,13 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
              p.Coverage_percentage,
              p.Coverage_variation / 1000000.0 AS Coverage_variation,
              p.Coverage_mean,
+             p.Coverage_median,
              CAST(s.Number_of_reads AS REAL) / (SELECT MIN(Number_of_reads) FROM Sample WHERE Number_of_reads > 0) AS Read_number_correction_ratio,
              CAST(s.Number_of_mapped_reads AS REAL) / (SELECT MIN(Number_of_mapped_reads) FROM Sample WHERE Number_of_mapped_reads > 0) AS Read_mapped_correction_ratio,
              p.Coverage_mean / (CAST(s.Number_of_reads AS REAL) / (SELECT MIN(Number_of_reads) FROM Sample WHERE Number_of_reads > 0)) AS Coverage_mean_corrected_by_read_number,
-             p.Coverage_mean / (CAST(s.Number_of_mapped_reads AS REAL) / (SELECT MIN(Number_of_mapped_reads) FROM Sample WHERE Number_of_mapped_reads > 0)) AS Coverage_mean_corrected_by_read_mapped
+             p.Coverage_mean / (CAST(s.Number_of_mapped_reads AS REAL) / (SELECT MIN(Number_of_mapped_reads) FROM Sample WHERE Number_of_mapped_reads > 0)) AS Coverage_mean_corrected_by_read_mapped,
+             p.Coverage_median / (CAST(s.Number_of_reads AS REAL) / (SELECT MIN(Number_of_reads) FROM Sample WHERE Number_of_reads > 0)) AS Coverage_median_corrected_by_read_number,
+             p.Coverage_median / (CAST(s.Number_of_mapped_reads AS REAL) / (SELECT MIN(Number_of_mapped_reads) FROM Sample WHERE Number_of_mapped_reads > 0)) AS Coverage_median_corrected_by_read_mapped
          FROM Presences p
          JOIN Contig c ON p.Contig_id = c.Contig_id
          JOIN Sample s ON p.Sample_id = s.Sample_id",

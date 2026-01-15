@@ -302,6 +302,18 @@ impl FeatureArrays {
         }
     }
 
+    /// Compute median coverage across all positions.
+    /// Returns the middle value of sorted primary_reads as f64.
+    pub fn coverage_median(&self) -> f64 {
+        if self.primary_reads.is_empty() {
+            0.0
+        } else {
+            let mut sorted: Vec<u64> = self.primary_reads.clone();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2] as f64
+        }
+    }
+
     /// Convert to FeatureMap for assemblycheck features.
     ///
     /// Only includes features relevant to the sequencing type:
