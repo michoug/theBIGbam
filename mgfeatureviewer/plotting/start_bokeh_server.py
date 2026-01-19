@@ -4,10 +4,12 @@ import os
 import duckdb
 import traceback
 
+import panel as pn
+
 from bokeh.layouts import column, row
 from bokeh.models import Div, InlineStyleSheet, Tooltip
 from bokeh.models.callbacks import CustomJS
-from bokeh.models.widgets import AutocompleteInput, CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup, RangeSlider, Select, TextInput
+from bokeh.models.widgets import AutocompleteInput, CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup, Select, TextInput
 from bokeh.models.plots import GridPlot
 
 # Import the plotting function from the repo
@@ -57,7 +59,7 @@ def build_controls(conn):
     except Exception:
         pass
 
-    # Get Coverage_variation min/max from Explicit_presences view (already divided by 100)
+    # Get Coverage_variation min/max from Explicit_presences view (already divided by 1000000)
     coverage_variation_max = 1.0
     try:
         cur.execute("SELECT MIN(Coverage_variation), MAX(Coverage_variation) FROM Explicit_presences WHERE Coverage_variation IS NOT NULL")
@@ -65,6 +67,17 @@ def build_controls(conn):
         if result and result[0] is not None and result[1] is not None:
             coverage_variation_min = result[0]
             coverage_variation_max = result[1]
+    except Exception:
+        pass
+
+    # Get Coverage_sd min/max from Explicit_presences view (already divided by 1000000)
+    coverage_sd_max = 1.0
+    try:
+        cur.execute("SELECT MIN(Coverage_sd), MAX(Coverage_sd) FROM Explicit_presences WHERE Coverage_sd IS NOT NULL")
+        result = cur.fetchone()
+        if result and result[0] is not None and result[1] is not None:
+            coverage_sd_min = result[0]
+            coverage_sd_max = result[1]
     except Exception:
         pass
 
@@ -241,92 +254,41 @@ def build_controls(conn):
         'coverage_mean_max': coverage_mean_max,
         'coverage_median_max': coverage_median_max,
         'coverage_variation_max': coverage_variation_max,
+        'coverage_sd_max': coverage_sd_max,
         'whole_contamination_max': whole_contamination_max
     }
     return widgets
 
-def modify_doc_factory(db_path):
-    """Return a modify_doc(doc) function to be used by Bokeh server application."""
+def create_layout(db_path):
+    """Create and return the application layout for Panel serve."""
 
     ### Event functions
-    ## Helper function to create RangeSlider with synchronized TextInputs
-    def create_slider_with_inputs(title, start, end, value, step, format_func=None, on_input_change=None):
-        """Create a RangeSlider with two TextInputs for manual value entry.
+    ## Helper function to create Panel EditableRangeSlider
+    def create_editable_range_slider(title, start, end, value, step, on_change=None):
+        """Create a Panel EditableRangeSlider.
 
         Args:
-            title: Slider title
+            title: Slider title/name
             start: Minimum value
             end: Maximum value
             value: Tuple of (min_value, max_value)
             step: Step size
-            format_func: Optional function to format values for display (default: auto-detect int/float)
-            on_input_change: Optional callback to call when TextInput values change (for filtering)
+            on_change: Optional callback to call when value changes
 
         Returns:
-            Tuple of (slider, min_input, max_input, combined_row)
+            Panel EditableRangeSlider widget
         """
-        slider = RangeSlider(
-            start=start, end=end, value=value, step=step,
-            title=title, sizing_mode="stretch_width"
+        slider = pn.widgets.EditableRangeSlider(
+            name=title,
+            start=start,
+            end=end,
+            value=value,
+            step=step,
+            sizing_mode="stretch_width"
         )
-
-        # Auto-detect format function if not provided
-        if format_func is None:
-            if isinstance(step, int) or (isinstance(step, float) and step == int(step)):
-                format_func = lambda x: str(int(x))
-            else:
-                # Determine decimal places from step
-                step_str = str(step)
-                if '.' in step_str:
-                    decimals = len(step_str.split('.')[1])
-                else:
-                    decimals = 2
-                format_func = lambda x, d=decimals: f"{x:.{d}f}"
-
-        min_input = TextInput(value=format_func(value[0]), width=60, title="")
-        max_input = TextInput(value=format_func(value[1]), width=60, title="")
-
-        # Lock to prevent infinite callback loops
-        sync_lock = {'locked': False}
-
-        # Sync slider → inputs
-        def slider_to_inputs(attr, old, new):
-            if sync_lock['locked']:
-                return
-            sync_lock['locked'] = True
-            min_input.value = format_func(new[0])
-            max_input.value = format_func(new[1])
-            sync_lock['locked'] = False
-
-        # Sync inputs → slider
-        def inputs_to_slider(attr, old, new):
-            if sync_lock['locked']:
-                return
-            try:
-                min_val = float(min_input.value)
-                max_val = float(max_input.value)
-                # Clamp to valid range
-                min_val = max(slider.start, min(min_val, slider.end))
-                max_val = max(slider.start, min(max_val, slider.end))
-                # Ensure min <= max
-                if min_val <= max_val:
-                    sync_lock['locked'] = True
-                    slider.value = (min_val, max_val)
-                    sync_lock['locked'] = False
-                    # Call the callback to trigger filtering
-                    if on_input_change:
-                        on_input_change()
-            except ValueError:
-                pass  # Invalid input, ignore
-
-        slider.on_change('value', slider_to_inputs)
-        min_input.on_change('value', inputs_to_slider)
-        max_input.on_change('value', inputs_to_slider)
-
-        # Create combined layout: [min_input] [slider] [max_input]
-        combined_row = row(min_input, slider, max_input, sizing_mode="stretch_width")
-
-        return slider, min_input, max_input, combined_row
+        if on_change:
+            slider.param.watch(on_change, 'value_throttled')
+        return slider
 
     ## Helper function to create collapsible section toggle callbacks
     def make_toggle_callback(btn, content):
@@ -570,6 +532,13 @@ def modify_doc_factory(db_path):
                 conditions.append("Coverage_variation >= ? AND Coverage_variation <= ?")
                 params.extend([min_val, max_val])
 
+        if coverage_sd_slider is not None:
+            min_val, max_val = coverage_sd_slider.value
+            cov_sd_max = widgets['coverage_sd_max']
+            if min_val > 0 or max_val < cov_sd_max:
+                conditions.append("Coverage_sd >= ? AND Coverage_sd <= ?")
+                params.extend([min_val, max_val])
+
         if conditions:
             query = f"SELECT DISTINCT Contig_name FROM Explicit_presences WHERE {' AND '.join(conditions)}"
             cur.execute(query, params)
@@ -660,6 +629,13 @@ def modify_doc_factory(db_path):
             cov_var_max = widgets['coverage_variation_max']
             if min_val > 0 or max_val < cov_var_max:
                 conditions.append("Coverage_variation >= ? AND Coverage_variation <= ?")
+                params.extend([min_val, max_val])
+
+        if coverage_sd_slider is not None:
+            min_val, max_val = coverage_sd_slider.value
+            cov_sd_max = widgets['coverage_sd_max']
+            if min_val > 0 or max_val < cov_sd_max:
+                conditions.append("Coverage_sd >= ? AND Coverage_sd <= ?")
                 params.extend([min_val, max_val])
 
         if conditions:
@@ -1078,9 +1054,8 @@ def modify_doc_factory(db_path):
 
 
     ## Build filtering section
-    filtering_toggle_btn = Button(label="▶", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
-    filtering_title = Div(text="<b>Filtering</b>", align="center")
-    filtering_header = row(filtering_toggle_btn, filtering_title, sizing_mode="stretch_width", align="center")
+    filtering_title = Div(text="<b>Filtering</b>")
+    filtering_header = filtering_title  # No toggle button - always visible
 
     filtering_children = []
 
@@ -1094,27 +1069,37 @@ def modify_doc_factory(db_path):
     coverage_mean_slider = None
     coverage_median_slider = None
     coverage_variation_slider = None
+    coverage_sd_slider = None
 
-    # Add "Contig filters" subsection (if multiple contigs)
+    # Add "Contig filters" collapsible subsection (if multiple contigs)
     min_len = min(widgets['contig_lengths'].values())
     max_len = max(widgets['contig_lengths'].values())
     length_slider = None
     if len(widgets["contigs"]) > 1:
-        contig_filters_title = Div(text="<b>Contig filters:</b>")
-        filtering_children.append(contig_filters_title)
+        contig_toggle_btn = Button(label="▶", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
+        contig_filters_title = Div(text="Contig filters", align="center")
+        contig_filters_header = row(contig_toggle_btn, contig_filters_title, sizing_mode="stretch_width", align="center")
 
-        length_slider, length_min_input, length_max_input, length_row = create_slider_with_inputs(
+        length_slider = create_editable_range_slider(
             "Contig length", min_len, max_len, (min_len, max_len), step=1,
-            on_input_change=refresh_contig_options
+            on_change=lambda event: refresh_contig_options()
         )
-        length_slider.on_change('value_throttled', lambda attr, old, new: refresh_contig_options())
-        filtering_children.append(length_row)
 
-    # Add "Per module" filtering subsection (if phage mechanisms or completeness data exists)
+        contig_filters_content = pn.Column(length_slider, visible=False, sizing_mode="stretch_width")
+        contig_toggle_btn.on_click(make_toggle_callback(contig_toggle_btn, contig_filters_content))
+
+        filtering_children.append(contig_filters_header)
+        filtering_children.append(contig_filters_content)
+
+    # Add "Coverage filters" collapsible subsection (always available if any module filters exist)
     has_module_filters = widgets['phage_mechanisms'] or widgets['has_completeness']
     if has_module_filters:
-        per_module_title = Div(text="<b>Per module:</b>")
-        filtering_children.append(per_module_title)
+        # Create collapsible Coverage filters section
+        coverage_toggle_btn = Button(label="▶", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
+        coverage_filters_title = Div(text="Coverage filters", align="center")
+        coverage_filters_header = row(coverage_toggle_btn, coverage_filters_title, sizing_mode="stretch_width", align="center")
+
+        coverage_filters_children = []
 
         correction_label = Div(text="Harmonise coverage mean between samples:", margin=(5, 0, 0, 10))
         correction_filter = Select(
@@ -1122,18 +1107,17 @@ def modify_doc_factory(db_path):
                 value="No correction",   # default = no filter (empty = all)
                 sizing_mode="stretch_width",
             )
-        filtering_children.append(correction_label)
-        filtering_children.append(correction_filter)
+        coverage_filters_children.append(correction_label)
+        coverage_filters_children.append(correction_filter)
 
         # Coverage patterns sliders (always available from Presences table)
         cov_mean_min = 0
         cov_mean_max = widgets['coverage_mean_max']
-        coverage_mean_slider, coverage_mean_min_input, coverage_mean_max_input, coverage_mean_row = create_slider_with_inputs(
+        coverage_mean_slider = create_editable_range_slider(
             "Coverage mean", cov_mean_min, cov_mean_max, (cov_mean_min, cov_mean_max), step=1,
-            on_input_change=lambda: (refresh_contig_options(), refresh_sample_options())
+            on_change=lambda event: (refresh_contig_options(), refresh_sample_options())
         )
-        coverage_mean_slider.on_change('value_throttled', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
-        filtering_children.append(coverage_mean_row)
+        coverage_filters_children.append(coverage_mean_slider)
 
         # Function to update coverage_mean_slider range when correction method changes
         def update_coverage_mean_slider():
@@ -1146,21 +1130,17 @@ def modify_doc_factory(db_path):
                 coverage_mean_slider.start = 0
                 coverage_mean_slider.end = new_max
                 coverage_mean_slider.value = (0, new_max)
-                # Also update TextInputs to match new range
-                coverage_mean_min_input.value = "0"
-                coverage_mean_max_input.value = str(int(new_max))
             refresh_contig_options()
             refresh_sample_options()
 
         # Coverage median slider
         cov_median_min = 0
         cov_median_max = widgets['coverage_median_max']
-        coverage_median_slider, coverage_median_min_input, coverage_median_max_input, coverage_median_row = create_slider_with_inputs(
+        coverage_median_slider = create_editable_range_slider(
             "Coverage median", cov_median_min, cov_median_max, (cov_median_min, cov_median_max), step=1,
-            on_input_change=lambda: (refresh_contig_options(), refresh_sample_options())
+            on_change=lambda event: (refresh_contig_options(), refresh_sample_options())
         )
-        coverage_median_slider.on_change('value_throttled', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
-        filtering_children.append(coverage_median_row)
+        coverage_filters_children.append(coverage_median_slider)
 
         # Function to update coverage_median_slider range when correction method changes
         def update_coverage_median_slider():
@@ -1173,9 +1153,6 @@ def modify_doc_factory(db_path):
                 coverage_median_slider.start = 0
                 coverage_median_slider.end = new_max
                 coverage_median_slider.value = (0, new_max)
-                # Also update TextInputs to match new range
-                coverage_median_min_input.value = "0"
-                coverage_median_max_input.value = str(int(new_max))
             refresh_contig_options()
             refresh_sample_options()
 
@@ -1183,75 +1160,107 @@ def modify_doc_factory(db_path):
         if hasattr(correction_filter, 'on_change'):
             correction_filter.on_change('value', lambda attr, old, new: (update_coverage_mean_slider(), update_coverage_median_slider()))
 
-        coverage_percentage_slider, _, _, coverage_percentage_row = create_slider_with_inputs(
+        coverage_percentage_slider = create_editable_range_slider(
             "Coverage percentage (%)", 0, 100, (0, 100), step=1,
-            on_input_change=lambda: (refresh_contig_options(), refresh_sample_options())
+            on_change=lambda event: (refresh_contig_options(), refresh_sample_options())
         )
-        coverage_percentage_slider.on_change('value_throttled', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
-        filtering_children.append(coverage_percentage_row)
+        coverage_filters_children.append(coverage_percentage_slider)
 
         cov_var_min = 0.0
         cov_var_max = widgets['coverage_variation_max']
-        # Slider shows normalized variance (stored value / 100)
-        coverage_variation_slider, _, _, coverage_variation_row = create_slider_with_inputs(
+        # Slider shows normalized variance (stored value / 1000000)
+        coverage_variation_slider = create_editable_range_slider(
             "Coverage variation", cov_var_min, cov_var_max, (cov_var_min, cov_var_max), step=0.01,
-            on_input_change=lambda: (refresh_contig_options(), refresh_sample_options())
+            on_change=lambda event: (refresh_contig_options(), refresh_sample_options())
         )
-        coverage_variation_slider.on_change('value_throttled', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
-        filtering_children.append(coverage_variation_row)
+        coverage_filters_children.append(coverage_variation_slider)
 
-        # Completeness range sliders (if Completeness table has data)
-        if widgets['has_completeness']:
-            prevalence_left_slider, _, _, prevalence_left_row = create_slider_with_inputs(
-                "Left completeness (%)", 0, 100, (0, 100), step=1,
-                on_input_change=lambda: (refresh_contig_options(), refresh_sample_options())
-            )
-            prevalence_left_slider.on_change('value_throttled', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
+        cov_sd_min = 0.0
+        cov_sd_max = widgets['coverage_sd_max']
+        # Slider shows coefficient of variation (stored value / 1000000)
+        coverage_sd_slider = create_editable_range_slider(
+            "Coverage SD", cov_sd_min, cov_sd_max, (cov_sd_min, cov_sd_max), step=0.01,
+            on_change=lambda event: (refresh_contig_options(), refresh_sample_options())
+        )
+        coverage_filters_children.append(coverage_sd_slider)
 
-            prevalence_right_slider, _, _, prevalence_right_row = create_slider_with_inputs(
-                "Right completeness (%)", 0, 100, (0, 100), step=1,
-                on_input_change=lambda: (refresh_contig_options(), refresh_sample_options())
-            )
-            prevalence_right_slider.on_change('value_throttled', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
+        # Create coverage filters content container (collapsible)
+        coverage_filters_content = pn.Column(*coverage_filters_children, visible=False, sizing_mode="stretch_width")
+        coverage_toggle_btn.on_click(make_toggle_callback(coverage_toggle_btn, coverage_filters_content))
 
-            pct_completeness_slider, _, _, pct_completeness_row = create_slider_with_inputs(
-                "Whole completeness (%)", 0, 100, (0, 100), step=1,
-                on_input_change=lambda: (refresh_contig_options(), refresh_sample_options())
-            )
-            pct_completeness_slider.on_change('value_throttled', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
+        filtering_children.append(coverage_filters_header)
+        filtering_children.append(coverage_filters_content)
 
-            conta_max = max(100, widgets['whole_contamination_max'])
-            pct_contamination_slider, _, _, pct_contamination_row = create_slider_with_inputs(
-                "Whole contamination (%)", 0, conta_max, (0, conta_max), step=1,
-                on_input_change=lambda: (refresh_contig_options(), refresh_sample_options())
-            )
-            pct_contamination_slider.on_change('value_throttled', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
+    # Add "Completeness filters" collapsible subsection (if Completeness table has data)
+    if widgets['has_completeness']:
+        # Create collapsible Completeness filters section
+        completeness_toggle_btn = Button(label="▶", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
+        completeness_filters_title = Div(text="Completeness filters", align="center")
+        completeness_filters_header = row(completeness_toggle_btn, completeness_filters_title, sizing_mode="stretch_width", align="center")
 
-            filtering_children.extend([
-                prevalence_left_row,
-                prevalence_right_row,
-                pct_completeness_row,
-                pct_contamination_row
-            ])
+        completeness_filters_children = []
 
-        # Phage mechanism checkbox filter (if PhageMechanisms table has data) - after completeness sliders
-        if widgets['phage_mechanisms']:
-            phage_label = Div(text="Phage mechanism:", margin=(5, 0, 0, 10))
-            phage_mechanism_filter = Select(
-                options=[""] + widgets['phage_mechanisms'],
-                value="",   # default = no filter (empty = all)
-                sizing_mode="stretch_width",
-            )
-            phage_mechanism_filter.on_change('value', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
-            filtering_children.append(phage_label)
-            filtering_children.append(phage_mechanism_filter)
+        prevalence_left_slider = create_editable_range_slider(
+            "Left completeness (%)", 0, 100, (0, 100), step=1,
+            on_change=lambda event: (refresh_contig_options(), refresh_sample_options())
+        )
 
-    # Add "Per variable" filtering subsection
+        prevalence_right_slider = create_editable_range_slider(
+            "Right completeness (%)", 0, 100, (0, 100), step=1,
+            on_change=lambda event: (refresh_contig_options(), refresh_sample_options())
+        )
+
+        pct_completeness_slider = create_editable_range_slider(
+            "Whole completeness (%)", 0, 100, (0, 100), step=1,
+            on_change=lambda event: (refresh_contig_options(), refresh_sample_options())
+        )
+
+        conta_max = max(100, widgets['whole_contamination_max'])
+        pct_contamination_slider = create_editable_range_slider(
+            "Whole contamination (%)", 0, conta_max, (0, conta_max), step=1,
+            on_change=lambda event: (refresh_contig_options(), refresh_sample_options())
+        )
+
+        completeness_filters_children.extend([
+            prevalence_left_slider,
+            prevalence_right_slider,
+            pct_completeness_slider,
+            pct_contamination_slider
+        ])
+
+        # Create completeness filters content container (collapsible)
+        completeness_filters_content = pn.Column(*completeness_filters_children, visible=False, sizing_mode="stretch_width")
+        completeness_toggle_btn.on_click(make_toggle_callback(completeness_toggle_btn, completeness_filters_content))
+
+        filtering_children.append(completeness_filters_header)
+        filtering_children.append(completeness_filters_content)
+
+    # Add "Phage mechanisms" collapsible subsection (if PhageMechanisms table has data)
+    if widgets['phage_mechanisms']:
+        phage_toggle_btn = Button(label="▶", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
+        phage_title = Div(text="Phage mechanisms", align="center")
+        phage_header = row(phage_toggle_btn, phage_title, sizing_mode="stretch_width", align="center")
+
+        phage_mechanism_filter = Select(
+            options=[""] + widgets['phage_mechanisms'],
+            value="",   # default = no filter (empty = all)
+            sizing_mode="stretch_width",
+        )
+        phage_mechanism_filter.on_change('value', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
+
+        phage_content = pn.Column(phage_mechanism_filter, visible=False, sizing_mode="stretch_width")
+        phage_toggle_btn.on_click(make_toggle_callback(phage_toggle_btn, phage_content))
+
+        filtering_children.append(phage_header)
+        filtering_children.append(phage_content)
+
+    # Add "Per variable" collapsible filtering subsection
     combined_help = "Filter by variable characteristics.\n\n#Points: Filter by number of data points.\n  - One sample view: Show contigs where more/less than threshold points exist for the variable in selected sample\n  - All samples view: Show contigs where at least one sample has more/less than threshold points\n\nMax: Filter by maximum value.\n  - One sample view: Show contigs where the variable reaches above/below threshold value in selected sample\n  - All samples view: Show contigs where the variable reaches above/below threshold value in at least one sample"
     tooltip = Tooltip(content=combined_help, position="right")
     help_per_variable = HelpButton(tooltip=tooltip, width=20, height=20, align="center", button_type="light", stylesheets=[toggle_stylesheet])
-    per_variable_title = Div(text="<b>Per variable:</b>")
-    per_variable_header = row(per_variable_title, help_per_variable, sizing_mode="stretch_width")
+    per_variable_toggle_btn = Button(label="▶", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
+    per_variable_title = Div(text="Per variable", align="center")
+    per_variable_header = row(per_variable_toggle_btn, per_variable_title, help_per_variable, sizing_mode="stretch_width", align="center")
 
     # Store all variable filter rows for dynamic management (already initialized above)
     variable_filters_column = column(sizing_mode="stretch_width")
@@ -1262,15 +1271,16 @@ def modify_doc_factory(db_path):
     variable_filter_rows.append(initial_row)
     variable_filters_column.children = [initial_row]
 
+    per_variable_content = pn.Column(variable_filters_column, visible=False, sizing_mode="stretch_width")
+    per_variable_toggle_btn.on_click(make_toggle_callback(per_variable_toggle_btn, per_variable_content))
+
     filtering_children.append(per_variable_header)
-    filtering_children.append(variable_filters_column)
+    filtering_children.append(per_variable_content)
 
-    filtering_content = column(
+    filtering_content = pn.Column(
         *filtering_children,
-        visible=False, sizing_mode="stretch_width"
+        visible=True, sizing_mode="stretch_width"  # Always visible, no toggle
     )
-
-    filtering_toggle_btn.on_click(make_toggle_callback(filtering_toggle_btn, filtering_content))
 
 
     ## Build Sample section
@@ -1501,42 +1511,33 @@ def modify_doc_factory(db_path):
                          variables_section_all,  # All Samples view (title headers only)
                          apply_button]
 
-    controls_column = column(*controls_children, width=350, sizing_mode="stretch_height", spacing=0)
-    controls_column.css_classes = ["left-col"]
+    controls_column = pn.Column(*controls_children, width=350, sizing_mode="stretch_height", css_classes=["left-col"])
 
     main_placeholder = column(Div(text="<i>No plot yet. Select one sample, one contig and at least one variable in \"One sample\" mode or one contig and one variable in \"All samples\" mode and click Apply.</i>"), sizing_mode="stretch_both")
 
     # Wrap everything in a Flex container
-    layout = row(controls_column, main_placeholder, sizing_mode="stretch_both", spacing = 0)
+    layout = pn.Row(controls_column, main_placeholder, sizing_mode="stretch_both")
     layout.stylesheets = [stylesheet]
 
-    def modify_doc(doc):
-        doc.add_root(layout)
-
-    return modify_doc
+    return layout
 
 def add_serve_args(parser):
     parser.add_argument("--db", required=True, help="Path to DuckDB database")
-    parser.add_argument("--port", type=int, default=5006, help="Port to serve Bokeh app")
+    parser.add_argument("--port", type=int, default=5006, help="Port to serve Panel app")
 
 def run_serve(args):
-    modify_doc = modify_doc_factory(args.db)
+    # Create a factory function that Panel will call for each session
+    def create_app():
+        return create_layout(args.db)
 
-    try:
-        from bokeh.server.server import Server
-        from bokeh.application import Application
-        from bokeh.application.handlers.function import FunctionHandler
-    except Exception as e:
-        print("Bokeh server components not installed or unavailable:", e)
-        print("You can run this file with `bokeh serve --show start_bokeh_server.py --args --db <DB>` as alternative.")
-        return 1
-
-    app = Application(FunctionHandler(modify_doc))
     static_path = os.path.join(os.path.dirname(__file__), "..", "..", "static")
-    server = Server({'/': app}, port=args.port, static_dirs={'static': static_path})
-    server.start()
-    print(f"Bokeh server running at http://localhost:{args.port}/")
-    server.io_loop.start()
+    pn.serve(
+        create_app,
+        port=args.port,
+        show=True,
+        title="MGFeatureViewer",
+        static_dirs={'assets': static_path}
+    )
     return 0
 
 if __name__ == "__main__":

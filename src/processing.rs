@@ -715,10 +715,30 @@ pub fn process_sample(
                 0.0
             };
 
+            // Coverage SD: Coefficient of Variation (CV) = std_dev / mean
+            // Normalized to remove correlation with coverage depth
+            // Scaled by 1,000,000 for integer storage (same as coverage_variation)
+            let coverage_sd = if arrays.primary_reads.len() > 0 && coverage_mean > 0.0 {
+                let mean_cov = coverage_mean as f64;
+                let n = arrays.primary_reads.len() as f64;
+                let variance: f64 = arrays.primary_reads
+                    .iter()
+                    .map(|&x| {
+                        let diff = x as f64 - mean_cov;
+                        diff * diff
+                    })
+                    .sum::<f64>() / n;
+                let cv = variance.sqrt() / mean_cov;  // Coefficient of variation
+                (cv * 1_000_000.0) as f32
+            } else {
+                0.0
+            };
+
             let presence = PresenceData {
                 contig_name: ref_name.clone(),
                 coverage_pct: coverage_pct as f32,
                 coverage_variation,
+                coverage_sd,
                 coverage_mean,
                 coverage_median,
             };

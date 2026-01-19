@@ -124,7 +124,7 @@ def map_with_mapper(threads: int, assembly_file: Path, sequencing_type: str, rea
 def add_mapping_all_args(parser):
     parser.add_argument('--csv', required=True, help='CSV file with comma-separated columns: read1,read2,sequencing_type,assembly_file')
     parser.add_argument('-a', '--assembly', help='Assembly file to use for all rows (overrides CSV field; optional)')
-    parser.add_argument('-s', '--sequencing_type', choices=['long', 'short'], help='Sequencing type: use "long" or "short"')
+    parser.add_argument('--sequencing-type', choices=['long', 'paired-short', 'single-short'], help='Sequencing type to use for all rows (overrides CSV field; optional)')
     parser.add_argument('--circular', action='store_true', help='Concatenate each contig to itself during the mapping to circularize it')
     parser.add_argument('-o', '--output-dir', required=True, help='Directory to create and place outputs (must NOT exist)')
     parser.add_argument('-t', '--threads', type=int, default=4, help='Threads to pass to minimap2 and samtools (default: 4)')
@@ -180,9 +180,7 @@ def run_mapping_all(args):
         
         seqtype_to_use = global_seqtype if global_seqtype else seqtype
         if not seqtype_to_use:
-            raise ValueError(f"Row {i}: sequencing_type is required (long or short)")
-        if seqtype_to_use not in {"long", "short"}:
-            raise ValueError(f"Row {i}: sequencing_type must be 'long' or 'short', got: {seqtype_to_use}")
+            raise ValueError(f"Row {i}: sequencing_type is required")
         
         assembly_to_use = global_assembly if global_assembly else (Path(assembly) if assembly else None)
         if assembly_to_use is None:
@@ -195,10 +193,19 @@ def run_mapping_all(args):
         basename_assembly = Path(assembly_to_use).stem
         desired_bam = outdir / f"{basename_read1}_mapped_on_{basename_assembly}.bam"
 
-        print(f"Processing row {i}: {read1p} -> assembly {assembly_to_use} (seqtype={seqtype}) -> {desired_bam}")
+        print(f"Processing row {i}: {read1p} -> assembly {assembly_to_use} (seqtype={seqtype_to_use}) -> {desired_bam}")
 
-        # Local execution
-        map_with_mapper(args.threads, assembly_to_use, seqtype_to_use, read1p, read2p, desired_bam, circular=getattr(args, 'circular', False))
+        # Create args namespace for run_mapping_per_sample
+        sample_args = argparse.Namespace(
+            read1=str(read1p),
+            read2=str(read2p) if read2p else None,
+            assembly=str(assembly_to_use),
+            sequencing_type=seqtype_to_use,
+            circular=getattr(args, 'circular', False),
+            output=str(desired_bam),
+            threads=args.threads,
+        )
+        run_mapping_per_sample(sample_args)
 
     print("All rows processed")
     return 0

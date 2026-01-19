@@ -141,13 +141,14 @@ impl DbWriter {
 
         for p in presences {
             if let Some(&contig_id) = self.contig_name_to_id.get(&p.contig_name) {
-                // Store coverage_percentage and coverage_variation as integers (×100)
+                // Store coverage_percentage, coverage_variation, and coverage_sd as integers (scaled)
                 // Store coverage_mean and coverage_median as integers (rounded)
                 let cov_pct = p.coverage_pct.round() as i32;
                 let cov_var = p.coverage_variation.round() as i32;
+                let cov_sd = p.coverage_sd.round() as i32;
                 let cov_mean = p.coverage_mean.round() as i32;
                 let cov_median = p.coverage_median.round() as i32;
-                appender.append_row(params![contig_id, sample_id, cov_pct, cov_var, cov_mean, cov_median])?;
+                appender.append_row(params![contig_id, sample_id, cov_pct, cov_var, cov_sd, cov_mean, cov_median])?;
             }
         }
 
@@ -406,7 +407,7 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
     )
     .context("Failed to create Sample table")?;
 
-    // Coverage_percentage and Coverage_variation stored as INTEGER (×100)
+    // Coverage_percentage, Coverage_variation, and Coverage_sd stored as INTEGER (scaled)
     // Coverage_mean and Coverage_median stored as INTEGER (rounded)
     // No Presence_id needed - (Contig_id, Sample_id) is the natural key
     conn.execute(
@@ -415,6 +416,7 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             Sample_id INTEGER,
             Coverage_percentage INTEGER,
             Coverage_variation INTEGER,
+            Coverage_sd INTEGER,
             Coverage_mean INTEGER,
             Coverage_median INTEGER,
             PRIMARY KEY (Contig_id, Sample_id)
@@ -753,6 +755,7 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
              s.Sample_name,
              p.Coverage_percentage,
              p.Coverage_variation / 1000000.0 AS Coverage_variation,
+             p.Coverage_sd / 1000000.0 AS Coverage_sd,
              p.Coverage_mean,
              p.Coverage_median,
              CAST(s.Number_of_reads AS REAL) / (SELECT MIN(Number_of_reads) FROM Sample WHERE Number_of_reads > 0) AS Read_number_correction_ratio,

@@ -13,6 +13,7 @@ requires-python = ">=3.9"
 
 dependencies = [
     "bokeh>=3.0",
+    "panel>=1.0",
     "biopython>=1.79",
     "pysam>=0.20",
     "numpy>=1.24",

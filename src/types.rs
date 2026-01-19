@@ -426,6 +426,10 @@ pub struct PresenceData {
     /// Coverage variation (Fano factor style): 1/(n-1) * Σ(cov(i+1) - cov(i))² / mean_cov
     /// Measures coverage smoothness normalized by mean (low = uniform, high = variable)
     pub coverage_variation: f32,
+    /// Coverage SD: Coefficient of Variation (CV) = std_dev / mean
+    /// Measures overall spread from the mean, normalized to remove correlation with coverage depth
+    /// Scaled by 1,000,000 for integer storage (same as coverage_variation)
+    pub coverage_sd: f32,
     /// Mean coverage depth across all positions
     pub coverage_mean: f32,
     /// Median coverage depth across all positions
