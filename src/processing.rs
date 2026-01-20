@@ -462,10 +462,14 @@ fn add_features_from_arrays(
 
         // reads_starts and reads_ends (bars) - save original data
         let reads_starts_original: Vec<f64> = arrays.reads_starts.iter().map(|&x| x as f64).collect();
-        let reads_starts_runs = compress_signal_with_reference(&reads_starts_original, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio);
+        let reads_starts_runs = compress_signal_with_reference(
+            &reads_starts_original, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio
+        );
 
         let reads_ends_original: Vec<f64> = arrays.reads_ends.iter().map(|&x| x as f64).collect();
-        let reads_ends_runs = compress_signal_with_reference(&reads_ends_original, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio);
+        let reads_ends_runs = compress_signal_with_reference(
+            &reads_ends_original, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio
+        );
 
         // Add reads_starts and reads_ends to output (original data)
         output.extend(reads_starts_runs.iter().map(|run| FeaturePoint {
@@ -530,61 +534,74 @@ fn add_features_from_arrays(
 
         // === STEP 3: Recompute runs from MERGED data ===
         let coverage_reduced_f64: Vec<f64> = arrays.coverage_reduced.iter().map(|&x| x as f64).collect();
-        let reads_starts_merged: Vec<f64> = arrays.reads_starts.iter().map(|&x| x as f64).collect();
-        let reads_ends_merged: Vec<f64> = arrays.reads_ends.iter().map(|&x| x as f64).collect();
-        let reads_starts_runs_merged = compress_signal_with_reference(&reads_starts_merged, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio);
-        let reads_ends_runs_merged = compress_signal_with_reference(&reads_ends_merged, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio);
-        
-        let left_clip_counts: Vec<f64> = arrays.left_clipping_lengths.iter().map(|v| v.len() as f64).collect();
-        let right_clip_counts: Vec<f64> = arrays.right_clipping_lengths.iter().map(|v| v.len() as f64).collect();
-        let left_clip_runs = compress_signal_with_reference(&left_clip_counts, Some(&primary_reads_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio);
-        let right_clip_runs = compress_signal_with_reference(&right_clip_counts, Some(&primary_reads_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio);
 
-        // === STEP 4: Filter and merge peaks ===
-        let (reads_starts_filtered, reads_ends_filtered) = filter_peaks_by_clippings(
-            &reads_starts_runs_merged,
-            &reads_ends_runs_merged,
-            &left_clip_runs,
-            &right_clip_runs,
-            pt_config.min_events,
-            pt_config.max_distance_peaks,
-            contig_length,
-            config.circular,
-            &dtr_regions,
-        );
+        // Check aligned fraction before proceeding with packaging detection
+        let aligned_count = coverage_reduced_f64.iter().filter(|&&x| x > 0.0).count();
+        let aligned_fraction = if coverage_reduced_f64.is_empty() {
+            0.0
+        } else {
+            (aligned_count as f64 / coverage_reduced_f64.len() as f64) * 100.0
+        };
 
-        let start_peaks = merge_peaks(
-            &reads_starts_filtered,
-            pt_config.max_distance_peaks,
-            contig_length,
-            config.circular,
-            &dtr_regions,
-        );
-        let end_peaks = merge_peaks(
-            &reads_ends_filtered,
-            pt_config.max_distance_peaks,
-            contig_length,
-            config.circular,
-            &dtr_regions,
-        );
+        if aligned_fraction >= pt_config.min_aligned_fraction as f64 {
+            let reads_starts_merged: Vec<f64> = arrays.reads_starts.iter().map(|&x| x as f64).collect();
+            let reads_ends_merged: Vec<f64> = arrays.reads_ends.iter().map(|&x| x as f64).collect();
+            let reads_starts_runs_merged = compress_signal_with_reference(&reads_starts_merged, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
+            let reads_ends_runs_merged = compress_signal_with_reference(&reads_ends_merged, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
 
-        let (mechanism, left_termini, right_termini, duplication) = classify_packaging(
-            &start_peaks,
-            &end_peaks,
-            contig_length,
-            config.circular,
-            &dtr_regions,
-        );
+            let left_clip_counts: Vec<f64> = arrays.left_clipping_lengths.iter().map(|v| v.len() as f64).collect();
+            let right_clip_counts: Vec<f64> = arrays.right_clipping_lengths.iter().map(|v| v.len() as f64).collect();
+            let left_clip_runs = compress_signal_with_reference(&left_clip_counts, Some(&primary_reads_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
+            let right_clip_runs = compress_signal_with_reference(&right_clip_counts, Some(&primary_reads_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
 
-        // Only return PackagingData if there's a detected mechanism (not "No_packaging")
-        if mechanism != "No_packaging" {
-            Some(PackagingData {
-                contig_name: contig_name.to_string(),
-                mechanism,
-                left_termini,
-                right_termini,
-                duplication,
-            })
+            // === STEP 4: Filter and merge peaks ===
+            let (reads_starts_filtered, reads_ends_filtered) = filter_peaks_by_clippings(
+                &reads_starts_runs_merged,
+                &reads_ends_runs_merged,
+                &left_clip_runs,
+                &right_clip_runs,
+                pt_config.min_events as f64,
+                pt_config.max_distance_peaks,
+                contig_length,
+                config.circular,
+                &dtr_regions,
+            );
+
+            let start_peaks = merge_peaks(
+                &reads_starts_filtered,
+                pt_config.max_distance_peaks,
+                contig_length,
+                config.circular,
+                &dtr_regions,
+            );
+            let end_peaks = merge_peaks(
+                &reads_ends_filtered,
+                pt_config.max_distance_peaks,
+                contig_length,
+                config.circular,
+                &dtr_regions,
+            );
+
+            let (mechanism, left_termini, right_termini, duplication) = classify_packaging(
+                &start_peaks,
+                &end_peaks,
+                contig_length,
+                config.circular,
+                &dtr_regions,
+            );
+
+            // Only return PackagingData if there's a detected mechanism (not "No_packaging")
+            if mechanism != "No_packaging" {
+                Some(PackagingData {
+                    contig_name: contig_name.to_string(),
+                    mechanism,
+                    left_termini,
+                    right_termini,
+                    duplication,
+                })
+            } else {
+                None
+            }
         } else {
             None
         }
