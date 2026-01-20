@@ -882,7 +882,6 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
          SELECT
              c.Contig_name,
              s.Sample_name,
-             p.Coverage_percentage AS Coverage_percentage,
              m.Phage_packaging_mechanism,
              m.Phage_left_terminus,
              m.Phage_right_terminus,

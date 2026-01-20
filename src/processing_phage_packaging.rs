@@ -14,8 +14,12 @@ pub struct Peak {
 /// Configuration for phage termini detection.
 #[derive(Clone, Copy)]
 pub struct PhageTerminiConfig {
+    /// Minimum aligned fraction to evaluate the phage termini
+    pub min_aligned_fraction: i32,
     /// Minimum event count to consider a signal significant (applies to both peaks and clippings)
-    pub min_events: f64,
+    pub min_events: i32,
+    /// Minimum frequence of events to consider a signal significant (applies to both peaks and clippings)
+    pub min_frequency: i32,
     /// Maximum distance (bp) between peaks to merge them
     pub max_distance_peaks: i32,
     /// Maximum distance (bp) from reference ends for duplication regions to be considered valid.
@@ -27,7 +31,9 @@ pub struct PhageTerminiConfig {
 impl Default for PhageTerminiConfig {
     fn default() -> Self {
         Self {
-            min_events: 10.0,
+            min_aligned_fraction: 100,
+            min_events: 10,
+            min_frequency: 10,
             max_distance_peaks: 20,
             max_distance_duplication: 100,
         }
