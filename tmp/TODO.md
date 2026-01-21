@@ -46,12 +46,9 @@
 
 - I should understand where all reads start, sometimes weird that starts+clippings do not bring all answers
 - !important! Problem when start_reads one bp away from other start_reads but on the other side and in a duplication -> becomes one duplication away and thus not merged
-- !important! Phage packaging determination affected by coverage_percentage maybe should not. Coverage_percentage should be close to 100% to establish termini!
-  subsampled_illumina_random_P1_SRR5042723_1_mapped_on_combined_assemblies     │ NC_000929.1_Mu            │ DTR_long_5' because phage termini inferred despite low coverage (coverage_percentage=56%)
 - I can use division by cov+ and cov- to get stronger signal for tau? Would imply different mathematical rules
 - Normally reads covering a position RP = reads starting with a match RM + reads starting with a clipping RC -> I could a check like that telling how reads start of average
 - Plutôt que de regarder zones de départ pourquoi ne pas regarder reads qui crossent tel/tel endroit -> I should be able to know how each read is starting and based on that i can have view to calculate percentage or reads passing each spot (number starting there divided by number continuing-ish)
-- !important! Separate params phageterm de compression parameters
 - !important! Say that if too much coverage variation I cannot conclude safely on phage packaging: raise warning or stop?
 
 # Utils:
