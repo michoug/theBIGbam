@@ -33,7 +33,7 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
         shared_xrange.start = xstart
         shared_xrange.end = xend
 
-    annotation_fig = make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool, subplot_size, shared_xrange) if genbank_path else None
+    annotation_fig = make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool, subplot_size, shared_xrange, xstart, xend) if genbank_path else None
 
     # Get list of samples
     cur.execute("SELECT Presences.Sample_id, Sample_name FROM Presences JOIN Sample ON Presences.Sample_id = Sample.Sample_id WHERE Contig_id=?", (contig_id,))
@@ -60,21 +60,21 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
                 if feature_lower in ["repeats", "repeat", "direct repeats", "inverted repeats"]:
                     # Direct repeats
                     if feature_lower in ["repeats", "repeat", "direct repeats"]:
-                        direct_feature_dict = get_repeats_data(cur, contig_id, "direct_repeats")
+                        direct_feature_dict = get_repeats_data(cur, contig_id, "direct_repeats", xstart, xend)
                         if direct_feature_dict:
                             direct_subplot = make_bokeh_subplot(direct_feature_dict, subplot_size, shared_xrange)
                             if direct_subplot is not None:
                                 genome_subplots.append(direct_subplot)
                     # Inverted repeats
                     if feature_lower in ["repeats", "repeat", "inverted repeats"]:
-                        inverted_feature_dict = get_repeats_data(cur, contig_id, "inverted_repeats")
+                        inverted_feature_dict = get_repeats_data(cur, contig_id, "inverted_repeats", xstart, xend)
                         if inverted_feature_dict:
                             inverted_subplot = make_bokeh_subplot(inverted_feature_dict, subplot_size, shared_xrange)
                             if inverted_subplot is not None:
                                 genome_subplots.append(inverted_subplot)
                 else:
                     # Other Genome features - try to get data (may fail if sample-dependent)
-                    list_feature_dict = get_feature_data(cur, genome_feature, contig_id, sample_id=None)
+                    list_feature_dict = get_feature_data(cur, genome_feature, contig_id, sample_id=None, xstart=xstart, xend=xend)
                     if not list_feature_dict:
                         continue
 
@@ -90,7 +90,7 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
     subplots = []
     for sample_id, sample_name in zip(sample_ids, sample_names):
         try:
-            list_feature_dict = get_feature_data(cur, variable, contig_id, sample_id)
+            list_feature_dict = get_feature_data(cur, variable, contig_id, sample_id, xstart, xend)
             if not list_feature_dict:
                 continue
 

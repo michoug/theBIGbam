@@ -79,7 +79,7 @@ mod python {
     ///         - "samples_failed": int
     ///         - "total_time": float (seconds)
     #[pyfunction]
-    #[pyo3(signature = (genbank_path, bam_files, output_db, modules, threads, sequencing_type=None, annotation_tool="", min_coverage=50.0, curve_ratio=10.0, bar_ratio=10.0, contig_variation_percentage=10.0, circular=false, create_indexes=true, max_samples_in_memory=10, autoblast_file=""))]
+    #[pyo3(signature = (genbank_path, bam_files, output_db, modules, threads, sequencing_type=None, annotation_tool="", min_coverage=50.0, curve_ratio=10.0, bar_ratio=10.0, contig_variation_percentage=10.0, circular=false, create_indexes=true, autoblast_file=""))]
     fn process_all_samples<'py>(
         py: Python<'py>,
         genbank_path: &str,
@@ -95,7 +95,6 @@ mod python {
         contig_variation_percentage: f64,
         circular: bool,
         create_indexes: bool,
-        max_samples_in_memory: usize,
         autoblast_file: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
         use crate::processing::{run_all_samples, ProcessConfig};
@@ -129,7 +128,6 @@ mod python {
                 annotation_tool,
                 &config,
                 create_indexes,
-                max_samples_in_memory,
                 Path::new(autoblast_file),
             )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))

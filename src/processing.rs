@@ -850,7 +850,6 @@ pub fn run_all_samples(
     annotation_tool: &str,
     config: &ProcessConfig,
     _create_indexes: bool, // Ignored - DuckDB uses zone maps instead of indexes
-    max_samples_in_memory: usize,
     autoblast_file: &Path,
 ) -> Result<ProcessResult> {
     unsafe {
@@ -928,7 +927,7 @@ pub fn run_all_samples(
     // Pre-validation: check all samples for warnings before processing starts
     validate_all_samples(bam_files, &contigs, modules, config.circular);
 
-    let result = process_samples_parallel(&bam_files, &contigs, modules, config, db_writer, max_samples_in_memory, &repeats)?;
+    let result = process_samples_parallel(&bam_files, &contigs, modules, config, db_writer, &repeats)?;
 
     print_summary(&result, output_db);
 
@@ -953,19 +952,31 @@ fn process_samples_parallel(
     modules: &[String],
     config: &ProcessConfig,
     db_writer: DbWriter,
-    max_samples_in_memory: usize,
     repeats: &[RepeatsData],
 ) -> Result<ProcessResult> {
     let total = bam_files.len();
     let is_tty = atty::is(Stream::Stderr);
     let start_time = std::time::Instant::now();
 
-    // Sequential mode for single thread: process one → write one → repeat
+    // Smart parallelization based on dataset characteristics:
+    // - Many contigs (metagenomic ≥500): limit concurrency to prevent OOM
+    // - Few contigs (phage/small genomes <500): full parallelism
+    //
+    // Sequential mode only for single-threaded operation
     if config.threads == 1 {
         return process_samples_sequential(bam_files, contigs, modules, config, db_writer, is_tty, repeats);
     }
 
-    // Parallel mode: producer-consumer with bounded channel
+    // Adaptive channel size based on memory pressure from contig count
+    // - Metagenomic (≥500 contigs): channel_size=1 → process one sample at a time (prevents OOM)
+    // - Normal (<500 contigs): channel_size=threads → full parallelism
+    let channel_size = if contigs.len() >= 500 {
+        1  // Large samples → process one at a time to prevent OOM
+    } else {
+        config.threads  // Normal samples → full parallelism
+    };
+
+    // Sample-parallel mode: producer-consumer with bounded channel
     let mp = MultiProgress::new();
 
     // For TTY: use interactive progress bars
@@ -1000,8 +1011,8 @@ fn process_samples_parallel(
         mp.add(ProgressBar::hidden())
     };
 
-    // Bounded channel limits memory to ~max_samples_in_memory samples
-    let (tx, rx) = sync_channel::<SampleResult>(max_samples_in_memory);
+    // Bounded channel limits memory based on dataset characteristics
+    let (tx, rx) = sync_channel::<SampleResult>(channel_size);
 
     let completed_count = AtomicUsize::new(0);
     let failed_count = AtomicUsize::new(0);

@@ -193,7 +193,7 @@ pub const VARIABLES: &[VariableConfig] = &[
     // Genome module - genomic properties
     VariableConfig { name: "direct_repeats", subplot: "Repeats", module: "Genome", module_order: 1, plot_type: PlotType::Bars, color: "#c1121f", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Direct repeats", help: Some("Direct repeats detected by self-BLAST (e.g., terminal repeats)") },   
     VariableConfig { name: "inverted_repeats", subplot: "Repeats", module: "Genome", module_order: 1, plot_type: PlotType::Bars, color: "#12C1B4", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Inverted repeats", help: Some("Inverted repeats detected by self-BLAST (e.g., terminal repeats)") },   
-    VariableConfig { name: "gc_content", subplot: "GC content", module: "Genome", module_order: 2, plot_type: PlotType::Curve, color: "#00008B", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "GC content", help: None },   
+    VariableConfig { name: "gc_content", subplot: "GC content", module: "Genome", module_order: 2, plot_type: PlotType::Curve, color: "#C3B1E1", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "GC content", help: None },   
     
     // Coverage module - basic read depth
     VariableConfig { name: "primary_reads", subplot: "Primary alignments", module: "Coverage", module_order: 1, plot_type: PlotType::Curve, color: "#333333", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Primary reads", help: None },

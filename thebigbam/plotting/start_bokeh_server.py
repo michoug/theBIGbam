@@ -104,6 +104,23 @@ def build_controls(conn):
     except Exception:
         pass
 
+    # Get annotation columns and their distinct values from Contig_annotation table
+    annotation_filters = {}
+    excluded_columns = {'Contig_id', 'Start', 'End', 'Strand', 'Type'}
+    try:
+        # Get column names from Contig_annotation table
+        cur.execute("PRAGMA table_info(Contig_annotation)")
+        columns = [row[1] for row in cur.fetchall() if row[1] not in excluded_columns]
+        
+        # Get distinct non-null values for each column
+        for column in columns:
+            cur.execute(f'SELECT DISTINCT "{column}" FROM Contig_annotation WHERE "{column}" IS NOT NULL ORDER BY "{column}"')
+            values = [str(r[0]) for r in cur.fetchall()]  # Convert to strings for AutocompleteInput
+            if values:  # Only add if there are values
+                annotation_filters[column] = values
+    except Exception:
+        pass  # Table doesn't exist or has no data
+
     # Widget Selector for Contigs (autocomplete with max 20 suggestions)
     cur.execute("SELECT Contig_name, Contig_length, Duplication_percentage FROM Contig ORDER BY Contig_name")
     rows = cur.fetchall()
@@ -274,7 +291,10 @@ def build_controls(conn):
         'whole_contamination_max': whole_contamination_max,
         'duplication_percentage_min': duplication_percentage_min,
         'duplication_percentage_max': duplication_percentage_max,
-        'has_duplication_data': has_duplication_data
+        'has_duplication_data': has_duplication_data,
+        'annotation_filters': annotation_filters,
+        'full_contigs': contigs,  # Store full list for substring matching
+        'full_samples': samples   # Store full list for substring matching
     }
     return widgets
 
@@ -310,6 +330,15 @@ def create_layout(db_path):
             slider.param.watch(on_change, 'value_throttled')
         return slider
 
+    ## Helper function for substring matching in autocomplete
+    def substring_filter(items, query, max_results=20):
+        """Filter items by substring match (case-insensitive)."""
+        if not query:
+            return [""] + items[:max_results]
+        query_lower = query.lower()
+        matches = [item for item in items if query_lower in item.lower()]
+        return [""] + matches[:max_results]
+
     ## Helper function to create collapsible section toggle callbacks
     def make_toggle_callback(btn, content):
         def callback():
@@ -319,6 +348,9 @@ def create_layout(db_path):
             else:
                 btn.label = "▶"
         return callback
+    
+    # Initialize annotation_inputs early so it's accessible in filter functions
+    annotation_inputs = {}
     
     ## Helper functions to refresh completions based on filters
     def query_summary_filtered_items(entity_type, var_name, comparison, threshold, filter_type="#Points"):
@@ -634,6 +666,19 @@ def create_layout(db_path):
             matching = {row[0] for row in cur.fetchall()}
             allowed_contigs &= matching
 
+        # Apply annotation filters
+        for column_name, input_widget in annotation_inputs.items():
+            if input_widget.value:
+                query = f'''
+                    SELECT DISTINCT Contig.Contig_name 
+                    FROM Contig_annotation
+                    JOIN Contig ON Contig_annotation.Contig_id = Contig.Contig_id
+                    WHERE "{column_name}" = ?
+                '''
+                cur.execute(query, (input_widget.value,))
+                matching = {row[0] for row in cur.fetchall()}
+                allowed_contigs &= matching
+
         return allowed_contigs
 
     def get_module_filtered_samples(contig_name=None):
@@ -755,6 +800,34 @@ def create_layout(db_path):
                 cur.execute(query, (phage_mechanism_filter.value,))
             matching = {row[0] for row in cur.fetchall()}
             allowed_samples &= matching
+
+        # Apply annotation filters (samples that have the contig with matching annotations)
+        for column_name, input_widget in annotation_inputs.items():
+            if input_widget.value:
+                if contig_name:
+                    # Filter samples that have this specific contig with the annotation
+                    query = f'''
+                        SELECT DISTINCT Sample.Sample_name
+                        FROM Contig_annotation
+                        JOIN Contig ON Contig_annotation.Contig_id = Contig.Contig_id
+                        JOIN Presences ON Contig.Contig_id = Presences.Contig_id
+                        JOIN Sample ON Presences.Sample_id = Sample.Sample_id
+                        WHERE "{column_name}" = ? AND Contig.Contig_name = ?
+                    '''
+                    cur.execute(query, (input_widget.value, contig_name))
+                else:
+                    # Filter samples that have any contig with the annotation
+                    query = f'''
+                        SELECT DISTINCT Sample.Sample_name
+                        FROM Contig_annotation
+                        JOIN Contig ON Contig_annotation.Contig_id = Contig.Contig_id
+                        JOIN Presences ON Contig.Contig_id = Presences.Contig_id
+                        JOIN Sample ON Presences.Sample_id = Sample.Sample_id
+                        WHERE "{column_name}" = ?
+                    '''
+                    cur.execute(query, (input_widget.value,))
+                matching = {row[0] for row in cur.fetchall()}
+                allowed_samples &= matching
 
         return allowed_samples
 
@@ -1037,15 +1110,30 @@ def create_layout(db_path):
             # Check if gene map should be shown (Gene map is first label in Genome module's cbg)
             genbank_path = db_path if (genome_cbg_one is not None and 0 in genome_cbg_one.active) else None
 
-            # Save current positions of the plot for restoration after re-plot
-            fig = main_placeholder.children[0]
-
+            # Parse and validate position inputs
             xstart = None
             xend = None
-            if isinstance(fig, GridPlot):
-                subplot = fig.children[0][0]
-                xstart = subplot.x_range.start
-                xend = subplot.x_range.end
+            
+            # Validate contig is selected
+            if not contig:
+                main_placeholder.children = [Div(text="<pre>Error: Please select a contig.</pre>")]
+                return
+            
+            # Get contig length for validation
+            contig_length = widgets['contig_lengths'].get(contig, 0)
+            
+            # Parse position inputs
+            try:
+                xstart = int(from_position_input.value) if from_position_input.value.strip() else 0
+                xend = int(to_position_input.value) if to_position_input.value.strip() else contig_length
+            except ValueError:
+                main_placeholder.children = [Div(text="<pre>Error: Invalid position range - positions must be integers.</pre>")]
+                return
+            
+            # Validate position range (1-indexed, positions must be within contig bounds)
+            if xstart < 0 or xend > contig_length or xstart >= xend:
+                main_placeholder.children = [Div(text=f"<pre>Error: Invalid position range - positions must satisfy 0 ≤ start &lt; end ≤ {contig_length}.</pre>")]
+                return
 
             if is_all:
                 # All-samples view: require exactly one variable selected from non-Genome modules
@@ -1255,6 +1343,35 @@ def create_layout(db_path):
                 on_change=lambda event: refresh_contig_options()
             )
             contig_filters_children.append(duplication_slider)
+
+        # Add annotation filters (annotation_inputs already initialized at top of create_layout)
+        for column_name, values in widgets.get('annotation_filters', {}).items():
+            label_div = Div(text=f"Contains {column_name}:", margin=(5, 0, 0, 10))
+            annotation_input = AutocompleteInput(
+                value="",
+                completions=[""] + values,
+                min_characters=0,
+                case_sensitive=False,
+                restrict=False,
+                max_completions=20,
+                placeholder=f"Filter by {column_name}...",
+                sizing_mode="stretch_width"
+            )
+            annotation_input.on_change('value', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
+            
+            # Add substring matching for this annotation filter
+            full_values = values  # Capture in closure
+            def make_annotation_callback(inp, vals):
+                def callback(attr, old, new):
+                    if new:
+                        filtered = substring_filter(vals, new)
+                        inp.completions = filtered
+                return callback
+            annotation_input.on_change('value_input', make_annotation_callback(annotation_input, full_values))
+            
+            annotation_inputs[column_name] = annotation_input
+            contig_filters_children.append(label_div)
+            contig_filters_children.append(annotation_input)
 
         contig_filters_content = pn.Column(*contig_filters_children, visible=False, sizing_mode="stretch_width")
         contig_toggle_btn.on_click(make_toggle_callback(contig_toggle_btn, contig_filters_content))
@@ -1467,6 +1584,13 @@ def create_layout(db_path):
 
     sample_toggle_btn.on_click(make_toggle_callback(sample_toggle_btn, above_sample_content))
     widgets['sample_select'].on_change('value', lambda attr, old, new: refresh_contig_options())
+    
+    # Add substring matching for sample autocomplete
+    def update_sample_completions(attr, old, new):
+        if new:
+            filtered = substring_filter(widgets['full_samples'], new)
+            widgets['sample_select'].completions = filtered
+    widgets['sample_select'].on_change('value_input', update_sample_completions)
 
 
     ## Build Contig section
@@ -1487,7 +1611,24 @@ def create_layout(db_path):
     )
     contig_toggle_btn.on_click(make_toggle_callback(contig_toggle_btn, above_contig_content))
 
-    widgets['contig_select'].on_change('value', lambda attr, old, new: refresh_sample_options())
+    def on_contig_change(attr, old, new):
+        refresh_sample_options()
+        # Update position inputs when contig changes
+        if new and new in widgets['contig_lengths']:
+            from_position_input.value = "0"
+            to_position_input.value = str(widgets['contig_lengths'][new])
+        else:
+            from_position_input.value = "0"
+            to_position_input.value = ""
+    
+    widgets['contig_select'].on_change('value', on_contig_change)
+    
+    # Add substring matching for contig autocomplete
+    def update_contig_completions(attr, old, new):
+        if new:
+            filtered = substring_filter(widgets['full_contigs'], new)
+            widgets['contig_select'].completions = filtered
+    widgets['contig_select'].on_change('value_input', update_contig_completions)
 
 
     ## Build Variables section - TWO SEPARATE SECTIONS for each view
@@ -1608,6 +1749,22 @@ def create_layout(db_path):
 
     # Add Genome section to contig_content
     below_contig_children = []
+    
+    # Create position range inputs
+    from_position_input = TextInput(value="0", placeholder="Start position", sizing_mode="stretch_width")
+    to_position_input = TextInput(value="", placeholder="End position", sizing_mode="stretch_width")
+    
+    position_label_from = Div(text="From", width=40, margin=(5, 5, 5, 0))
+    position_label_to = Div(text="to", width=25, margin=(5, 5, 5, 5))
+    
+    position_row = row(
+        position_label_from, from_position_input, 
+        position_label_to, to_position_input,
+        sizing_mode="stretch_width"
+    )
+    
+    below_contig_children.append(position_row)
+    
     if genome_section is not None:
         below_contig_children = list(below_contig_children) + [genome_section]
 
@@ -1616,6 +1773,10 @@ def create_layout(db_path):
         visible=True, sizing_mode="stretch_width"
     )
     contig_toggle_btn.on_click(make_toggle_callback(contig_toggle_btn, below_contig_content))
+
+    # Initialize position inputs if contig is pre-filled
+    if widgets['contig_select'].value and widgets['contig_select'].value in widgets['contig_lengths']:
+        to_position_input.value = str(widgets['contig_lengths'][widgets['contig_select'].value])
 
 
     ### Attach callbacks for One Sample view (module checkbox ↔ variable bidirectional sync)

@@ -77,10 +77,20 @@ def get_contig_info(cur, contig_name):
         raise ValueError(f"Contig not found: {contig_name}")
     return row
 
-def make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool, subplot_size, shared_xrange):
+def make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool, subplot_size, shared_xrange, xstart=None, xend=None):
     cur = conn.cursor()
 
-    cur.execute("SELECT \"Start\", \"End\", Strand, \"Type\", Product, \"Function\", Phrog FROM Contig_annotation WHERE Contig_id=?", (contig_id,))
+    # Build position filter clause for annotations
+    position_filter = ""
+    params = [contig_id]
+    if xstart is not None and xend is not None:
+        position_filter = " AND \"End\" >= ? AND \"Start\" <= ?"
+        params.extend([xstart, xend])
+
+    cur.execute(
+        f"SELECT \"Start\", \"End\", Strand, \"Type\", Product, \"Function\", Phrog FROM Contig_annotation WHERE Contig_id=?{position_filter}",
+        tuple(params)
+    )
     seq_ann_rows = cur.fetchall()
 
     sequence_annotations = []
@@ -278,13 +288,15 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None, feature
     return p
 
 ### Function to get repeats (contig-level, sample-independent)
-def get_repeats_data(cur, contig_id, variable_name="direct_repeats"):
+def get_repeats_data(cur, contig_id, variable_name="direct_repeats", xstart=None, xend=None):
     """Get repeats data for plotting, formatted for make_bokeh_subplot().
 
     Args:
         cur: DuckDB cursor
         contig_id: Contig ID
         variable_name: Either 'direct_repeats' or 'inverted_repeats'
+        xstart: Optional start position for filtering (only fetch data intersecting this range)
+        xend: Optional end position for filtering (only fetch data intersecting this range)
 
     Returns:
         List with one feature dict formatted for make_bokeh_subplot()
@@ -311,10 +323,17 @@ def get_repeats_data(cur, contig_id, variable_name="direct_repeats"):
 
     # Check if table exists and has data
     try:
+        # Build position filter clause
+        position_filter = ""
+        params = [contig_id]
+        if xstart is not None and xend is not None:
+            position_filter = " AND Position2 >= ? AND Position1 <= ?"
+            params.extend([xstart, xend])
+        
         cur.execute(
             f"SELECT Position1, Position2, Position1prime, Position2prime, Pident "
-            f"FROM {table_name} WHERE Contig_id=? ORDER BY Position1",
-            (contig_id,)
+            f"FROM {table_name} WHERE Contig_id=?{position_filter} ORDER BY Position1",
+            tuple(params)
         )
         rows = cur.fetchall()
     except Exception:
@@ -322,6 +341,16 @@ def get_repeats_data(cur, contig_id, variable_name="direct_repeats"):
 
     if not rows:
         return []
+
+    # Clip repeat positions to requested range
+    if xstart is not None and xend is not None:
+        clipped_rows = []
+        for row in rows:
+            pos1, pos2, pos1p, pos2p, pident_int = row
+            clipped_pos1 = max(pos1, xstart)
+            clipped_pos2 = min(pos2, xend)
+            clipped_rows.append((clipped_pos1, clipped_pos2, pos1p, pos2p, pident_int))
+        rows = clipped_rows
 
     x_coords = []
     y_coords = []
@@ -369,12 +398,14 @@ def get_repeats_data(cur, contig_id, variable_name="direct_repeats"):
 
 
 ### Function to get GC content (contig-level, sample-independent)
-def get_gc_content_data(cur, contig_id):
+def get_gc_content_data(cur, contig_id, xstart=None, xend=None):
     """Get GC content data for plotting, formatted for make_bokeh_subplot().
 
     Args:
         cur: DuckDB cursor
         contig_id: Contig ID
+        xstart: Optional start position for filtering (only fetch data intersecting this range)
+        xend: Optional end position for filtering (only fetch data intersecting this range)
 
     Returns:
         List with one feature dict formatted for make_bokeh_subplot()
@@ -392,10 +423,17 @@ def get_gc_content_data(cur, contig_id):
 
     # Check if table exists and has data
     try:
+        # Build position filter clause
+        position_filter = ""
+        params = [contig_id]
+        if xstart is not None and xend is not None:
+            position_filter = " AND Last_position >= ? AND First_position <= ?"
+            params.extend([xstart, xend])
+        
         cur.execute(
-            "SELECT First_position, Last_position, GC_percentage "
-            "FROM Contig_GCContent WHERE Contig_id=? ORDER BY First_position",
-            (contig_id,)
+            f"SELECT First_position, Last_position, GC_percentage "
+            f"FROM Contig_GCContent WHERE Contig_id=?{position_filter} ORDER BY First_position",
+            tuple(params)
         )
         rows = cur.fetchall()
     except Exception:
@@ -404,14 +442,32 @@ def get_gc_content_data(cur, contig_id):
     if not rows:
         return []
 
+    # Clip GC content positions to requested range
+    if xstart is not None and xend is not None:
+        clipped_rows = []
+        for row in rows:
+            first_pos, last_pos, gc_pct = row
+            clipped_first = max(first_pos, xstart)
+            clipped_last = min(last_pos, xend)
+            clipped_rows.append((clipped_first, clipped_last, gc_pct))
+        rows = clipped_rows
+
     x_coords = []
     y_coords = []
     first_pos_coords = []
     last_pos_coords = []
 
+    # Create step plot by adding points at both start and end of each window
+    # This maintains the GC percentage value across the entire sliding window range
     for first_pos, last_pos, gc_pct in rows:
-        midpoint = (first_pos + last_pos) / 2.0
-        x_coords.append(midpoint)
+        # Add point at start of window
+        x_coords.append(first_pos)
+        y_coords.append(gc_pct)
+        first_pos_coords.append(first_pos)
+        last_pos_coords.append(last_pos)
+        
+        # Add point at end of window (creates horizontal line across window)
+        x_coords.append(last_pos)
         y_coords.append(gc_pct)
         first_pos_coords.append(first_pos)
         last_pos_coords.append(last_pos)
@@ -476,7 +532,7 @@ def merge_rle_segments(plus_rows, minus_rows):
 
 
 ### Function to get features of one variable
-def get_feature_data(cur, feature, contig_id, sample_id):
+def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None):
     """Get feature data for plotting.
 
     Args:
@@ -484,6 +540,8 @@ def get_feature_data(cur, feature, contig_id, sample_id):
         feature: Feature name to query
         contig_id: Contig ID
         sample_id: Sample ID
+        xstart: Optional start position for filtering (only fetch data intersecting this range)
+        xend: Optional end position for filtering (only fetch data intersecting this range)
     """
     # Get rendering info from Variable table (Type and Size are quoted - reserved words in DuckDB)
     cur.execute(
@@ -520,36 +578,89 @@ def get_feature_data(cur, feature, contig_id, sample_id):
         # Special handling for primary_reads: combine strand tables in Python
         # This avoids the OOM issues from the complex VIEW that computes on-the-fly
         if feature_table == "Feature_primary_reads":
+            # Build position filter clause
+            position_filter = ""
+            params = [sample_id, contig_id]
+            if xstart is not None and xend is not None:
+                position_filter = " AND Last_position >= ? AND First_position <= ?"
+                params.extend([xstart, xend])
+            
             cur.execute(
-                "SELECT First_position, Last_position, Value FROM Feature_primary_reads_plus_only "
-                "WHERE Sample_id=? AND Contig_id=? ORDER BY First_position",
-                (sample_id, contig_id)
+                f"SELECT First_position, Last_position, Value FROM Feature_primary_reads_plus_only "
+                f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
+                tuple(params)
             )
             plus_rows = cur.fetchall()
 
             cur.execute(
-                "SELECT First_position, Last_position, Value FROM Feature_primary_reads_minus_only "
-                "WHERE Sample_id=? AND Contig_id=? ORDER BY First_position",
-                (sample_id, contig_id)
+                f"SELECT First_position, Last_position, Value FROM Feature_primary_reads_minus_only "
+                f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
+                tuple(params)
             )
             minus_rows = cur.fetchall()
+
+            # Clip plus and minus rows before merging to ensure boundaries are respected
+            if xstart is not None and xend is not None:
+                clipped_plus = []
+                for first_pos, last_pos, value in plus_rows:
+                    clipped_first = max(first_pos, xstart)
+                    clipped_last = min(last_pos, xend)
+                    clipped_plus.append((clipped_first, clipped_last, value))
+                plus_rows = clipped_plus
+
+                clipped_minus = []
+                for first_pos, last_pos, value in minus_rows:
+                    clipped_first = max(first_pos, xstart)
+                    clipped_last = min(last_pos, xend)
+                    clipped_minus.append((clipped_first, clipped_last, value))
+                minus_rows = clipped_minus
 
             data_rows = merge_rle_segments(plus_rows, minus_rows)
         # Query Feature_* table (RLE format: First_position, Last_position, Value, and optionally Mean, Median, Std)
         elif has_stats:
+            # Build position filter clause
+            position_filter = ""
+            params = [sample_id, contig_id]
+            if xstart is not None and xend is not None:
+                position_filter = " AND Last_position >= ? AND First_position <= ?"
+                params.extend([xstart, xend])
+            
             cur.execute(
                 f"SELECT First_position, Last_position, Value, Mean, Median, Std FROM {feature_table} "
-                "WHERE Sample_id=? AND Contig_id=? ORDER BY First_position",
-                (sample_id, contig_id)
+                f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
+                tuple(params)
             )
             data_rows = cur.fetchall()
         else:
+            # Build position filter clause
+            position_filter = ""
+            params = [sample_id, contig_id]
+            if xstart is not None and xend is not None:
+                position_filter = " AND Last_position >= ? AND First_position <= ?"
+                params.extend([xstart, xend])
+            
             cur.execute(
                 f"SELECT First_position, Last_position, Value FROM {feature_table} "
-                "WHERE Sample_id=? AND Contig_id=? ORDER BY First_position",
-                (sample_id, contig_id)
+                f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
+                tuple(params)
             )
             data_rows = cur.fetchall()
+
+        # Clip feature positions to requested range
+        if xstart is not None and xend is not None:
+            clipped_rows = []
+            for row in data_rows:
+                if has_stats:
+                    first_pos, last_pos, value, mean, median, std = row
+                    clipped_first = max(first_pos, xstart)
+                    clipped_last = min(last_pos, xend)
+                    clipped_rows.append((clipped_first, clipped_last, value, mean, median, std))
+                else:
+                    first_pos, last_pos, value = row
+                    clipped_first = max(first_pos, xstart)
+                    clipped_last = min(last_pos, xend)
+                    clipped_rows.append((clipped_first, clipped_last, value))
+            data_rows = clipped_rows
 
         # Expand RLE runs into individual points for plotting
         x_coords = []
@@ -648,7 +759,7 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
         shared_xrange.start = xstart
         shared_xrange.end = xend
 
-    annotation_fig = make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool, subplot_size, shared_xrange) if genbank_path else None
+    annotation_fig = make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool, subplot_size, shared_xrange, xstart, xend) if genbank_path else None
 
     # Get sample characteristics
     cur.execute("SELECT Sample_id, Sample_name FROM Sample WHERE Sample_name=?", (sample_name,))
@@ -667,7 +778,7 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
     if include_repeats:
         # Direct repeats
         try:
-            direct_feature_dict = get_repeats_data(cur, contig_id, "direct_repeats")
+            direct_feature_dict = get_repeats_data(cur, contig_id, "direct_repeats", xstart, xend)
             if direct_feature_dict:
                 direct_subplot = make_bokeh_subplot(direct_feature_dict, subplot_size, shared_xrange)
                 if direct_subplot is not None:
@@ -676,7 +787,7 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
             print(f"Error processing Direct Repeats: {e}", flush=True)
         # Inverted repeats
         try:
-            inverted_feature_dict = get_repeats_data(cur, contig_id, "inverted_repeats")
+            inverted_feature_dict = get_repeats_data(cur, contig_id, "inverted_repeats", xstart, xend)
             if inverted_feature_dict:
                 inverted_subplot = make_bokeh_subplot(inverted_feature_dict, subplot_size, shared_xrange)
                 if inverted_subplot is not None:
@@ -687,7 +798,7 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
     # Add GC content subplot if requested (contig-level, sample-independent)
     if include_gc_content:
         try:
-            gc_feature_dict = get_gc_content_data(cur, contig_id)
+            gc_feature_dict = get_gc_content_data(cur, contig_id, xstart, xend)
             if gc_feature_dict:
                 gc_subplot = make_bokeh_subplot(gc_feature_dict, subplot_size, shared_xrange)
                 if gc_subplot is not None:
@@ -698,7 +809,7 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
     # Add other requested features
     for feature in requested_features:
         try:
-            list_feature_dict = get_feature_data(cur, feature, contig_id, sample_id)
+            list_feature_dict = get_feature_data(cur, feature, contig_id, sample_id, xstart, xend)
             subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, feature_name=feature)
             if subplot_feature is not None:
                 subplots.append(subplot_feature)

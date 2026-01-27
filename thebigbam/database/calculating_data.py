@@ -12,7 +12,7 @@ except ImportError:
     _rust = None
 
 
-def calculating_all_features_parallel(list_modules, bam_files, output_db, min_coverage, curve_ratio, bar_ratio, contig_variation_percentage=0.1, circular=False, n_sample_cores=None, sequencing_type=None, genbank_path=None, annotation_tool="", max_samples_in_memory=10, autoblast_file=None):
+def calculating_all_features_parallel(list_modules, bam_files, output_db, min_coverage, curve_ratio, bar_ratio, contig_variation_percentage=0.1, circular=False, n_sample_cores=None, sequencing_type=None, genbank_path=None, annotation_tool="", autoblast_file=None):
     """Process all BAM files in parallel using Rust bindings."""
     if not HAS_RUST:
         sys.exit("ERROR: Rust bindings (thebigbam_rs) are required but not available. Please install them first.")
@@ -37,7 +37,6 @@ def calculating_all_features_parallel(list_modules, bam_files, output_db, min_co
             contig_variation_percentage=float(contig_variation_percentage),
             circular=circular,
             create_indexes=True,
-            max_samples_in_memory=max_samples_in_memory,
             autoblast_file=autoblast_file if autoblast_file else "",
         )
     except Exception as e:
@@ -64,7 +63,6 @@ def add_calculate_args(parser):
     parser.add_argument('--variation_percentage', type=float, default=50, help='Run-length encoding ratio for independent features like coverage (default: 50%%)')
     parser.add_argument('--coverage_percentage', type=float, default=10, help='Compressing ratio for features depending on coverage: only values above this %% of the local coverage are kept (default: 10%%)')
     parser.add_argument('--contig_variation_percentage', type=float, default=10, help='Run-length encoding ratio for contig-level features like GC content (default: 10%%)')
-    parser.add_argument("--max-samples-in-memory", type=int, default=10, help="Max samples to hold in memory during processing (default: 10). Lower for large datasets to reduce memory usage.")
 
 VALID_MODULES = ["Coverage", "Misalignment", "Long-reads", "Paired-reads", "Phage termini"]
 
@@ -111,8 +109,6 @@ def run_calculate_args(args):
 
     if assembly_path and not os.path.exists(assembly_path):
         sys.exit(f"ERROR: Assembly file not found: {assembly_path}")
-
-    max_samples_in_memory = getattr(args, 'max_samples_in_memory', 10)
 
     # Warn if "Phage termini" is requested without genbank
     if "Phage termini" in requested_modules and not genbank_path:
@@ -168,7 +164,7 @@ def run_calculate_args(args):
         requested_modules, bam_files, output_db, min_coverage, variation_percentage, coverage_percentage,
         contig_variation_percentage=contig_variation_percentage, circular=circular, n_sample_cores=n_cores,
         sequencing_type=args.sequencing_type, genbank_path=genbank_path, annotation_tool=annotation_tool if genbank_path else "",
-        max_samples_in_memory=max_samples_in_memory, autoblast_file=autoblast_file
+        autoblast_file=autoblast_file
     )
 
 def main():
