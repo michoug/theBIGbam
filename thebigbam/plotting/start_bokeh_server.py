@@ -1332,15 +1332,61 @@ def create_layout(db_path):
         return total
     
     def create_query_row(section_data):
-        """Create a single query row with input text and remove button."""
-        query_input = TextInput(value="", placeholder="Enter search query...", sizing_mode="stretch_width")
-        minus_btn = Button(label="−", width=30, height=30, stylesheets=[stylesheet])
+        """Create a single query row with cascading selects, comparison, text input and remove button."""
+        # Define category to subcategory mapping
+        category_map = {
+            "Category 1": ["Sub 1A", "Sub 1B", "Sub 1C"],
+            "Category 2": ["Sub 2A", "Sub 2B"],
+            "Category 3": ["Sub 3A", "Sub 3B", "Sub 3C", "Sub 3D"]
+        }
         
-        query_row = row(query_input, minus_btn, sizing_mode="stretch_width", margin=(5, 0, 5, 0))
+        # First level select (categories)
+        category_select = Select(
+            options=list(category_map.keys()),
+            value="Category 1",
+            width=90,
+            # margin is first top, then right, bottom, left
+            margin=(0, 2, 0, 0)
+        )
+        
+        # Second level select (subcategories) - initially shows Category 1's subcategories
+        subcategory_select = Select(
+            options=category_map["Category 1"],
+            value=category_map["Category 1"][0],
+            sizing_mode="stretch_width",
+            margin=(0, 2, 0, 0)
+        )
+        
+        # Comparison operator select
+        comparison_select = Select(
+            options=["=", ">", "<", "!="],
+            value="=",
+            margin=(0, 2, 0, 0)
+        )
+        
+        # Text input for value
+        query_input = TextInput(value="", placeholder="Value...", width=70, margin=(0, 2, 0, 0))
+        
+        # Remove button
+        minus_btn = Button(label="−", width=30, height=30, stylesheets=[stylesheet], margin=(0, 10, 0, 0))
+        
+        # Cascading dropdown: update subcategory options when category changes
+        def update_subcategories(attr, old, new):
+            if new in category_map:
+                subcategory_select.options = category_map[new]
+                subcategory_select.value = category_map[new][0]
+        
+        category_select.on_change('value', update_subcategories)
+        
+        query_row = row(category_select, subcategory_select, comparison_select, query_input, minus_btn, 
+                       sizing_mode="stretch_width", margin=(5, 0, 5, 0))
         
         # Store reference to this row
         row_data = {
             'query_row': query_row,
+            'category_select': category_select,
+            'subcategory_select': subcategory_select,
+            'comparison_select': comparison_select,
             'input': query_input,
             'and_div': None  # Will be set when AND is added above this row
         }
@@ -1920,7 +1966,7 @@ def create_layout(db_path):
     
     # Create position range inputs
     from_position_input = TextInput(value="0", placeholder="Start position", sizing_mode="stretch_width")
-    to_position_input = TextInput(value="", placeholder="End position", sizing_mode="stretch_width")
+    to_position_input = TextInput(value="", placeholder="End position", sizing_mode="stretch_width", margin=(0, 10, 0, 0))
     
     position_label_from = Div(text="From", width=40, margin=(5, 5, 5, 0))
     position_label_to = Div(text="to", width=25, margin=(5, 5, 5, 5))
@@ -2001,11 +2047,11 @@ def create_layout(db_path):
 
     ## Put together all DOM elements
     # Create visual separators (horizontal lines) using background color
-    separator_filtering2 = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
-    separator_filtering = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
-    separator_samples = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
-    separator_contigs = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
-    separator_variables = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
+    separator_filtering2 = Div(text="", height=1, sizing_mode="stretch_width", styles={'background-color': '#333', 'margin': '10px 0'})
+    separator_filtering = Div(text="", height=1, sizing_mode="stretch_width", styles={'background-color': '#333', 'margin': '10px 0'})
+    separator_samples = Div(text="", height=1, sizing_mode="stretch_width", styles={'background-color': '#333', 'margin': '10px 0'})
+    separator_contigs = Div(text="", height=1, sizing_mode="stretch_width", styles={'background-color': '#333', 'margin': '10px 0'})
+    separator_variables = Div(text="", height=1, sizing_mode="stretch_width", styles={'background-color': '#333', 'margin': '10px 0'})
 
     # Gene map is now part of the Genome module's CheckboxButtonGroup
     # Include both variables sections - visibility is toggled by on_view_change
@@ -2018,7 +2064,7 @@ def create_layout(db_path):
                          variables_section_all,  # All Samples view (title headers only)
                          buttons_row]
 
-    controls_column = pn.Column(*controls_children, width=350, sizing_mode="stretch_height", css_classes=["left-col"])
+    controls_column = pn.Column(*controls_children, sizing_mode="stretch_height", css_classes=["left-col"])
 
     main_placeholder = column(Div(text="<i>No plot yet. Select one sample, one contig and at least one variable in \"One sample\" mode or one contig and one variable in \"All samples\" mode and click Apply.</i>"), sizing_mode="stretch_both")
 
