@@ -234,6 +234,7 @@ fn add_features_from_arrays(
     flags: ModuleFlags,
     repeats: &[RepeatsData],
     output: &mut Vec<FeaturePoint>,
+    primary_count: u64,
 ) -> (Option<PackagingData>, Option<CompletenessData>) {
     let pt_config = config.phagetermini_config;
 
@@ -614,6 +615,7 @@ fn add_features_from_arrays(
 
     // Compute completeness statistics when mapping_metrics is enabled
     let completeness_result = if flags.mapping_metrics {
+        // Use actual primary read count (not sum of coverage array which gives coverage × positions)
         let completeness = compute_completeness(
             &arrays.left_clipping_lengths,
             &arrays.right_clipping_lengths,
@@ -627,6 +629,8 @@ fn add_features_from_arrays(
             &mismatch_runs,
             contig_name,
             contig_length,
+            arrays.circularising_reads_count,
+            primary_count,
         );
         if completeness.has_data() {
             Some(completeness)
@@ -710,7 +714,7 @@ pub fn process_sample(
 
             // Calculate features for this contig
             let mut features = Vec::new();
-            let (packaging_info, completeness_info) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, seq_type, flags, repeats, &mut features);
+            let (packaging_info, completeness_info) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, seq_type, flags, repeats, &mut features, primary_count);
 
             // Calculate mean and median coverage depth
             let coverage_mean = arrays.coverage_mean() as f32;
@@ -907,10 +911,11 @@ pub fn run_all_samples(
         .iter()
         .filter_map(|contig| {
             contig.sequence.as_ref().map(|seq| {
-                let runs = compute_gc_content(seq, 100, config.contig_variation_percentage);
+                let (runs, stats) = compute_gc_content(seq, 100, config.contig_variation_percentage);
                 GCContentData {
                     contig_name: contig.name.clone(),
                     runs,
+                    stats,
                 }
             })
         })
@@ -919,6 +924,7 @@ pub fn run_all_samples(
     if !gc_data.is_empty() {
         eprintln!("\n### Computing GC content for {} contigs...", gc_data.len());
         db_writer.write_gc_content(&gc_data)?;
+        db_writer.update_contig_gc_stats(&gc_data)?;
     }
 
     eprintln!("\n### Processing {} samples with {} threads", bam_files.len(), config.threads);

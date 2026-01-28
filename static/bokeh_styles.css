@@ -1,7 +1,7 @@
 .left-col {
     background-color: #ffeff8; /* light tan background */
-    padding: 15px;
-    min-width: 350px;
+    padding: 10px;
+    min-width: 400px;
     max-height: 100vh;
     overflow-y: auto;
     position: sticky;

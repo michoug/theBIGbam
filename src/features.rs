@@ -116,6 +116,24 @@ pub struct FeatureArrays {
     pub mate_on_another_contig: Vec<u64>,
 
     // -------------------------------------------------------------------------
+    // Circularising reads tracking
+    // -------------------------------------------------------------------------
+    /// Total count of reads that support genome circularity.
+    /// In circular mode: reads crossing the mid-position of doubled contig.
+    /// For paired reads: non-inward pairs spanning junction within mean + 3*sd insert size.
+    pub circularising_reads_count: u64,
+
+    /// Running insert size statistics for paired reads (Welford's algorithm).
+    /// Used to compute mean + 3*sd threshold for circularising pair detection.
+    pub insert_size_count: u64,
+    pub insert_size_mean: f64,
+    pub insert_size_m2: f64,  // For Welford's variance
+
+    /// Candidate circularising pairs for post-processing.
+    /// Stores (pos, mpos, insert_size) for non-inward pairs near boundaries.
+    pub circularising_candidates: Vec<(usize, usize, i32)>,
+
+    // -------------------------------------------------------------------------
     // Internal: Strand-specific tracking for phagetermini
     // -------------------------------------------------------------------------
     // We track starts/ends separately by strand during processing,
@@ -166,6 +184,11 @@ impl FeatureArrays {
             non_inward_pairs: vec![0u64; ref_length],
             mate_not_mapped: vec![0u64; ref_length],
             mate_on_another_contig: vec![0u64; ref_length],
+            circularising_reads_count: 0,
+            insert_size_count: 0,
+            insert_size_mean: 0.0,
+            insert_size_m2: 0.0,
+            circularising_candidates: Vec::new(),
             start_plus: vec![0u64; ref_length],
             start_minus: vec![0u64; ref_length],
             end_plus: vec![0u64; ref_length],
@@ -193,6 +216,55 @@ impl FeatureArrays {
         let covered_bp = self.primary_reads.iter().filter(|&&x| x > 0).count();
         // Convert to percentage
         (covered_bp as f64 / self.ref_length() as f64) * 100.0
+    }
+
+    /// Update running insert size statistics using Welford's algorithm.
+    /// Call this for each proper pair with valid template length.
+    #[inline]
+    pub fn update_insert_stats(&mut self, insert_size: f64) {
+        self.insert_size_count += 1;
+        let delta = insert_size - self.insert_size_mean;
+        self.insert_size_mean += delta / self.insert_size_count as f64;
+        let delta2 = insert_size - self.insert_size_mean;
+        self.insert_size_m2 += delta * delta2;
+    }
+
+    /// Compute standard deviation of insert sizes from running statistics.
+    #[inline]
+    pub fn insert_size_sd(&self) -> f64 {
+        if self.insert_size_count < 2 {
+            0.0
+        } else {
+            (self.insert_size_m2 / self.insert_size_count as f64).sqrt()
+        }
+    }
+
+    /// Finalize circularising read count after all reads are processed.
+    /// Filters candidate pairs based on computed mean + 3*sd threshold.
+    pub fn finalize_circularising_count(&mut self, ref_length: usize, circular: bool) {
+        let mean = self.insert_size_mean;
+        let sd = self.insert_size_sd();
+        let threshold = mean + 3.0 * sd;
+
+        for &(_pos, _mpos, insert) in &self.circularising_candidates {
+            if circular {
+                // In circular mode: check if insert within threshold
+                if (insert as f64) <= threshold {
+                    self.circularising_reads_count += 1;
+                }
+            } else {
+                // In non-circular mode: check if wrapped insert within threshold
+                // wrapped = contig_length - insert_size (apparent insert is ~contig_length)
+                let wrapped = ref_length as f64 - insert as f64;
+                if wrapped > 0.0 && wrapped <= threshold {
+                    self.circularising_reads_count += 1;
+                }
+            }
+        }
+
+        // Clear candidates to free memory
+        self.circularising_candidates.clear();
+        self.circularising_candidates.shrink_to_fit();
     }
 
     /// Finalize phagetermini strand arrays based on sequencing type.

@@ -3,16 +3,10 @@
 # Calculate:
 
 ## On computation:
-
-- !important! Threads param from calculate do not seem to work it is overriden by number threads i give with cluster
-- Erase table if no data in it it takes a lot of time and memory to check each table for non-zero values, so skip this check for now?
-
-## On compressing:
-
-- Check RLE acts symmetrically if I turn a contig around: there should be no difference in compression
+- Threads param from calculate do not seem to work it is overriden by number threads i give with cluster
 
 ## On tests:
-
+- Check RLE acts symmetrically if I turn a contig around: there should be no difference in compression
 - Add plenty of additional tests during computation
 - Add set of long reads where no read passes more than twice end of contig -> check then than coverage_reduced = coverage and that no clippings
 

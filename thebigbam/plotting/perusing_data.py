@@ -28,6 +28,7 @@ def build_summary_data(conn, contig_name, sample_names):
     side_completeness_cols = {
         "Prevalence_completeness_left": "Left completeness (%)", "Distance_contaminated_left": "Left expansion* (bp)", "Min_missing_left": "Left collapse** (bp)",
         "Prevalence_completeness_right": "Right completeness (%)", "Distance_contaminated_right": "Right expansion* (bp)", "Min_missing_right": "Right collapse** (bp)",
+        "Circularising_reads": "Circularising reads", "Circularising_reads_percentage": "Circularising reads (%)",
     }
 
     phage_cols = {

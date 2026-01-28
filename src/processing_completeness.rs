@@ -33,6 +33,8 @@ pub fn compute_completeness(
     mismatch_runs: &[Run],
     contig_name: &str,
     contig_length: usize,
+    circularising_reads_count: u64,
+    total_primary_reads: u64,
 ) -> CompletenessData {
     // Helper function to compute median from a vector of lengths
     fn compute_median(lengths: &[u32]) -> i32 {
@@ -195,6 +197,19 @@ pub fn compute_completeness(
         }
     }
 
+    // Compute circularising reads percentage
+    let circularising_reads = if circularising_reads_count > 0 {
+        Some(circularising_reads_count)
+    } else {
+        None
+    };
+
+    let circularising_reads_percentage = if total_primary_reads > 0 && circularising_reads_count > 0 {
+        Some(((circularising_reads_count as f64 / total_primary_reads as f64) * 100.0).round() as i32)
+    } else {
+        None
+    };
+
     CompletenessData {
         contig_name: contig_name.to_string(),
         prevalence_left: left_result.map(|(p, _, _)| p * 100.0), // Store as percentage
@@ -208,5 +223,7 @@ pub fn compute_completeness(
         total_insertions: if total_insertions > 0.0 { Some(total_insertions) } else { None },
         total_reads_clipped: if total_reads_clipped > 0.0 { Some(total_reads_clipped) } else { None },
         total_reference_clipped: if total_reference_clipped > 0.0 { Some(total_reference_clipped) } else { None },
+        circularising_reads,
+        circularising_reads_percentage,
     }
 }

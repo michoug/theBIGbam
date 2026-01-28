@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::gc_content::GCContentRun;
+use crate::gc_content::{GCContentRun, GCStats};
 use crate::types::{feature_table_name, ContigInfo, FeatureAnnotation, FeaturePoint, PackagingData, PresenceData, VARIABLES};
 
 /// Thread-safe database connection wrapper for sequential writes.
@@ -198,12 +198,16 @@ impl DbWriter {
                     let total_ins = data.total_insertions.map(|v| v.round() as i32);
                     let total_rc = data.total_reads_clipped.map(|v| v.round() as i32);
                     let total_ref = data.total_reference_clipped.map(|v| v.round() as i32);
+                    // Circularising reads
+                    let circ_reads = data.circularising_reads.map(|v| v as i64);
+                    let circ_pct = data.circularising_reads_percentage;
 
                     appender.append_row(params![
                         contig_id, sample_id,
                         prev_left, data.distance_left, data.min_missing_left,
                         prev_right, data.distance_right, data.min_missing_right,
-                        total_mm, total_del, total_ins, total_rc, total_ref
+                        total_mm, total_del, total_ins, total_rc, total_ref,
+                        circ_reads, circ_pct
                     ])?;
                 }
             }
@@ -459,6 +463,26 @@ impl DbWriter {
         Ok(())
     }
 
+    /// Update Contig table with GC statistics (average, sd, median).
+    /// Called after computing GC content for all contigs.
+    pub fn update_contig_gc_stats(&self, gc_data: &[GCContentData]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "UPDATE Contig SET GC_average = ?, GC_sd = ?, GC_median = ? WHERE Contig_name = ?"
+        )?;
+
+        for data in gc_data {
+            stmt.execute(params![
+                data.stats.average as f64,
+                data.stats.sd as f64,
+                data.stats.median as f64,
+                &data.contig_name
+            ])?;
+        }
+
+        Ok(())
+    }
+
     /// Finalize the database after all samples are processed.
     pub fn finalize(self) -> Result<()> {
         let conn = self.conn.into_inner().unwrap();
@@ -491,7 +515,10 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             Contig_name TEXT UNIQUE,
             Contig_length INTEGER,
             Annotation_tool TEXT,
-            Duplication_percentage INTEGER
+            Duplication_percentage INTEGER,
+            GC_average REAL,
+            GC_sd REAL,
+            GC_median REAL
         )",
         [],
     )
@@ -600,7 +627,9 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             Total_deletions INTEGER,
             Total_insertions INTEGER,
             Total_reads_clipped INTEGER,
-            Total_reference_clipped INTEGER
+            Total_reference_clipped INTEGER,
+            Circularising_reads INTEGER,
+            Circularising_reads_percentage INTEGER
         )",
         [],
     )
@@ -665,12 +694,16 @@ fn insert_contigs(conn: &Connection, contigs: &[ContigInfo]) -> Result<()> {
 
     for (i, contig) in contigs.iter().enumerate() {
         let null_int: Option<i32> = None;
+        let null_real: Option<f64> = None;
         appender.append_row(params![
             (i + 1) as i64,
             &contig.name,
             contig.length as i64,
             &contig.annotation_tool,
-            null_int  // Duplication_percentage - set later from autoblast
+            null_int,   // Duplication_percentage - set later from autoblast
+            null_real,  // GC_average - set later from GC content computation
+            null_real,  // GC_sd - set later from GC content computation
+            null_real,  // GC_median - set later from GC content computation
         ])
         .with_context(|| format!("Failed to append contig: {}", contig.name))?;
     }
@@ -916,7 +949,9 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
              COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_deletions, 0) + COALESCE(comp.Total_reference_clipped, 0) AS Score_contamination,
              CASE WHEN c.Contig_length > 0 THEN ROUND(
                 (COALESCE(comp.Total_mismatches, 0) + COALESCE(comp.Total_deletions, 0) + COALESCE(comp.Total_reference_clipped, 0)) * 100 / c.Contig_length
-             )::INTEGER ELSE 100 END AS Percentage_contamination
+             )::INTEGER ELSE 100 END AS Percentage_contamination,
+             COALESCE(comp.Circularising_reads, 0) AS Circularising_reads,
+             COALESCE(comp.Circularising_reads_percentage, 0) AS Circularising_reads_percentage
          FROM Completeness comp
          JOIN Contig c ON comp.Contig_id = c.Contig_id
          JOIN Sample s ON comp.Sample_id = s.Sample_id",
@@ -1039,11 +1074,12 @@ pub struct RepeatsData {
 }
 
 /// GC content data for a contig.
-/// Contains pre-computed GC content runs with RLE compression.
+/// Contains pre-computed GC content runs with RLE compression and statistics.
 #[derive(Clone, Debug)]
 pub struct GCContentData {
     pub contig_name: String,
     pub runs: Vec<GCContentRun>,
+    pub stats: GCStats,
 }
 
 /// Completeness data for a contig.
@@ -1068,6 +1104,10 @@ pub struct CompletenessData {
     pub total_reads_clipped: Option<f64>,
     /// Weighted reference gaps: Σ(avg_prevalence * distance) for paired clips - contributes to contamination
     pub total_reference_clipped: Option<f64>,
+    /// Count of reads supporting genome circularity
+    pub circularising_reads: Option<u64>,
+    /// Percentage of primary reads that are circularising
+    pub circularising_reads_percentage: Option<i32>,
 }
 
 impl CompletenessData {
@@ -1076,7 +1116,7 @@ impl CompletenessData {
         self.prevalence_left.is_some() || self.prevalence_right.is_some()
             || self.total_mismatches.is_some() || self.total_deletions.is_some()
             || self.total_insertions.is_some() || self.total_reads_clipped.is_some()
-            || self.total_reference_clipped.is_some()
+            || self.total_reference_clipped.is_some() || self.circularising_reads.is_some()
     }
 }
 

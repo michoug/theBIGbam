@@ -643,6 +643,12 @@ def create_layout(db_path):
                 conditions.append("Percentage_contamination >= ? AND Percentage_contamination <= ?")
                 params.extend([min_val, max_val])
 
+        if circularising_slider is not None:
+            min_val, max_val = circularising_slider.value
+            if min_val > 0 or max_val < 100:
+                conditions.append("Circularising_reads_percentage >= ? AND Circularising_reads_percentage <= ?")
+                params.extend([min_val, max_val])
+
         if conditions:
             query = f"SELECT DISTINCT Contig_name FROM Explicit_completeness WHERE {' AND '.join(conditions)}"
             cur.execute(query, params)
@@ -776,6 +782,12 @@ def create_layout(db_path):
             conta_max = widgets['whole_contamination_max']
             if min_val > 0 or max_val < conta_max:
                 conditions.append("Percentage_contamination >= ? AND Percentage_contamination <= ?")
+                params.extend([min_val, max_val])
+
+        if circularising_slider is not None:
+            min_val, max_val = circularising_slider.value
+            if min_val > 0 or max_val < 100:
+                conditions.append("Circularising_reads_percentage >= ? AND Circularising_reads_percentage <= ?")
                 params.extend([min_val, max_val])
 
         if conditions:
@@ -1272,6 +1284,12 @@ def create_layout(db_path):
         css_text = f.read()
     stylesheet = InlineStyleSheet(css=css_text)
 
+    # Pink buttons css
+    pink_buttons_css_path = os.path.join(static_path, "pink_buttons.css")
+    with open(pink_buttons_css_path) as f:
+        pink_buttons_css_text = f.read()
+    pink_buttons_stylesheet = InlineStyleSheet(css=pink_buttons_css_text)
+
     # Separate stylesheet for toggle buttons (minimal styling)
     toggle_css_path = os.path.join(static_path, "toggle_styles.css")
     with open(toggle_css_path) as f:
@@ -1299,6 +1317,172 @@ def create_layout(db_path):
     views.on_change('active', on_view_change)
 
 
+    ## Build Filtering2 section (advanced search with AND/OR logic)
+    filtering2_title = Div(text="<b>Filtering2</b>")
+    filtering2_header = filtering2_title
+
+    # Store all OR sections in a list for dynamic management
+    or_sections = []
+    
+    def count_total_query_rows():
+        """Count total number of query rows across all OR sections."""
+        total = 0
+        for section_data in or_sections:
+            total += len(section_data['rows'])
+        return total
+    
+    def create_query_row(section_data):
+        """Create a single query row with input text and remove button."""
+        query_input = TextInput(value="", placeholder="Enter search query...", sizing_mode="stretch_width")
+        minus_btn = Button(label="−", width=30, height=30, stylesheets=[stylesheet])
+        
+        query_row = row(query_input, minus_btn, sizing_mode="stretch_width", margin=(5, 0, 5, 0))
+        
+        # Store reference to this row
+        row_data = {
+            'query_row': query_row,
+            'input': query_input,
+            'and_div': None  # Will be set when AND is added above this row
+        }
+        
+        def remove_row_callback():
+            # Don't allow removal if this is the only query row across all sections
+            if count_total_query_rows() <= 1:
+                return
+            
+            # Find which section this row belongs to
+            for section_data in or_sections:
+                if row_data in section_data['rows']:
+                    idx = section_data['rows'].index(row_data)
+                    
+                    # Remove the row
+                    section_data['rows'].remove(row_data)
+                    
+                    # Rebuild the section
+                    rebuild_section(section_data)
+                    
+                    # If section is now empty, remove it
+                    if len(section_data['rows']) == 0:
+                        or_sections.remove(section_data)
+                        rebuild_filtering2_content()
+                    
+                    break
+        
+        minus_btn.on_click(remove_row_callback)
+        return row_data
+    
+    def rebuild_section(section_data):
+        """Rebuild a section's content with all its query rows and the Add AND button."""
+        section_children = []
+        
+        for i, row_data in enumerate(section_data['rows']):
+            # Add AND div before each row except the first
+            if i > 0:
+                select_widget = Select(
+                options=["AND", "OR"],
+                    value="AND",
+                    margin=(5, 0, 5, 0)
+                )
+                section_children.append(select_widget)
+                row_data['and_div'] = select_widget
+            else:
+                row_data['and_div'] = None
+            
+            section_children.append(row_data['query_row'])
+        
+        # Add the "+ Add AND" button
+        section_children.append(section_data['add_and_btn'])
+        
+        # Update the section column's children
+        section_data['column'].children = section_children
+    
+    def create_or_section():
+        """Create a new OR section with one query row and Add AND/OR button."""
+        section_column = column(
+            sizing_mode="stretch_width",
+            styles={'border-left': '3px solid #00b17c', 'padding-left': '10px', 'margin-left': '5px'}
+        )
+        
+        add_and_btn = Button(
+            label="+ Add AND/OR", 
+            margin=(5, 0, 5, 0),
+            stylesheets=[stylesheet]
+        )
+        
+        section_data = {
+            'column': section_column,
+            'rows': [],
+            'add_and_btn': add_and_btn
+        }
+        
+        def add_and_or_callback():
+            # Create a new query row
+            new_row = create_query_row(section_data)
+            section_data['rows'].append(new_row)
+            rebuild_section(section_data)
+        
+        add_and_btn.on_click(add_and_or_callback)
+        
+        # Create initial query row
+        initial_row = create_query_row(section_data)
+        section_data['rows'].append(initial_row)
+        
+        rebuild_section(section_data)
+        
+        return section_data
+    
+    # Create the global "+ Add AND/OR" button
+    global_add_btn = Button(
+        label="+ Add AND/OR", 
+        margin=(10, 0, 5, 0),
+        stylesheets=[pink_buttons_stylesheet]
+    )
+    
+    # Store reference to the button widget for replacement
+    global_widget_state = {'widget': global_add_btn}
+    
+    def rebuild_filtering2_content():
+        """Rebuild the entire Filtering2 content with all OR sections."""
+        content_children = []
+        
+        for i, section_data in enumerate(or_sections):
+            # Add OR div before each section except the first
+            if i > 0:
+                select_widget = Select(
+                options=["AND", "OR"],
+                    value="AND",
+                    margin=(5, 0, 5, 0)
+                )
+                content_children.append(select_widget)
+            
+            content_children.append(section_data['column'])
+        
+        # Add the current global widget (button or select) at the end
+        content_children.append(global_widget_state['widget'])
+        
+        filtering2_content.children = content_children
+    
+    def global_add_and_or_callback():
+        # Create a new section
+        new_section = create_or_section()
+        or_sections.append(new_section)
+        rebuild_filtering2_content()
+    
+    global_add_btn.on_click(global_add_and_or_callback)
+    
+    # Create initial OR section
+    initial_section = create_or_section()
+    or_sections.append(initial_section)
+    
+    # Create the main content container (using Bokeh column, not Panel)
+    filtering2_content = column(
+        sizing_mode="stretch_width"
+    )
+    
+    # Initial build of content
+    rebuild_filtering2_content()
+
+
     ## Build filtering section
     filtering_title = Div(text="<b>Filtering</b>")
     filtering_header = filtering_title  # No toggle button - always visible
@@ -1309,6 +1493,7 @@ def create_layout(db_path):
     phage_mechanism_filter = None
     prevalence_left_slider = None
     prevalence_right_slider = None
+    circularising_slider = None
     pct_completeness_slider = None
     pct_contamination_slider = None
     coverage_percentage_slider = None
@@ -1499,11 +1684,17 @@ def create_layout(db_path):
             on_change=lambda event: (refresh_contig_options(), refresh_sample_options())
         )
 
+        circularising_slider = create_editable_range_slider(
+            "Circularising reads (%)", 0, 100, (0, 100), step=1,
+            on_change=lambda event: (refresh_contig_options(), refresh_sample_options())
+        )
+
         completeness_filters_children.extend([
             pct_completeness_slider,
             pct_contamination_slider,
             prevalence_left_slider,
-            prevalence_right_slider
+            prevalence_right_slider,
+            circularising_slider
         ])
 
         # Create completeness filters content container (collapsible)
@@ -1810,6 +2001,7 @@ def create_layout(db_path):
 
     ## Put together all DOM elements
     # Create visual separators (horizontal lines) using background color
+    separator_filtering2 = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
     separator_filtering = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
     separator_samples = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
     separator_contigs = Div(text="", height=1, width=350, styles={'background-color': '#333', 'margin': '10px 0'})
@@ -1817,7 +2009,8 @@ def create_layout(db_path):
 
     # Gene map is now part of the Genome module's CheckboxButtonGroup
     # Include both variables sections - visibility is toggled by on_view_change
-    controls_children = [logo, views, separator_filtering, filtering_header, filtering_content,
+    controls_children = [logo, views, separator_filtering2, filtering2_header, filtering2_content,
+                         separator_filtering, filtering_header, filtering_content,
                          separator_contigs, contig_header, above_contig_content, widgets['contig_select'], below_contig_content,
                          separator_samples, sample_header, above_sample_content, widgets['sample_select'],
                          separator_variables,

@@ -14,6 +14,17 @@ pub struct GCContentRun {
     pub gc_percentage: u8,
 }
 
+/// Statistics for GC content across a contig.
+#[derive(Debug, Clone)]
+pub struct GCStats {
+    /// Mean GC percentage (0-100)
+    pub average: f32,
+    /// Standard deviation of windowed GC percentages
+    pub sd: f32,
+    /// Median GC percentage (0-100)
+    pub median: f32,
+}
+
 /// Compute GC content using a sliding window approach with RLE compression.
 ///
 /// # Parameters
@@ -27,11 +38,13 @@ pub struct GCContentRun {
 /// 3. Apply RLE compression: merge consecutive positions with similar GC%
 ///
 /// # Returns
-/// Vector of GC content runs with (start_pos, end_pos, gc_percentage)
-pub fn compute_gc_content(sequence: &[u8], window_size: usize, contig_variation_percentage: f64) -> Vec<GCContentRun> {
+/// Tuple of (runs, stats) where:
+/// - runs: Vector of GC content runs with (start_pos, end_pos, gc_percentage)
+/// - stats: GCStats with average, sd, and median GC percentages
+pub fn compute_gc_content(sequence: &[u8], window_size: usize, contig_variation_percentage: f64) -> (Vec<GCContentRun>, GCStats) {
     let n = sequence.len();
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), GCStats { average: 0.0, sd: 0.0, median: 0.0 });
     }
 
     let half_window = window_size / 2;
@@ -53,8 +66,51 @@ pub fn compute_gc_content(sequence: &[u8], window_size: usize, contig_variation_
         gc_values.push(gc_pct);
     }
 
+    // Compute statistics from raw values before compression
+    let stats = compute_gc_stats(&gc_values);
+
     // Apply RLE compression with user-configurable tolerance
-    compress_gc_values(&gc_values, contig_variation_percentage)
+    let runs = compress_gc_values(&gc_values, contig_variation_percentage);
+
+    (runs, stats)
+}
+
+/// Compute GC statistics (average, sd, median) from raw GC values.
+fn compute_gc_stats(gc_values: &[u8]) -> GCStats {
+    if gc_values.is_empty() {
+        return GCStats { average: 0.0, sd: 0.0, median: 0.0 };
+    }
+
+    let n = gc_values.len() as f64;
+
+    // Compute average
+    let sum: f64 = gc_values.iter().map(|&v| v as f64).sum();
+    let average = sum / n;
+
+    // Compute standard deviation
+    let variance: f64 = gc_values.iter()
+        .map(|&v| {
+            let diff = v as f64 - average;
+            diff * diff
+        })
+        .sum::<f64>() / n;
+    let sd = variance.sqrt();
+
+    // Compute median
+    let mut sorted = gc_values.to_vec();
+    sorted.sort_unstable();
+    let median = if sorted.len() % 2 == 0 {
+        let mid = sorted.len() / 2;
+        (sorted[mid - 1] as f64 + sorted[mid] as f64) / 2.0
+    } else {
+        sorted[sorted.len() / 2] as f64
+    };
+
+    GCStats {
+        average: average as f32,
+        sd: sd as f32,
+        median: median as f32,
+    }
 }
 
 /// Count G and C bases in a window, excluding N bases.
@@ -142,46 +198,56 @@ mod tests {
     fn test_gc_content_simple() {
         // ATGC sequence - 50% GC
         let sequence = b"ATGCATGCATGC";
-        let runs = compute_gc_content(sequence, 4, 10.0);
+        let (runs, stats) = compute_gc_content(sequence, 4, 10.0);
 
         // Should produce runs with ~50% GC
         assert!(!runs.is_empty());
         for run in &runs {
             assert!(run.gc_percentage >= 40 && run.gc_percentage <= 60);
         }
+        // Stats should also be around 50%
+        assert!(stats.average >= 40.0 && stats.average <= 60.0);
     }
 
     #[test]
     fn test_gc_content_high_gc() {
         // All GC
         let sequence = b"GGGGCCCCGGGGCCCC";
-        let runs = compute_gc_content(sequence, 4, 10.0);
+        let (runs, stats) = compute_gc_content(sequence, 4, 10.0);
 
         // Should produce runs with 100% GC
         assert!(!runs.is_empty());
         for run in &runs {
             assert_eq!(run.gc_percentage, 100);
         }
+        // Stats should be 100% with 0 sd
+        assert_eq!(stats.average, 100.0);
+        assert_eq!(stats.sd, 0.0);
+        assert_eq!(stats.median, 100.0);
     }
 
     #[test]
     fn test_gc_content_low_gc() {
         // All AT
         let sequence = b"AAAATTTTAAAATTTT";
-        let runs = compute_gc_content(sequence, 4, 10.0);
+        let (runs, stats) = compute_gc_content(sequence, 4, 10.0);
 
         // Should produce runs with 0% GC
         assert!(!runs.is_empty());
         for run in &runs {
             assert_eq!(run.gc_percentage, 0);
         }
+        // Stats should be 0% with 0 sd
+        assert_eq!(stats.average, 0.0);
+        assert_eq!(stats.sd, 0.0);
+        assert_eq!(stats.median, 0.0);
     }
 
     #[test]
     fn test_gc_content_with_n() {
         // Sequence with N bases - N should be excluded
         let sequence = b"ATGCNNNNATGC";
-        let runs = compute_gc_content(sequence, 4, 10.0);
+        let (runs, _stats) = compute_gc_content(sequence, 4, 10.0);
 
         // Should still compute ~50% GC from valid bases
         assert!(!runs.is_empty());
@@ -190,15 +256,18 @@ mod tests {
     #[test]
     fn test_gc_content_empty() {
         let sequence: &[u8] = b"";
-        let runs = compute_gc_content(sequence, 4, 10.0);
+        let (runs, stats) = compute_gc_content(sequence, 4, 10.0);
         assert!(runs.is_empty());
+        assert_eq!(stats.average, 0.0);
+        assert_eq!(stats.sd, 0.0);
+        assert_eq!(stats.median, 0.0);
     }
 
     #[test]
     fn test_full_coverage() {
         // Verify that the runs cover the entire sequence
         let sequence = b"ATGCATGCATGCATGCATGC"; // 20 bases
-        let runs = compute_gc_content(sequence, 4, 10.0);
+        let (runs, _stats) = compute_gc_content(sequence, 4, 10.0);
 
         // First run should start at position 1
         assert_eq!(runs.first().unwrap().start_pos, 1);
@@ -215,11 +284,27 @@ mod tests {
     fn test_compression() {
         // Long sequence with uniform GC should compress well
         let sequence: Vec<u8> = b"ATGC".repeat(1000);
-        let runs = compute_gc_content(&sequence, 100, 10.0);
+        let (runs, stats) = compute_gc_content(&sequence, 100, 10.0);
 
         // Should compress but still cover full length
         assert!(!runs.is_empty());
         assert_eq!(runs.first().unwrap().start_pos, 1);
         assert_eq!(runs.last().unwrap().end_pos, 4000);
+        // Stats should be around 50%
+        assert!(stats.average >= 45.0 && stats.average <= 55.0);
+    }
+
+    #[test]
+    fn test_gc_stats() {
+        // Test stats computation with known values
+        let gc_values: Vec<u8> = vec![40, 50, 60];
+        let stats = compute_gc_stats(&gc_values);
+
+        // Average should be 50
+        assert_eq!(stats.average, 50.0);
+        // Median should be 50
+        assert_eq!(stats.median, 50.0);
+        // SD should be sqrt((100+0+100)/3) = sqrt(200/3) ≈ 8.16
+        assert!(stats.sd > 8.0 && stats.sd < 9.0);
     }
 }
