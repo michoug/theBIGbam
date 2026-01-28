@@ -8,7 +8,7 @@ import panel as pn
 
 from bokeh.layouts import column, row
 from bokeh.models import Div, InlineStyleSheet, Tooltip
-from bokeh.models.widgets import AutocompleteInput, CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup, Select, TextInput
+from bokeh.models.widgets import CheckboxGroup, HelpButton, Button, RadioButtonGroup, CheckboxButtonGroup, Select, TextInput
 from bokeh.models.plots import GridPlot
 
 # Import the plotting function from the repo
@@ -129,28 +129,30 @@ def build_controls(conn):
     contig_duplications = {r[0]: r[2] for r in rows}  # Dictionary mapping contig_name -> duplication percentage (can be None)
     
     # If only one contig in database, pre-fill the field
-    contig_select = AutocompleteInput(value=contigs[0] if len(contigs) == 1 else "",
-                                      completions=[""] + contigs,
-                                      min_characters=0,
-                                      case_sensitive=False,
-                                      restrict=False,
-                                      max_completions=20,
-                                      placeholder="Type to search contigs...",
-                                      sizing_mode="stretch_width")
+    contig_select = pn.widgets.AutocompleteInput(
+        value=contigs[0] if len(contigs) == 1 else "",
+        options=contigs,
+        min_characters=0,
+        case_sensitive=False,
+        placeholder="Type to search contigs...",
+        search_strategy="includes",
+        sizing_mode="stretch_width"
+    )
 
     # Widget Selector for Samples (autocomplete with max 20 suggestions)
     cur.execute("SELECT Sample_name FROM Sample ORDER BY Sample_name")
     samples = [r[0] for r in cur.fetchall()]
     
     # If only one sample in database, pre-fill the field
-    sample_select = AutocompleteInput(value=samples[0] if len(samples) == 1 else "",
-                                      completions=[""] + samples,
-                                      min_characters=0,
-                                      case_sensitive=False,
-                                      restrict=False,
-                                      max_completions=20,
-                                      placeholder="Type to search samples...",
-                                      sizing_mode="stretch_width")
+    sample_select = pn.widgets.AutocompleteInput(
+        value=samples[0] if len(samples) == 1 else "",
+        options=samples,
+        min_characters=0,
+        case_sensitive=False,
+        placeholder="Type to search samples...",
+        search_strategy="includes",
+        sizing_mode="stretch_width"
+    )
 
     # Build presence mappings: sample -> contigs and contig -> samples
     cur.execute("""
@@ -834,7 +836,7 @@ def create_layout(db_path):
     def update_widget_completions(widget, completions):
         """Update widget completions. Clear value if not in completions."""
         # Always add empty option at top to work around Bokeh AutocompleteInput click bug
-        widget.completions = [""] + completions
+        widget.options = [""] + completions
         # Clear value if it's not in the new completions (empty is always valid)
         if widget.value and widget.value not in completions:
             widget.value = ""
@@ -915,8 +917,8 @@ def create_layout(db_path):
 
     def update_section_titles():
         """Update Filtering, Contigs, and Samples section titles with current counts."""
-        filtered_contigs = set(widgets['contig_select'].completions) - {""}
-        filtered_samples = set(widgets['sample_select'].completions) - {""}
+        filtered_contigs = set(widgets['contig_select'].options) - {""}
+        filtered_samples = set(widgets['sample_select'].options) - {""}
 
         # If a contig is selected, only count pairs for that contig
         selected_contig = widgets['contig_select'].value
@@ -1018,13 +1020,12 @@ def create_layout(db_path):
             width=70
         )
 
-        var_input = AutocompleteInput(
-            completions=widgets['variables'],
+        var_input = pn.widgets.AutocompleteInput(
+            options=widgets['variables'],
             placeholder="Select variable...",
             min_characters=0,
             case_sensitive=False,
-            restrict=False,
-            max_completions=10,
+            search_strategy="includes",
             sizing_mode="stretch_width"
         )
         
@@ -1044,7 +1045,7 @@ def create_layout(db_path):
         # len(variable_filter_rows)>0 to make - button invisible initially
         minus_btn = Button(label="−", width=30, height=30, visible=len(variable_filter_rows)>0)
         
-        filter_row = row(type_select, var_input, comparison_select, threshold_input, \
+        filter_row = row(type_select, var_input.get_root(), comparison_select, threshold_input, \
                          plus_btn, minus_btn, sizing_mode="stretch_width")
         
         # Adjust margins for better spacing
@@ -1088,9 +1089,9 @@ def create_layout(db_path):
             refresh_contig_options()
             refresh_sample_options()
         
-        # Attach to all three inputs
+        # Attach to all inputs (var_input is Panel widget, others are Bokeh)
         type_select.on_change('value', refresh_on_filter_change)
-        var_input.on_change('value', refresh_on_filter_change)
+        var_input.param.watch(lambda event: refresh_on_filter_change(None, None, event.new), 'value')
         comparison_select.on_change('value', refresh_on_filter_change)
         threshold_input.on_change('value', refresh_on_filter_change)
 
@@ -1347,31 +1348,20 @@ def create_layout(db_path):
         # Add annotation filters (annotation_inputs already initialized at top of create_layout)
         for column_name, values in widgets.get('annotation_filters', {}).items():
             label_div = Div(text=f"Contains {column_name}:", margin=(5, 0, 0, 10))
-            annotation_input = AutocompleteInput(
+            annotation_input = pn.widgets.AutocompleteInput(
                 value="",
-                completions=[""] + values,
+                options=values,
                 min_characters=0,
                 case_sensitive=False,
-                restrict=False,
-                max_completions=20,
                 placeholder=f"Filter by {column_name}...",
+                search_strategy="includes",
                 sizing_mode="stretch_width"
             )
-            annotation_input.on_change('value', lambda attr, old, new: (refresh_contig_options(), refresh_sample_options()))
-            
-            # Add substring matching for this annotation filter
-            full_values = values  # Capture in closure
-            def make_annotation_callback(inp, vals):
-                def callback(attr, old, new):
-                    if new:
-                        filtered = substring_filter(vals, new)
-                        inp.completions = filtered
-                return callback
-            annotation_input.on_change('value_input', make_annotation_callback(annotation_input, full_values))
+            annotation_input.param.watch(lambda event: (refresh_contig_options(), refresh_sample_options()), 'value')
             
             annotation_inputs[column_name] = annotation_input
             contig_filters_children.append(label_div)
-            contig_filters_children.append(annotation_input)
+            contig_filters_children.append(annotation_input.get_root())
 
         contig_filters_content = pn.Column(*contig_filters_children, visible=False, sizing_mode="stretch_width")
         contig_toggle_btn.on_click(make_toggle_callback(contig_toggle_btn, contig_filters_content))
@@ -1583,14 +1573,7 @@ def create_layout(db_path):
     )
 
     sample_toggle_btn.on_click(make_toggle_callback(sample_toggle_btn, above_sample_content))
-    widgets['sample_select'].on_change('value', lambda attr, old, new: refresh_contig_options())
-    
-    # Add substring matching for sample autocomplete
-    def update_sample_completions(attr, old, new):
-        if new:
-            filtered = substring_filter(widgets['full_samples'], new)
-            widgets['sample_select'].completions = filtered
-    widgets['sample_select'].on_change('value_input', update_sample_completions)
+    widgets['sample_select'].param.watch(lambda event: refresh_contig_options(), 'value')
 
 
     ## Build Contig section
@@ -1611,7 +1594,8 @@ def create_layout(db_path):
     )
     contig_toggle_btn.on_click(make_toggle_callback(contig_toggle_btn, above_contig_content))
 
-    def on_contig_change(attr, old, new):
+    def on_contig_change(event):
+        new = event.new
         refresh_sample_options()
         # Update position inputs when contig changes
         if new and new in widgets['contig_lengths']:
@@ -1621,14 +1605,7 @@ def create_layout(db_path):
             from_position_input.value = "0"
             to_position_input.value = ""
     
-    widgets['contig_select'].on_change('value', on_contig_change)
-    
-    # Add substring matching for contig autocomplete
-    def update_contig_completions(attr, old, new):
-        if new:
-            filtered = substring_filter(widgets['full_contigs'], new)
-            widgets['contig_select'].completions = filtered
-    widgets['contig_select'].on_change('value_input', update_contig_completions)
+    widgets['contig_select'].param.watch(on_contig_change, 'value')
 
 
     ## Build Variables section - TWO SEPARATE SECTIONS for each view
