@@ -204,8 +204,8 @@ impl DbWriter {
 
                     appender.append_row(params![
                         contig_id, sample_id,
-                        prev_left, data.distance_left, data.min_missing_left,
-                        prev_right, data.distance_right, data.min_missing_right,
+                        prev_left, data.left_contamination_length, data.left_missing_length,
+                        prev_right, data.right_contamination_length, data.right_missing_length,
                         total_mm, total_del, total_ins, total_rc, total_ref,
                         circ_reads, circ_pct
                     ])?;
@@ -618,11 +618,11 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             Contig_id INTEGER,
             Sample_id INTEGER,
             Left_clippings_percentage INTEGER,
-            Distance_contaminated_left INTEGER,
-            Min_missing_left INTEGER,
+            Left_contamination_length INTEGER,
+            Left_missing_length INTEGER,
             Right_clippings_percentage INTEGER,
-            Distance_contaminated_right INTEGER,
-            Min_missing_right INTEGER,
+            Right_contamination_length INTEGER,
+            Right_missing_length INTEGER,
             Mismatch_frequency INTEGER,
             Deletion_frequency INTEGER,
             Insertion_frequency INTEGER,
@@ -930,26 +930,26 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
              c.Contig_name,
              s.Sample_name,
              COALESCE(100 - comp.Left_clippings_percentage, 100) AS Left_completeness_percentage,
-             COALESCE(comp.Distance_contaminated_left, 0) AS Distance_contaminated_left,
-             COALESCE(comp.Min_missing_left, 0) AS Min_missing_left,
+             COALESCE(comp.Left_contamination_length, 0) AS Left_contamination_length,
+             COALESCE(comp.Left_missing_length, 0) AS Left_missing_length,
              COALESCE(100 - comp.Right_clippings_percentage, 100) AS Right_completeness_percentage,
-             COALESCE(comp.Distance_contaminated_right, 0) AS Distance_contaminated_right,
-             COALESCE(comp.Min_missing_right, 0) AS Min_missing_right,
-             COALESCE(comp.Mismatch_frequency, 0) AS Mismatch_frequency,
-             COALESCE(comp.Deletion_frequency, 0) AS Deletion_frequency,
-             COALESCE(comp.Insertion_frequency, 0) AS Insertion_frequency,
-             COALESCE(comp.Read_based_clipping_frequency, 0) AS Read_based_clipping_frequency,
-             COALESCE(comp.Reference_based_clippings_frequency, 0) AS Reference_based_clippings_frequency,
+             COALESCE(comp.Right_contamination_length, 0) AS Right_contamination_length,
+             COALESCE(comp.Right_missing_length, 0) AS Right_missing_length,
+             CASE WHEN c.Contig_length > 0 THEN COALESCE(comp.Mismatch_frequency, 0.0) / c.Contig_length ELSE 0 END AS Mismatch_frequency,
+             CASE WHEN c.Contig_length > 0 THEN COALESCE(comp.Deletion_frequency, 0.0) / c.Contig_length ELSE 0 END AS Deletion_frequency,
+             CASE WHEN c.Contig_length > 0 THEN COALESCE(comp.Insertion_frequency, 0.0) / c.Contig_length ELSE 0 END AS Insertion_frequency,
+             CASE WHEN c.Contig_length > 0 THEN COALESCE(comp.Read_based_clipping_frequency, 0.0) / c.Contig_length ELSE 0 END AS Read_based_clipping_frequency,
+             CASE WHEN c.Contig_length > 0 THEN COALESCE(comp.Reference_based_clippings_frequency, 0.0) / c.Contig_length ELSE 0 END AS Reference_based_clippings_frequency,
              COALESCE(comp.Mismatch_frequency, 0) + COALESCE(comp.Insertion_frequency, 0) + COALESCE(comp.Read_based_clipping_frequency, 0) AS Score_completeness,
-             CASE WHEN c.Contig_length > 0 THEN ROUND(
+             CASE WHEN c.Contig_length > 0 THEN GREATEST(0, ROUND(
                 100 - (
-                    (COALESCE(comp.Mismatch_frequency, 0) + COALESCE(comp.Insertion_frequency, 0) + COALESCE(comp.Read_based_clipping_frequency, 0)) * 100 / c.Contig_length
+                    (COALESCE(comp.Mismatch_frequency, 0) + COALESCE(comp.Insertion_frequency, 0) + COALESCE(comp.Read_based_clipping_frequency, 0)) * 100.0 / c.Contig_length
                 )
-             )::INTEGER ELSE 100 END AS Whole_completeness_percentage,
+             ))::INTEGER ELSE 100 END AS Completeness_percentage,
              COALESCE(comp.Mismatch_frequency, 0) + COALESCE(comp.Deletion_frequency, 0) + COALESCE(comp.Reference_based_clippings_frequency, 0) AS Score_contamination,
-             CASE WHEN c.Contig_length > 0 THEN ROUND(
-                (COALESCE(comp.Mismatch_frequency, 0) + COALESCE(comp.Deletion_frequency, 0) + COALESCE(comp.Reference_based_clippings_frequency, 0)) * 100 / c.Contig_length
-             )::INTEGER ELSE 100 END AS Whole_contamination_percentage,
+             CASE WHEN c.Contig_length > 0 THEN LEAST(100, ROUND(
+                (COALESCE(comp.Mismatch_frequency, 0) + COALESCE(comp.Deletion_frequency, 0) + COALESCE(comp.Reference_based_clippings_frequency, 0)) * 100.0 / c.Contig_length
+             ))::INTEGER ELSE 0 END AS Contamination_percentage,
              COALESCE(comp.Circularising_reads, 0) AS Circularising_reads,
              COALESCE(comp.Circularising_reads_percentage, 0) AS Circularising_reads_percentage
          FROM Completeness comp
@@ -1089,11 +1089,11 @@ pub struct GCContentData {
 pub struct CompletenessData {
     pub contig_name: String,
     pub prevalence_left: Option<f64>,
-    pub distance_left: Option<i32>,
-    pub min_missing_left: Option<i32>,
+    pub left_contamination_length: Option<i32>,
+    pub left_missing_length: Option<i32>,
     pub prevalence_right: Option<f64>,
-    pub distance_right: Option<i32>,
-    pub min_missing_right: Option<i32>,
+    pub right_contamination_length: Option<i32>,
+    pub right_missing_length: Option<i32>,
     /// Weighted mismatches: Σ(count/coverage) - contributes to both completeness and contamination
     pub total_mismatches: Option<f64>,
     /// Weighted deletions: Σ(count/coverage * median_length) - contributes to contamination

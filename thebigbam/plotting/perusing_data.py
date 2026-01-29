@@ -20,14 +20,14 @@ def build_summary_data(conn, contig_name, sample_names):
     }
 
     completeness_cols = {
-        "Whole_completeness_percentage": "Completeness (%)", "Whole_contamination_percentage": "Contamination (%)",
-        "Mismatch_frequency": "Mismatches (bp)", "Insertion_frequency": "Insertions* (bp)", "Deletion_frequency": "Deletions** (bp)",
-        "Read_based_clipping_frequency": "Read clippings (bp)", "Reference_based_clippings_frequency": "Reference clippings (bp)"
+        "Completeness_percentage": "Completeness (%)", "Contamination_percentage": "Contamination (%)",
+        "Mismatch_frequency": "Mismatches (per pos)", "Insertion_frequency": "Insertions* (per pos)", "Deletion_frequency": "Deletions** (per pos)",
+        "Read_based_clipping_frequency": "Read clippings (per pos)", "Reference_based_clippings_frequency": "Reference clippings (per pos)"
     }
 
     side_completeness_cols = {
-        "Left_completeness_percentage": "Left completeness (%)", "Distance_contaminated_left": "Left expansion* (bp)", "Min_missing_left": "Left collapse** (bp)",
-        "Right_completeness_percentage": "Right completeness (%)", "Distance_contaminated_right": "Right expansion* (bp)", "Min_missing_right": "Right collapse** (bp)",
+        "Left_completeness_percentage": "Left completeness (%)", "Left_contamination_length": "Left expansion* (bp)", "Left_missing_length": "Left collapse** (bp)",
+        "Right_completeness_percentage": "Right completeness (%)", "Right_contamination_length": "Right expansion* (bp)", "Right_missing_length": "Right collapse** (bp)",
         "Circularising_reads": "Circularising reads", "Circularising_reads_percentage": "Circularising reads (%)",
     }
 

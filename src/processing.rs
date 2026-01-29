@@ -234,7 +234,6 @@ fn add_features_from_arrays(
     flags: ModuleFlags,
     repeats: &[RepeatsData],
     output: &mut Vec<FeaturePoint>,
-    primary_count: u64,
 ) -> (Option<PackagingData>, Option<CompletenessData>) {
     let pt_config = config.phagetermini_config;
 
@@ -630,7 +629,6 @@ fn add_features_from_arrays(
             contig_name,
             contig_length,
             arrays.circularising_reads_count,
-            primary_count,
         );
         if completeness.has_data() {
             Some(completeness)
@@ -714,7 +712,7 @@ pub fn process_sample(
 
             // Calculate features for this contig
             let mut features = Vec::new();
-            let (packaging_info, completeness_info) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, seq_type, flags, repeats, &mut features, primary_count);
+            let (packaging_info, completeness_info) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, seq_type, flags, repeats, &mut features);
 
             // Calculate mean and median coverage depth
             let coverage_mean = arrays.coverage_mean() as f32;

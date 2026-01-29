@@ -5,9 +5,10 @@ use crate::db::CompletenessData;
 
 /// Compute completeness statistics from clipping, insertion, mismatch, and deletion data.
 ///
-/// For the left side: finds the first left-clipping event where clipped_length > distance_to_start.
+/// For the left side: finds all significant left-clipping events where clipped_length > distance_to_start,
+/// then picks the one with the highest prevalence (clipping_count / coverage).
 ///
-/// For the right side: finds the first right-clipping event where clipped_length > distance_to_end.
+/// For the right side: same logic with right-clipping events where clipped_length > distance_to_end.
 ///
 /// score_completeness: sum of weighted missing basepairs (in reads but not reference):
 /// - clippings: (count/coverage) * median_length
@@ -19,7 +20,7 @@ use crate::db::CompletenessData;
 /// - deletions: (count/coverage) * median_length
 /// - paired clippings (right followed by left): average_prevalence * distance
 ///
-/// Returns None for a side if the first clipping event doesn't satisfy the condition.
+/// Returns None for a side if no clipping event satisfies the condition.
 pub fn compute_completeness(
     left_clipping_lengths: &[Vec<u32>],
     right_clipping_lengths: &[Vec<u32>],
@@ -34,7 +35,6 @@ pub fn compute_completeness(
     contig_name: &str,
     contig_length: usize,
     circularising_reads_count: u64,
-    total_primary_reads: u64,
 ) -> CompletenessData {
     // Helper function to compute median from a vector of lengths
     fn compute_median(lengths: &[u32]) -> i32 {
@@ -51,20 +51,18 @@ pub fn compute_completeness(
         }
     }
 
-    // Find the FIRST left-clipping event (leftmost position), then check if clipped_length > distance_to_start
-    // Only valid if the first left-clipping satisfies the condition
+    // Find all left-clipping events where median clipped length > distance to start,
+    // then pick the one with the highest prevalence (clipping_count / coverage).
     let left_result = left_clip_runs
         .iter()
-        .min_by_key(|run| run.start_pos) // Find the first (leftmost) left-clipping
-        .and_then(|run| {
-            let pos = (run.start_pos - 1) as usize; // Convert to 0-indexed
-            let distance_to_start = run.start_pos - 1; // Distance from position 1
+        .filter_map(|run| {
+            let pos = (run.start_pos - 1) as usize;
+            let distance_to_start = run.start_pos - 1;
             let min_missing = if pos < left_clipping_lengths.len() {
                 compute_median(&left_clipping_lengths[pos])
             } else {
                 0
             };
-            // Only valid if clipped length > distance to start
             if min_missing > distance_to_start {
                 let clipping_count = run.value as f64;
                 let coverage = primary_reads.get(pos).copied().unwrap_or(0) as f64;
@@ -73,22 +71,21 @@ pub fn compute_completeness(
             } else {
                 None
             }
-        });
+        })
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    // Find the FIRST right-clipping event (rightmost position), then check if clipped_length > distance_to_end
-    // Only valid if the first right-clipping satisfies the condition
+    // Find all right-clipping events where median clipped length > distance to end,
+    // then pick the one with the highest prevalence (clipping_count / coverage).
     let right_result = right_clip_runs
         .iter()
-        .max_by_key(|run| run.start_pos) // Find the first (rightmost) right-clipping
-        .and_then(|run| {
-            let pos = (run.start_pos - 1) as usize; // Convert to 0-indexed
-            let distance_to_end = contig_length as i32 - run.start_pos; // Distance to end
+        .filter_map(|run| {
+            let pos = (run.start_pos - 1) as usize;
+            let distance_to_end = contig_length as i32 - run.start_pos;
             let min_missing = if pos < right_clipping_lengths.len() {
                 compute_median(&right_clipping_lengths[pos])
             } else {
                 0
             };
-            // Only valid if clipped length > distance to end
             if min_missing > distance_to_end {
                 let clipping_count = run.value as f64;
                 let coverage = primary_reads.get(pos).copied().unwrap_or(0) as f64;
@@ -97,7 +94,8 @@ pub fn compute_completeness(
             } else {
                 None
             }
-        });
+        })
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     // Compute individual score components
 
@@ -157,7 +155,7 @@ pub fn compute_completeness(
         }
     }
 
-    // Total reference clipped: Σ(avg_prevalence * distance) for paired clips (right followed by left)
+    // Total reference clipped: Σ(min_prevalence * distance) for paired clips (right followed by left)
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum ClipType { Right, Left }
 
@@ -191,21 +189,28 @@ pub fn compute_completeness(
         if type_right == ClipType::Right && type_left == ClipType::Left {
             let distance = pos_left - pos_right;
             if distance > 0 {
-                let avg_prevalence = (prev_right + prev_left) / 2.0;
-                total_reference_clipped += avg_prevalence * distance as f64;
+                let min_prevalence = prev_right.min(prev_left);
+                total_reference_clipped += min_prevalence * distance as f64;
             }
         }
     }
 
-    // Compute circularising reads percentage
+    // Compute circularising reads percentage based on mean coverage at junction
     let circularising_reads = if circularising_reads_count > 0 {
         Some(circularising_reads_count)
     } else {
         None
     };
 
-    let circularising_reads_percentage = if total_primary_reads > 0 && circularising_reads_count > 0 {
-        Some(((circularising_reads_count as f64 / total_primary_reads as f64) * 100.0).round() as i32)
+    let circularising_reads_percentage = if circularising_reads_count > 0 && !primary_reads.is_empty() {
+        let first = primary_reads[0] as f64;
+        let last = primary_reads[primary_reads.len() - 1] as f64;
+        let mean_junction_coverage = (first + last) / 2.0;
+        if mean_junction_coverage > 0.0 {
+            Some(((circularising_reads_count as f64 / mean_junction_coverage) * 100.0).round() as i32)
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -213,11 +218,11 @@ pub fn compute_completeness(
     CompletenessData {
         contig_name: contig_name.to_string(),
         prevalence_left: left_result.map(|(p, _, _)| p * 100.0), // Store as percentage
-        distance_left: left_result.map(|(_, d, _)| d),
-        min_missing_left: left_result.map(|(_, _, m)| m),
+        left_contamination_length: left_result.map(|(_, d, _)| d),
+        left_missing_length: left_result.map(|(_, _, m)| m),
         prevalence_right: right_result.map(|(p, _, _)| p * 100.0), // Store as percentage
-        distance_right: right_result.map(|(_, d, _)| d),
-        min_missing_right: right_result.map(|(_, _, m)| m),
+        right_contamination_length: right_result.map(|(_, d, _)| d),
+        right_missing_length: right_result.map(|(_, _, m)| m),
         total_mismatches: if total_mismatches > 0.0 { Some(total_mismatches) } else { None },
         total_deletions: if total_deletions > 0.0 { Some(total_deletions) } else { None },
         total_insertions: if total_insertions > 0.0 { Some(total_insertions) } else { None },

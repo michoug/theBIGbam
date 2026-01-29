@@ -137,7 +137,7 @@ pub fn process_contig_streaming(
         };
 
         // Compute template length and proper_pair with circular correction if needed
-        let (template_length, is_proper_pair, is_non_inward) = if circular && seq_type.is_short_paired() {
+        let (template_length, is_proper_pair, _is_non_inward) = if circular && seq_type.is_short_paired() {
             // In circular mode, insert_size and is_proper_pair from BAM are based on doubled assembly
             // We need to recompute based on the actual circular genome coordinates
             let pos1 = record.pos() as usize;
@@ -171,37 +171,14 @@ pub fn process_contig_streaming(
             (record.insert_size().abs() as i32, record.is_proper_pair(), non_inward)
         };
 
-        // Track circularising reads (primary alignments only)
-        if !record.is_secondary() && !record.is_supplementary() {
+        // Track circularising reads (primary alignments only, circular mode only)
+        if circular && !record.is_secondary() && !record.is_supplementary() {
             let raw_start = record.pos() as usize;
             let raw_end = cigar_view.end_pos() as usize;
 
-            // For circular mode: detect reads crossing the boundary (mid-position of doubled contig)
-            if circular && raw_start < ref_length && raw_end > ref_length {
+            // Detect reads crossing the boundary (mid-position of doubled contig)
+            if raw_start < ref_length && raw_end > ref_length {
                 arrays.circularising_reads_count += 1;
-            }
-            // For paired reads: track insert stats and candidate circularising pairs
-            else if seq_type.is_short_paired() && record.is_first_in_template() {
-                // Update insert size stats for proper pairs (for threshold calculation)
-                if is_proper_pair && template_length > 0 {
-                    arrays.update_insert_stats(template_length as f64);
-                }
-
-                // Store non-inward pairs near boundaries as candidates for later filtering
-                if is_non_inward && !record.is_mate_unmapped() {
-                    let pos = record.pos() as usize % ref_length;
-                    let mpos = record.mpos() as usize % ref_length;
-
-                    // Check if positions suggest junction spanning
-                    // (one mate in first 10%, other in last 10% of contig)
-                    let near_start = pos.min(mpos);
-                    let near_end = pos.max(mpos);
-                    let margin = ref_length / 10;
-
-                    if near_start < margin && near_end > ref_length - margin {
-                        arrays.circularising_candidates.push((pos, mpos, template_length));
-                    }
-                }
             }
         }
 
@@ -246,12 +223,6 @@ pub fn process_contig_streaming(
     // Only needed for phagetermini; other features are already finalized
     if flags.phagetermini {
         arrays.finalize_strands(seq_type);
-    }
-
-    // Finalize circularising read count for paired reads
-    // This filters candidate pairs using computed mean + 3*sd threshold
-    if seq_type.is_short_paired() && !arrays.circularising_candidates.is_empty() {
-        arrays.finalize_circularising_count(ref_length, circular);
     }
 
     Ok(Some((arrays, coverage_pct, primary_count)))

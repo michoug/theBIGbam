@@ -84,7 +84,7 @@ def build_controls(conn):
 
     whole_contamination_max = 100.0
     try:
-        cur.execute("SELECT MAX(Whole_contamination_percentage) FROM Explicit_completeness WHERE Whole_contamination_percentage IS NOT NULL")
+        cur.execute("SELECT MAX(Contamination_percentage) FROM Explicit_completeness WHERE Contamination_percentage IS NOT NULL")
         result = cur.fetchone()
         if result and result[0] is not None:
             whole_contamination_max = result[0]
@@ -634,14 +634,14 @@ def create_layout(db_path):
         if pct_completeness_slider is not None:
             min_val, max_val = pct_completeness_slider.value
             if min_val > 0 or max_val < 100:
-                conditions.append("Whole_completeness_percentage >= ? AND Whole_completeness_percentage <= ?")
+                conditions.append("Completeness_percentage >= ? AND Completeness_percentage <= ?")
                 params.extend([min_val, max_val])
 
         if pct_contamination_slider is not None:
             min_val, max_val = pct_contamination_slider.value
             conta_max = widgets['whole_contamination_max']
             if min_val > 0 or max_val < conta_max:
-                conditions.append("Whole_contamination_percentage >= ? AND Whole_contamination_percentage <= ?")
+                conditions.append("Contamination_percentage >= ? AND Contamination_percentage <= ?")
                 params.extend([min_val, max_val])
 
         if circularising_slider is not None:
@@ -775,14 +775,14 @@ def create_layout(db_path):
         if pct_completeness_slider is not None:
             min_val, max_val = pct_completeness_slider.value
             if min_val > 0 or max_val < 100:
-                conditions.append("Whole_completeness_percentage >= ? AND Whole_completeness_percentage <= ?")
+                conditions.append("Completeness_percentage >= ? AND Completeness_percentage <= ?")
                 params.extend([min_val, max_val])
 
         if pct_contamination_slider is not None:
             min_val, max_val = pct_contamination_slider.value
             conta_max = widgets['whole_contamination_max']
             if min_val > 0 or max_val < conta_max:
-                conditions.append("Whole_contamination_percentage >= ? AND Whole_contamination_percentage <= ?")
+                conditions.append("Contamination_percentage >= ? AND Contamination_percentage <= ?")
                 params.extend([min_val, max_val])
 
         if circularising_slider is not None:
