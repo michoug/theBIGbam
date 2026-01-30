@@ -15,6 +15,7 @@ class SearchableSelect(JSComponent):
         """
         .ts-wrapper { width: 100%; }
         .ts-wrapper .ts-control { border: 1px solid #ccc; border-radius: 4px; padding: 4px 8px; min-height: 31px; font-size: 14px; }
+        .ts-dropdown { margin-top: 0 !important; }
         """
     ]
 
@@ -24,7 +25,6 @@ class SearchableSelect(JSComponent):
     export function render({ model }) {
         const container = document.createElement('div');
         container.style.width = '100%';
-        container.style.margin = '5px 10px 10px 0';
         const select = document.createElement('select');
         select.setAttribute('placeholder', model.placeholder);
         container.appendChild(select);

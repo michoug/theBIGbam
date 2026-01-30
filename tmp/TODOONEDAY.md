@@ -76,13 +76,9 @@
 - Sometimes autocomplete for Contig field (and others?) do not work at first use but work after clicking away and coming back: when bugged if i pick again a sample it works in visualisation?
 - Non_inward_pairs, mate_not_mapped, mate_on_another_contig are Curves in plots, can we see it when small range from from far away?
 - If no genbank provided you should not show gene map option
-- !important! Filter to only show part of the contig possible (from bp x to bp y) -> could be very useful for eukaryotic contigs
-- !important! Filter contigs by genes present to look for a specific function for example
-- !important! Make 2 buttons instead of just Apply: "Peruse" and "Plot". Peruse lets you see one tables with as many columns as plots requested. Plus show general statistics associated to this contig in this sample at the top. Similarly adapted for All-samples view with table showing differents statistics per samples as well
 - !important! Possibility to extract tables with data as well
 - !important! Be able to slide down in autocomplete lists -> pagination easy to implement?
 - Flavobacterium147_T9_12_phage2 -> no sites kept because many small site -> i could plot sites post termini classification via view? idea highlight on plot of phagetermini via point or similar?
-- When i click on gene also have gray associated areas in subplots or remove gray altogether?
 - Show loading logo when waiting for plot to be generated
 - Change title Bokeh Application in the web page
 

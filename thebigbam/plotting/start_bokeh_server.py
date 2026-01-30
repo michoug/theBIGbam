@@ -1772,7 +1772,7 @@ def create_layout(db_path):
         )
 
         # Container for the dynamic input widget
-        input_container = column(width=90, margin=(0, 2, 0, 0))
+        input_container = pn.Column(width=90, margin=(0, 2, 0, 0))
 
         def refresh_on_filter_change():
             """Refresh contig and sample options when Filtering2 values change."""
@@ -1786,25 +1786,25 @@ def create_layout(db_path):
         # Create initial input widget based on column type
         if initial_is_text:
             distinct_values = initial_col_info.get('distinct_values', [])
-            initial_input = Select(
-                value="",
-                options=distinct_values,
-                width=90,
-                margin=(0, 2, 0, 0)
+            initial_input = SearchableSelect(
+                value="", options=distinct_values,
+                placeholder="Search...", width=90
             )
-            input_container.children = [initial_input]
-            initial_input.on_change('value', lambda attr, old, new: refresh_on_filter_change())
+            input_container.objects = [initial_input]
+            initial_input.param.watch(lambda event: refresh_on_filter_change(), 'value')
+            initial_is_panel = True
         else:
             initial_input = Spinner(value=0, placeholder="Value...", width=90, margin=(0, 2, 0, 0))
-            input_container.children = [initial_input]
+            input_container.objects = [initial_input]
             # Add callback for Bokeh Spinner
             initial_input.on_change('value', lambda attr, old, new: refresh_on_filter_change())
+            initial_is_panel = False
 
         # Remove button
         minus_btn = Button(label="−", width=30, height=30, stylesheets=[stylesheet], margin=(0, 10, 0, 0))
 
         # Store reference to current input widget (for later retrieval)
-        current_input_ref = {'widget': initial_input, 'is_panel': False}
+        current_input_ref = {'widget': initial_input, 'is_panel': initial_is_panel}
 
         def update_input_widget(col_name):
             """Update the input widget based on column type."""
@@ -1825,19 +1825,17 @@ def create_layout(db_path):
             # Create new input widget
             if is_text:
                 distinct_values = col_info.get('distinct_values', [])
-                new_input = Select(
-                    value="",
-                    options=distinct_values,
-                    width=90,
-                    margin=(0, 2, 0, 0)
+                new_input = SearchableSelect(
+                    value="", options=distinct_values,
+                    placeholder="Search...", width=90
                 )
-                input_container.children = [new_input]
+                input_container.objects = [new_input]
                 current_input_ref['widget'] = new_input
-                current_input_ref['is_panel'] = False
-                new_input.on_change('value', lambda attr, old, new: refresh_on_filter_change())
+                current_input_ref['is_panel'] = True
+                new_input.param.watch(lambda event: refresh_on_filter_change(), 'value')
             else:
                 new_input = Spinner(value=0, placeholder="Value...", width=90, margin=(0, 2, 0, 0))
-                input_container.children = [new_input]
+                input_container.objects = [new_input]
                 current_input_ref['widget'] = new_input
                 current_input_ref['is_panel'] = False
                 # Add callback for Bokeh Spinner
@@ -1862,7 +1860,7 @@ def create_layout(db_path):
         # Add callback to comparison_select to refresh when operator changes
         comparison_select.on_change('value', lambda attr, old, new: refresh_on_filter_change())
 
-        query_row = row(category_select, subcategory_select, comparison_select, input_container, minus_btn,
+        query_row = pn.Row(category_select, subcategory_select, comparison_select, input_container, minus_btn,
                        sizing_mode="stretch_width", margin=(5, 0, 5, 0))
 
         # Store reference to this row
@@ -1932,12 +1930,12 @@ def create_layout(db_path):
         # Add the "+ Add AND" button
         section_children.append(section_data['add_and_btn'])
 
-        # Update the section column's children
-        section_data['column'].children = section_children
+        # Update the section column's objects
+        section_data['column'].objects = section_children
 
     def create_or_section():
         """Create a new OR section with one query row and Add AND/OR button."""
-        section_column = column(
+        section_column = pn.Column(
             sizing_mode="stretch_width",
             styles={'border-left': '3px solid #00b17c', 'padding-left': '10px', 'margin-left': '5px'}
         )
@@ -2010,7 +2008,7 @@ def create_layout(db_path):
         # Add the current global widget (button or select) at the end
         content_children.append(global_widget_state['widget'])
 
-        filtering_content.children = content_children
+        filtering_content.objects = content_children
 
     def global_add_and_or_callback():
         # Create a new section
@@ -2024,8 +2022,8 @@ def create_layout(db_path):
     initial_section = create_or_section()
     or_sections.append(initial_section)
 
-    # Create the main content container (using Bokeh column, not Panel)
-    filtering_content = column(
+    # Create the main content container (Panel Column to support Panel widgets inside)
+    filtering_content = pn.Column(
         sizing_mode="stretch_width"
     )
 
@@ -2058,7 +2056,7 @@ def create_layout(db_path):
     ## Build Sample section
     sample_toggle_btn = Button(label="▼", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
     sample_title = Div(text="<b>Samples</b>", align="center")
-    sample_header = row(sample_toggle_btn, sample_title, sizing_mode="stretch_width", align="center")
+    sample_header = row(sample_toggle_btn, sample_title, sizing_mode="stretch_width", align="center", margin=(0, 0, 5, 0))
 
     above_sample_children = []
     above_sample_content = column(
@@ -2084,7 +2082,7 @@ def create_layout(db_path):
     contig_toggle_btn = Button(label="▼", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
     contig_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
     contig_title = Div(text="<b>Contigs</b>", align="center")
-    contig_header = row(contig_toggle_btn, contig_title, sizing_mode="stretch_width", align="center")
+    contig_header = row(contig_toggle_btn, contig_title, sizing_mode="stretch_width", align="center", margin=(0, 0, 5, 0))
     above_contig_children = []
     
     above_contig_content = column(
@@ -2239,7 +2237,8 @@ def create_layout(db_path):
     position_row = row(
         position_label_from, from_position_input, 
         position_label_to, to_position_input,
-        sizing_mode="stretch_width"
+        sizing_mode="stretch_width",
+        margin=(10, 0, 0, 0)
     )
     
     below_contig_children.append(position_row)
