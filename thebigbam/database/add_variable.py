@@ -22,12 +22,12 @@ def config_feature_subplot(subplot, module, plot_type, color, title, alpha=0.8, 
 
 
 def add_add_variable_args(parser):
-    parser.add_argument('db')
-    parser.add_argument('variable_name')
-    parser.add_argument('type')
-    parser.add_argument('color')
-    parser.add_argument('title')
-    parser.add_argument('csv_file')
+    parser.add_argument('--db', required=True, help='Path to DuckDB database')
+    parser.add_argument('--name', dest='variable_name', required=True, help='Name for the new variable')
+    parser.add_argument('--type', dest='type', required=True, help='Plot type (e.g., bars, line)')
+    parser.add_argument('--color', required=True, help='Color for the variable')
+    parser.add_argument('--title', required=True, help='Title for the variable')
+    parser.add_argument('--csv', dest='csv_file', required=True, help='CSV file with variable data')
 
 
 def run_add_variable(args):

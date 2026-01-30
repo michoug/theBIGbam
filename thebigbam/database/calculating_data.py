@@ -51,8 +51,8 @@ def calculating_all_features_parallel(list_modules, bam_files, output_db, min_co
 
 def add_calculate_args(parser):
     parser.add_argument("-t", "--threads", required=True, help="Number of threads available")
-    parser.add_argument("-g", "--genbank", help="Path to annotation file: GenBank (.gbk, .gbff) or GFF3 (.gff) format (optional; if not provided, no gene annotations will be stored)")
-    parser.add_argument("-b", "--bam_files", required=True, help="Path to bam file or directory containing mapping files (BAM format)")
+    parser.add_argument("-g", "--genbank", help="Path to annotation file: GenBank (.gbk, .gbff) or GFF3 (.gff) format. Required if no BAM files provided.")
+    parser.add_argument("-b", "--bam_files", help="Path to bam file or directory containing mapping files (BAM format). Optional if genbank is provided.")
     parser.add_argument("--circular", action="store_true", help="Set if assembly was doubled during mapping (enables modulo logic)")
     parser.add_argument("-o", "--output", required=True, help="Output database file path (.db)")
     parser.add_argument("-m", "--modules", required=False, default=None, help="List of modules to compute (comma-separated). If not provided, all modules are computed. Options: Coverage, Misalignment, Long-reads, Paired-reads, Phage termini")
@@ -71,22 +71,39 @@ def run_calculate_args(args):
     genbank_path = getattr(args, 'genbank', None)
     assembly_path = getattr(args, 'assembly', None)
 
-    if os.path.isdir(args.bam_files):
-        bam_files = [os.path.join(args.bam_files, f) for f in os.listdir(args.bam_files) if f.endswith(".bam")]
-    else:
-        bam_files = [args.bam_files]
+    # Handle optional bam_files
+    bam_files = []
+    if args.bam_files:
+        if os.path.isdir(args.bam_files):
+            bam_files = [os.path.join(args.bam_files, f) for f in os.listdir(args.bam_files) if f.endswith(".bam")]
+            if not bam_files:
+                print(f"WARNING: No .bam files found in directory '{args.bam_files}'", flush=True)
+        elif os.path.isfile(args.bam_files):
+            bam_files = [args.bam_files]
+        else:
+            sys.exit(f"ERROR: BAM path not found: {args.bam_files}")
+    
+    # Validate: need at least genbank OR bam_files
+    if not bam_files and not genbank_path:
+        sys.exit("ERROR: You must provide either --bam_files or --genbank (or both).")
+    
     if not bam_files:
-        sys.exit("ERROR: No BAM files found in the specified mapping path.")
+        print("No BAM files provided. Will only populate contig-level data from GenBank.", flush=True)
 
+    # Handle modules - if no BAM files, modules are ignored
     if args.modules is None:
-        # Default: all modules
-        requested_modules = VALID_MODULES.copy()
+        # Default: all modules (but they require BAM files)
+        requested_modules = VALID_MODULES.copy() if bam_files else []
     else:
         requested_modules = [m.strip() for m in args.modules.split(",")]
         # Validate module names
         for module in requested_modules:
             if module not in VALID_MODULES:
                 sys.exit(f"ERROR: Unknown module '{module}'. Valid modules are: {', '.join(VALID_MODULES)}")
+        # Warn if modules specified but no BAM files
+        if not bam_files and requested_modules:
+            print(f"WARNING: Modules {requested_modules} require BAM files - they will be skipped.", flush=True)
+            requested_modules = []
     min_coverage = args.min_coverage
     variation_percentage = args.variation_percentage
     coverage_percentage = args.coverage_percentage

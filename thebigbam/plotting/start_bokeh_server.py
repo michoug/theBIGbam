@@ -15,6 +15,7 @@ from bokeh.models.plots import GridPlot
 from .plotting_data_per_sample import generate_bokeh_plot_per_sample
 from .plotting_data_all_samples import generate_bokeh_plot_all_samples
 from ..database.database_getters import get_filtering_metadata
+from .searchable_select import SearchableSelect
 
 def build_controls(conn):
 
@@ -115,7 +116,7 @@ def build_controls(conn):
         # Get distinct non-null values for each column
         for column in columns:
             cur.execute(f'SELECT DISTINCT "{column}" FROM Contig_annotation WHERE "{column}" IS NOT NULL ORDER BY "{column}"')
-            values = [str(r[0]) for r in cur.fetchall()]  # Convert to strings for AutocompleteInput
+            values = [str(r[0]) for r in cur.fetchall()]
             if values:  # Only add if there are values
                 annotation_filters[column] = values
     except Exception:
@@ -129,13 +130,10 @@ def build_controls(conn):
     contig_duplications = {r[0]: r[2] for r in rows}  # Dictionary mapping contig_name -> duplication percentage (can be None)
     
     # If only one contig in database, pre-fill the field
-    contig_select = pn.widgets.AutocompleteInput(
+    contig_select = SearchableSelect(
         value=contigs[0] if len(contigs) == 1 else "",
         options=contigs,
-        min_characters=0,
-        case_sensitive=False,
         placeholder="Type to search contigs...",
-        search_strategy="includes",
         sizing_mode="stretch_width"
     )
 
@@ -144,13 +142,10 @@ def build_controls(conn):
     samples = [r[0] for r in cur.fetchall()]
     
     # If only one sample in database, pre-fill the field
-    sample_select = pn.widgets.AutocompleteInput(
+    sample_select = SearchableSelect(
         value=samples[0] if len(samples) == 1 else "",
         options=samples,
-        min_characters=0,
-        case_sensitive=False,
         placeholder="Type to search samples...",
-        search_strategy="includes",
         sizing_mode="stretch_width"
     )
 
@@ -1009,9 +1004,7 @@ def create_layout(db_path):
 
     def update_widget_completions(widget, completions):
         """Update widget completions. Clear value if not in completions."""
-        # Always add empty option at top to work around Bokeh AutocompleteInput click bug
-        widget.options = [""] + completions
-        # Clear value if it's not in the new completions (empty is always valid)
+        widget.options = completions
         if widget.value and widget.value not in completions:
             widget.value = ""
     
@@ -1196,12 +1189,9 @@ def create_layout(db_path):
             width=70
         )
 
-        var_input = pn.widgets.AutocompleteInput(
+        var_input = Select(
             options=widgets['variables'],
-            placeholder="Select variable...",
-            min_characters=0,
-            case_sensitive=False,
-            search_strategy="includes",
+            value="",
             sizing_mode="stretch_width"
         )
         
@@ -1221,7 +1211,7 @@ def create_layout(db_path):
         # len(variable_filter_rows)>0 to make - button invisible initially
         minus_btn = Button(label="−", width=30, height=30, visible=len(variable_filter_rows)>0)
         
-        filter_row = row(type_select, var_input.get_root(), comparison_select, threshold_input, \
+        filter_row = row(type_select, var_input, comparison_select, threshold_input, \
                          plus_btn, minus_btn, sizing_mode="stretch_width")
         
         # Adjust margins for better spacing
@@ -1269,9 +1259,9 @@ def create_layout(db_path):
             global_toggle_lock['locked'] = False
             update_section_titles()
         
-        # Attach to all inputs (var_input is Panel widget, others are Bokeh)
+        # Attach to all inputs
         type_select.on_change('value', refresh_on_filter_change)
-        var_input.param.watch(lambda event: refresh_on_filter_change(None, None, event.new), 'value')
+        var_input.on_change('value', refresh_on_filter_change)
         comparison_select.on_change('value', refresh_on_filter_change)
         threshold_input.on_change('value', refresh_on_filter_change)
 
@@ -1298,7 +1288,7 @@ def create_layout(db_path):
             # Validate contig is selected
             if not contig:
                 peruse_button.visible = False
-                main_placeholder.children = [Div(text="<pre>Error: Please select a contig.</pre>")]
+                main_placeholder.objects = [pn.pane.HTML("<pre>Error: Please select a contig.</pre>")]
                 return
             
             # Get contig length for validation
@@ -1310,13 +1300,13 @@ def create_layout(db_path):
                 xend = int(to_position_input.value) if to_position_input.value.strip() else contig_length
             except ValueError:
                 peruse_button.visible = False
-                main_placeholder.children = [Div(text="<pre>Error: Invalid position range - positions must be integers.</pre>")]
+                main_placeholder.objects = [pn.pane.HTML("<pre>Error: Invalid position range - positions must be integers.</pre>")]
                 return
             
             # Validate position range (1-indexed, positions must be within contig bounds)
             if xstart < 0 or xend > contig_length or xstart >= xend:
                 peruse_button.visible = False
-                main_placeholder.children = [Div(text=f"<pre>Error: Invalid position range - positions must satisfy 0 ≤ start &lt; end ≤ {contig_length}.</pre>")]
+                main_placeholder.objects = [pn.pane.HTML(f"<pre>Error: Invalid position range - positions must satisfy 0 ≤ start &lt; end ≤ {contig_length}.</pre>")]
                 return
 
             if is_all:
@@ -1370,10 +1360,27 @@ def create_layout(db_path):
                 print(f"[start_bokeh_server] Generating plot for sample={sample}, contig={contig}, features={requested_features}")
                 grid = generate_bokeh_plot_per_sample(conn, requested_features, contig, sample, xstart=xstart, xend=xend, genbank_path=genbank_path)
 
+            # Extract and cache plot data for instant downloads (no database round-trip)
+            try:
+                plot_data_cache['data'] = extract_plot_data_from_grid(grid)
+                plot_data_cache['is_all_samples'] = is_all
+                # Set filename based on context
+                safe_contig = "".join(c if c.isalnum() or c in "-_" else "_" for c in contig)
+                if is_all:
+                    safe_var = "".join(c if c.isalnum() or c in "-_" else "_" for c in (selected_var or 'data'))
+                    plot_data_cache['filename'] = f"{safe_contig}_all_samples_{safe_var}.csv"
+                else:
+                    safe_sample = "".join(c if c.isalnum() or c in "-_" else "_" for c in sample)
+                    plot_data_cache['filename'] = f"{safe_contig}_{safe_sample}_data.csv"
+                print(f"[start_bokeh_server] Cached {len(plot_data_cache['data'])} data sources for download", flush=True)
+            except Exception as cache_err:
+                print(f"[start_bokeh_server] Warning: Could not cache plot data: {cache_err}", flush=True)
+                plot_data_cache['data'] = None
+
             # Create toolbar-style row with buttons positioned top-right
-            from bokeh.models import Spacer
-            toolbar_row = row(
-                Spacer(sizing_mode="stretch_width"),  # Push buttons to right
+            # Use Panel Row to mix Bokeh and Panel widgets
+            toolbar_row = pn.Row(
+                pn.Spacer(sizing_mode="stretch_width"),  # Push buttons to right
                 peruse_button,
                 download_contig_button,
                 download_metrics_button,
@@ -1386,7 +1393,7 @@ def create_layout(db_path):
             download_data_button.visible = True  # Show download data button when plot exists
             
             # Stack toolbar row above grid
-            main_placeholder.children = [column(toolbar_row, grid, sizing_mode="stretch_both")]
+            main_placeholder.objects = [pn.Column(toolbar_row, grid, sizing_mode="stretch_both")]
 
         except Exception as e:
             peruse_button.visible = False
@@ -1395,7 +1402,7 @@ def create_layout(db_path):
             download_data_button.visible = False
             tb = traceback.format_exc()
             print(f"[start_bokeh_server] Exception: {tb}", flush=True)
-            main_placeholder.children = [Div(text=f"<pre>Error building plot:\n{tb}</pre>")]
+            main_placeholder.objects = [pn.pane.HTML(f"<pre>Error building plot:\n{tb}</pre>")]
 
     ## Peruse button callback function
     def peruse_clicked():
@@ -1436,39 +1443,177 @@ def create_layout(db_path):
         # Generate and open HTML in new window
         generate_and_open_peruse_html(conn, contig, sample_names)
 
-    ## Download contig summary callback function
-    def download_contig_clicked():
-        """Generate and download contig summary as CSV."""
+    ## Download functionality using Panel FileDownload widgets
+    import io
+    
+    # Store references to download widgets (created later, after widgets dict exists)
+    download_widgets = {'contig': None, 'metrics': None, 'data': None}
+    
+    # Cache for plot data - extracted from ColumnDataSources after plotting
+    # This avoids re-querying the database for downloads (instant downloads)
+    plot_data_cache = {'data': None, 'is_all_samples': False, 'filename': 'data.csv'}
+    
+    def extract_plot_data_from_grid(grid):
+        """Extract all data from ColumnDataSources in a GridPlot.
+        
+        Returns a list of dicts, each containing data from one renderer's source.
+        """
+        from bokeh.models import GlyphRenderer
+        
+        all_data = []
+        figures = []
+        
+        # Get all figures from the grid
+        if hasattr(grid, 'children'):
+            for item in grid.children:
+                if hasattr(item, '__iter__'):
+                    for subitem in item:
+                        if hasattr(subitem, 'renderers'):
+                            figures.append(subitem)
+                elif hasattr(item, 'renderers'):
+                    figures.append(item)
+        
+        for fig in figures:
+            if not hasattr(fig, 'renderers'):
+                continue
+            
+            # Get legend label from figure's legend if available
+            legend_map = {}
+            if hasattr(fig, 'legend') and fig.legend:
+                for legend in fig.legend:
+                    if hasattr(legend, 'items'):
+                        for item in legend.items:
+                            if hasattr(item, 'label') and hasattr(item, 'renderers'):
+                                # Extract string from Bokeh Value object
+                                label_obj = item.label
+                                if hasattr(label_obj, 'value'):
+                                    label_val = label_obj.value  # Bokeh Value object
+                                elif isinstance(label_obj, dict):
+                                    label_val = label_obj.get('value', '')
+                                else:
+                                    label_val = str(label_obj)
+                                for r in item.renderers:
+                                    legend_map[id(r)] = label_val
+            
+            for renderer in fig.renderers:
+                if isinstance(renderer, GlyphRenderer) and hasattr(renderer, 'data_source'):
+                    source = renderer.data_source
+                    if hasattr(source, 'data') and source.data:
+                        data = {k: list(v) for k, v in source.data.items()}  # Copy data
+                        # Skip empty sources or sources without x/y
+                        if 'x' not in data or 'y' not in data:
+                            continue
+                        if not data['x'] or not data['y']:
+                            continue
+                        # Get feature name from legend
+                        feature_name = legend_map.get(id(renderer), 'unknown')
+                        data['_feature_name'] = feature_name
+                        all_data.append(data)
+        
+        return all_data
+    
+    def convert_plot_data_to_csv(plot_data, is_all_samples):
+        """Convert extracted plot data to CSV string."""
+        if not plot_data:
+            return None
+        
+        import csv as csv_module
+        output = io.StringIO()
+        writer = csv_module.writer(output)
+        
+        first_col = 'sample_name' if is_all_samples else 'feature_name'
+        
+        # Check what columns exist across all data
+        has_first_last = any('first_pos' in d for d in plot_data)
+        has_stats = any('mean' in d for d in plot_data)
+        
+        # Build header
+        if has_first_last:
+            if has_stats:
+                header = [first_col, 'start_position', 'last_position', 'value', 'mean', 'median', 'std']
+            else:
+                header = [first_col, 'start_position', 'last_position', 'value']
+        else:
+            if has_stats:
+                header = [first_col, 'position', 'value', 'mean', 'median', 'std']
+            else:
+                header = [first_col, 'position', 'value']
+        
+        writer.writerow(header)
+        
+        for data in plot_data:
+            name = data.get('_feature_name', 'unknown')
+            x_vals = data.get('x', [])
+            y_vals = data.get('y', [])
+            first_pos = data.get('first_pos', None)
+            last_pos = data.get('last_pos', None)
+            means = data.get('mean', None)
+            medians = data.get('median', None)
+            stds = data.get('std', None)
+            
+            # Step-plot data has pairs of points (start, end) with same y value
+            # Consolidate pairs into single rows: start_pos, end_pos, value
+            # This is faster (half the rows) and produces cleaner output
+            n = len(x_vals)
+            i = 0
+            while i < n:
+                # Check if this is a step-plot pair (consecutive points with same y)
+                if i + 1 < n and y_vals[i] == y_vals[i + 1]:
+                    # Step-plot pair: use x[i] as start, x[i+1] as end
+                    start_x = x_vals[i]
+                    end_x = x_vals[i + 1]
+                    row = [name, start_x, end_x, y_vals[i]]
+                    if has_stats:
+                        row.append(means[i] if means and i < len(means) else '')
+                        row.append(medians[i] if medians and i < len(medians) else '')
+                        row.append(stds[i] if stds and i < len(stds) else '')
+                    writer.writerow(row)
+                    i += 2  # Skip both points of the pair
+                else:
+                    # Single point (not a pair)
+                    if has_first_last and first_pos and last_pos:
+                        row = [name, first_pos[i], last_pos[i], y_vals[i]]
+                    else:
+                        row = [name, x_vals[i], x_vals[i], y_vals[i]]
+                    if has_stats:
+                        row.append(means[i] if means and i < len(means) else '')
+                        row.append(medians[i] if medians and i < len(medians) else '')
+                        row.append(stds[i] if stds and i < len(stds) else '')
+                    writer.writerow(row)
+                    i += 1
+        
+        return output.getvalue()
+
+    def make_contig_download_callback():
+        """Create callback for contig summary download."""
         from .downloading_data import download_contig_summary_csv
         
         contig = widgets['contig_select'].value
-
-        # Check if contig is selected
         if not contig:
             print("[start_bokeh_server] Download: No contig selected", flush=True)
-            return
+            return io.StringIO("")
+        
+        csv_content = download_contig_summary_csv(db_path, contig)
+        if csv_content:
+            safe_contig = "".join(c if c.isalnum() or c in "-_" else "_" for c in contig)
+            if download_widgets['contig']:
+                download_widgets['contig'].filename = f"{safe_contig}_contig_summary.csv"
+            return io.StringIO(csv_content)
+        return io.StringIO("")
 
-        # Generate and download CSV
-        download_contig_summary_csv(conn, contig)
-
-    ## Download metrics summary callback function
-    def download_metrics_clicked():
-        """Generate and download metrics summary as CSV."""
+    def make_metrics_download_callback():
+        """Create callback for metrics summary download."""
         from .downloading_data import download_metrics_summary_csv
         
         contig = widgets['contig_select'].value
-
-        # Check if contig is selected
         if not contig:
             print("[start_bokeh_server] Download metrics: No contig selected", flush=True)
-            return
+            return io.StringIO("")
 
         is_all = (views.active == 1)
 
         if is_all:
-            # All Samples view: get filtered samples
             filtered_samples = [s for s in orig_samples if s in widgets['contig_to_samples'].get(contig, set())]
-            # Apply Filtering2 query builder conditions
             filtering_pairs = get_filtering_filtered_pairs()
             if filtering_pairs is not None:
                 allowed_samples = {pair[1] for pair in filtering_pairs}
@@ -1476,101 +1621,48 @@ def create_layout(db_path):
 
             if not filtered_samples:
                 print("[start_bokeh_server] Download metrics: No samples match filters", flush=True)
-                return
+                return io.StringIO("")
 
             sample_names = filtered_samples
-            # Filename for all samples view
             safe_contig = "".join(c if c.isalnum() or c in "-_" else "_" for c in contig)
-            filename = f"{safe_contig}_in_all_samples_metrics.csv"
+            if download_widgets['metrics']:
+                download_widgets['metrics'].filename = f"{safe_contig}_in_all_samples_metrics.csv"
         else:
-            # One Sample view: use selected sample
             sample = widgets['sample_select'].value
             if not sample:
                 print("[start_bokeh_server] Download metrics: No sample selected", flush=True)
-                return
+                return io.StringIO("")
             sample_names = [sample]
-            # Filename for one sample view
             safe_contig = "".join(c if c.isalnum() or c in "-_" else "_" for c in contig)
             safe_sample = "".join(c if c.isalnum() or c in "-_" else "_" for c in sample)
-            filename = f"{safe_contig}_in_{safe_sample}_metrics.csv"
+            if download_widgets['metrics']:
+                download_widgets['metrics'].filename = f"{safe_contig}_in_{safe_sample}_metrics.csv"
 
-        # Generate and download CSV
-        download_metrics_summary_csv(conn, contig, sample_names, filename)
+        csv_content = download_metrics_summary_csv(db_path, contig, sample_names)
+        if csv_content:
+            return io.StringIO(csv_content)
+        return io.StringIO("")
 
-    ## Download data callback function
-    def download_data_clicked():
-        """Generate and download feature data as CSV."""
-        from .downloading_data import download_feature_data_csv
+    def make_data_download_callback():
+        """Create callback for feature data download.
         
-        contig = widgets['contig_select'].value
-
-        # Check if contig is selected
-        if not contig:
-            print("[start_bokeh_server] Download data: No contig selected", flush=True)
-            return
-
-        is_all = (views.active == 1)
-        active_variables_widgets = widgets['variables_widgets_all'] if is_all else widgets['variables_widgets_one']
-
-        if is_all:
-            # All Samples view: get the selected variable and filtered samples
-            selected_var = None
-            for cbg in active_variables_widgets:
-                if cbg.active and selected_var is None:
-                    selected_var = cbg.labels[cbg.active[-1]]
-            
-            if not selected_var:
-                print("[start_bokeh_server] Download data: No variable selected", flush=True)
-                return
-            
-            # Get filtered samples
-            filtered_samples = [s for s in orig_samples if s in widgets['contig_to_samples'].get(contig, set())]
-            filtering_pairs = get_filtering_filtered_pairs()
-            if filtering_pairs is not None:
-                allowed_samples = {pair[1] for pair in filtering_pairs}
-                filtered_samples = [s for s in filtered_samples if s in allowed_samples]
-
-            if not filtered_samples:
-                print("[start_bokeh_server] Download data: No samples match filters", flush=True)
-                return
-
-            # Filename for all samples view
-            safe_contig = "".join(c if c.isalnum() or c in "-_" else "_" for c in contig)
-            safe_var = "".join(c if c.isalnum() or c in "-_" else "_" for c in selected_var)
-            filename = f"{safe_contig}_in_all_samples_data_for_{safe_var}.csv"
-            
-            # Download with sample_name column
-            download_feature_data_csv(conn, contig, filtered_samples, [selected_var], filename, is_all_samples=True)
-        else:
-            # One Sample view: get selected sample and all selected features
-            sample = widgets['sample_select'].value
-            if not sample:
-                print("[start_bokeh_server] Download data: No sample selected", flush=True)
-                return
-            
-            # Collect all selected features
-            requested_features = []
-            for cbg in active_variables_widgets:
-                for idx in cbg.active:
-                    requested_features.append(cbg.labels[idx])
-            
-            # Also collect from Genome module if available
-            if genome_cbg_one is not None:
-                for idx in genome_cbg_one.active:
-                    if genome_cbg_one.labels[idx] != "Gene map":  # Skip gene map
-                        requested_features.append(genome_cbg_one.labels[idx])
-            
-            if not requested_features:
-                print("[start_bokeh_server] Download data: No features selected", flush=True)
-                return
-            
-            # Filename for one sample view
-            safe_contig = "".join(c if c.isalnum() or c in "-_" else "_" for c in contig)
-            safe_sample = "".join(c if c.isalnum() or c in "-_" else "_" for c in sample)
-            filename = f"{safe_contig}_in_{safe_sample}_data.csv"
-            
-            # Download with feature_name column
-            download_feature_data_csv(conn, contig, [sample], requested_features, filename, is_all_samples=False)
+        Uses cached plot data for instant downloads (no database round-trip).
+        """
+        # Use cached plot data (extracted from ColumnDataSources after plotting)
+        if plot_data_cache['data']:
+            csv_content = convert_plot_data_to_csv(
+                plot_data_cache['data'], 
+                plot_data_cache['is_all_samples']
+            )
+            if csv_content:
+                if download_widgets['data']:
+                    download_widgets['data'].filename = plot_data_cache['filename']
+                print(f"[start_bokeh_server] Data download from cache ({len(plot_data_cache['data'])} sources)", flush=True)
+                return io.StringIO(csv_content)
+        
+        # No cache available - return empty (user needs to click Apply first)
+        print("[start_bokeh_server] Download data: No cached data (click Apply first)", flush=True)
+        return io.StringIO("")
 
     ### Creating all DOM elements
     # Open DuckDB database connection to build widgets depending on data
@@ -1694,19 +1786,14 @@ def create_layout(db_path):
         # Create initial input widget based on column type
         if initial_is_text:
             distinct_values = initial_col_info.get('distinct_values', [])
-            initial_input = pn.widgets.AutocompleteInput(
+            initial_input = Select(
                 value="",
                 options=distinct_values,
-                min_characters=0,
-                case_sensitive=False,
-                placeholder="Value...",
-                search_strategy="includes",
                 width=90,
                 margin=(0, 2, 0, 0)
             )
-            input_container.children = [initial_input.get_root()]
-            # Add callback for Panel AutocompleteInput
-            initial_input.param.watch(lambda event: refresh_on_filter_change(), 'value')
+            input_container.children = [initial_input]
+            initial_input.on_change('value', lambda attr, old, new: refresh_on_filter_change())
         else:
             initial_input = Spinner(value=0, placeholder="Value...", width=90, margin=(0, 2, 0, 0))
             input_container.children = [initial_input]
@@ -1717,7 +1804,7 @@ def create_layout(db_path):
         minus_btn = Button(label="−", width=30, height=30, stylesheets=[stylesheet], margin=(0, 10, 0, 0))
 
         # Store reference to current input widget (for later retrieval)
-        current_input_ref = {'widget': initial_input, 'is_panel': initial_is_text}
+        current_input_ref = {'widget': initial_input, 'is_panel': False}
 
         def update_input_widget(col_name):
             """Update the input widget based on column type."""
@@ -1738,21 +1825,16 @@ def create_layout(db_path):
             # Create new input widget
             if is_text:
                 distinct_values = col_info.get('distinct_values', [])
-                new_input = pn.widgets.AutocompleteInput(
+                new_input = Select(
                     value="",
                     options=distinct_values,
-                    min_characters=0,
-                    case_sensitive=False,
-                    placeholder="Value...",
-                    search_strategy="includes",
                     width=90,
                     margin=(0, 2, 0, 0)
                 )
-                input_container.children = [new_input.get_root()]
+                input_container.children = [new_input]
                 current_input_ref['widget'] = new_input
-                current_input_ref['is_panel'] = True
-                # Add callback for Panel AutocompleteInput
-                new_input.param.watch(lambda event: refresh_on_filter_change(), 'value')
+                current_input_ref['is_panel'] = False
+                new_input.on_change('value', lambda attr, old, new: refresh_on_filter_change())
             else:
                 new_input = Spinner(value=0, placeholder="Value...", width=90, margin=(0, 2, 0, 0))
                 input_container.children = [new_input]
@@ -2229,35 +2311,38 @@ def create_layout(db_path):
     )
     peruse_button.on_click(lambda: peruse_clicked())
 
-    # Download contig summary button
-    download_contig_button = Button(
-        label="DOWNLOAD CONTIG SUMMARY", 
+    # Download contig summary - Panel FileDownload widget
+    download_contig_button = pn.widgets.FileDownload(
+        callback=make_contig_download_callback,
+        filename="contig_summary.csv",
+        label="DOWNLOAD CONTIG SUMMARY",
+        button_type="primary",
         height=30,
-        stylesheets=[stylesheet], 
-        css_classes=["apply-btn"],
-        visible=False  # Hidden until plot is generated
+        visible=False
     )
-    download_contig_button.on_click(lambda: download_contig_clicked())
+    download_widgets['contig'] = download_contig_button
 
-    # Download metrics summary button
-    download_metrics_button = Button(
-        label="DOWNLOAD METRICS SUMMARY", 
+    # Download metrics summary - Panel FileDownload widget
+    download_metrics_button = pn.widgets.FileDownload(
+        callback=make_metrics_download_callback,
+        filename="metrics_summary.csv",
+        label="DOWNLOAD METRICS SUMMARY",
+        button_type="primary",
         height=30,
-        stylesheets=[stylesheet], 
-        css_classes=["apply-btn"],
-        visible=False  # Hidden until plot is generated
+        visible=False
     )
-    download_metrics_button.on_click(lambda: download_metrics_clicked())
+    download_widgets['metrics'] = download_metrics_button
 
-    # Download feature data button
-    download_data_button = Button(
-        label="DOWNLOAD DATA", 
+    # Download feature data - Panel FileDownload widget
+    download_data_button = pn.widgets.FileDownload(
+        callback=make_data_download_callback,
+        filename="data.csv",
+        label="DOWNLOAD DATA",
+        button_type="primary",
         height=30,
-        stylesheets=[stylesheet], 
-        css_classes=["apply-btn"],
-        visible=False  # Hidden until plot is generated
+        visible=False
     )
-    download_data_button.on_click(lambda: download_data_clicked())
+    download_widgets['data'] = download_data_button
 
     # Only Apply button in left panel now
     buttons_row = apply_button
@@ -2286,7 +2371,10 @@ def create_layout(db_path):
     controls_column = pn.Column(*controls_children, sizing_mode="stretch_height", css_classes=["left-col"])
 
     peruse_button.visible = False  # Initially hidden
-    main_placeholder = column(Div(text="<i>No plot yet. Select one sample, one contig and at least one variable in \"One sample\" mode or one contig and one variable in \"All samples\" mode and click Apply.</i>"), sizing_mode="stretch_both")
+    main_placeholder = pn.Column(
+        pn.pane.HTML("<i>No plot yet. Select one sample, one contig and at least one variable in \"One sample\" mode or one contig and one variable in \"All samples\" mode and click Apply.</i>"),
+        sizing_mode="stretch_both"
+    )
 
     # Wrap everything in a Flex container
     layout = pn.Row(controls_column, main_placeholder, sizing_mode="stretch_both")

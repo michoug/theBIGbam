@@ -925,6 +925,20 @@ pub fn run_all_samples(
         db_writer.update_contig_gc_stats(&gc_data)?;
     }
 
+    // If no BAM files provided, skip sample processing (genbank-only mode)
+    if bam_files.is_empty() {
+        eprintln!("\n### No BAM files provided - skipping sample processing");
+        eprintln!("Database populated with {} contigs and {} annotations", contigs.len(), annotations.len());
+        
+        return Ok(ProcessResult {
+            samples_processed: 0,
+            samples_failed: 0,
+            total_time_secs: 0.0,
+            processing_time_secs: 0.0,
+            writing_time_secs: 0.0,
+        });
+    }
+
     eprintln!("\n### Processing {} samples with {} threads", bam_files.len(), config.threads);
     eprintln!("Modules: {}\n", modules.join(", "));
 

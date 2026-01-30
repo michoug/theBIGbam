@@ -4,7 +4,7 @@ import sys
 
 # Import command modules so we can share arg definitions and run functions
 from thebigbam.utils import (
-    read_mapping, assembly_annotation
+    read_mapping, assembly_annotation, add_sample_metadata, add_contig_metadata
 )
 from thebigbam.database import add_variable, calculating_data
 from thebigbam.plotting import plotting_data_all_samples, plotting_data_per_sample, start_bokeh_server
@@ -15,6 +15,8 @@ BASE_DIR = os.path.dirname(__file__)
 SCRIPTS = {
     'calculate': "Run feature calculations over BAMs",
     'add-variable': "Add an external variable from CSV to DB",
+    'add-sample-metadata': "Add sample metadata from CSV as new columns in Sample table",
+    'add-contig-metadata': "Add contig metadata from CSV as new columns in Contig table",
 
     'plot-per-sample': "Produce per-sample static HTML plot",
     'plot-all-samples': "Produce all-samples static HTML plot",
@@ -39,6 +41,12 @@ def build_argparser():
 
     sp = sub.add_parser('add-variable', help=SCRIPTS['add-variable'])
     add_variable.add_add_variable_args(sp)
+
+    sp = sub.add_parser('add-sample-metadata', help=SCRIPTS['add-sample-metadata'])
+    add_sample_metadata.add_add_sample_metadata_args(sp)
+
+    sp = sub.add_parser('add-contig-metadata', help=SCRIPTS['add-contig-metadata'])
+    add_contig_metadata.add_add_contig_metadata_args(sp)
 
     # plotting commands
     sp = sub.add_parser('plot-per-sample', help=SCRIPTS['plot-per-sample'])
@@ -118,6 +126,12 @@ def main(argv=None):
 
     if args.cmd == 'add-variable':
         return add_variable.run_add_variable(args)
+
+    if args.cmd == 'add-sample-metadata':
+        return add_sample_metadata.run_add_sample_metadata(args)
+
+    if args.cmd == 'add-contig-metadata':
+        return add_contig_metadata.run_add_contig_metadata(args)
 
     if args.cmd == 'plot-per-sample':
         return plotting_data_per_sample.run_plot_per_sample(args)
