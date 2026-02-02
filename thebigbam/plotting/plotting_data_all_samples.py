@@ -56,20 +56,19 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
 
                 # Handle Repeats specially - they use contig-only tables
                 if feature_lower in ["repeats", "repeat", "direct repeats", "inverted repeats"]:
-                    # Direct repeats
+                    repeats_feature_dicts = []
                     if feature_lower in ["repeats", "repeat", "direct repeats"]:
                         direct_feature_dict = get_repeats_data(cur, contig_id, "direct_repeats", xstart, xend)
                         if direct_feature_dict:
-                            direct_subplot = make_bokeh_subplot(direct_feature_dict, subplot_size, shared_xrange)
-                            if direct_subplot is not None:
-                                genome_subplots.append(direct_subplot)
-                    # Inverted repeats
+                            repeats_feature_dicts.extend(direct_feature_dict)
                     if feature_lower in ["repeats", "repeat", "inverted repeats"]:
                         inverted_feature_dict = get_repeats_data(cur, contig_id, "inverted_repeats", xstart, xend)
                         if inverted_feature_dict:
-                            inverted_subplot = make_bokeh_subplot(inverted_feature_dict, subplot_size, shared_xrange)
-                            if inverted_subplot is not None:
-                                genome_subplots.append(inverted_subplot)
+                            repeats_feature_dicts.extend(inverted_feature_dict)
+                    if repeats_feature_dicts:
+                        repeats_subplot = make_bokeh_subplot(repeats_feature_dicts, subplot_size, shared_xrange)
+                        if repeats_subplot is not None:
+                            genome_subplots.append(repeats_subplot)
                 # Handle GC content specially - contig-level table without Sample_id
                 elif feature_lower in ["gc_content", "gc content", "gccontent", "gc"]:
                     gc_feature_dict = get_gc_content_data(cur, contig_id, xstart, xend)

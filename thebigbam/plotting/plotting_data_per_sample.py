@@ -1090,24 +1090,23 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
 
     # Add Repeats subplots if requested (contig-level, sample-independent)
     if include_repeats:
-        # Direct repeats
+        repeats_feature_dicts = []
         try:
             direct_feature_dict = get_repeats_data(cur, contig_id, "direct_repeats", xstart, xend)
             if direct_feature_dict:
-                direct_subplot = make_bokeh_subplot(direct_feature_dict, subplot_size, shared_xrange)
-                if direct_subplot is not None:
-                    subplots.append(direct_subplot)
+                repeats_feature_dicts.extend(direct_feature_dict)
         except Exception as e:
             print(f"Error processing Direct Repeats: {e}", flush=True)
-        # Inverted repeats
         try:
             inverted_feature_dict = get_repeats_data(cur, contig_id, "inverted_repeats", xstart, xend)
             if inverted_feature_dict:
-                inverted_subplot = make_bokeh_subplot(inverted_feature_dict, subplot_size, shared_xrange)
-                if inverted_subplot is not None:
-                    subplots.append(inverted_subplot)
+                repeats_feature_dicts.extend(inverted_feature_dict)
         except Exception as e:
             print(f"Error processing Inverted Repeats: {e}", flush=True)
+        if repeats_feature_dicts:
+            repeats_subplot = make_bokeh_subplot(repeats_feature_dicts, subplot_size, shared_xrange)
+            if repeats_subplot is not None:
+                subplots.append(repeats_subplot)
 
     # Add GC content subplot if requested (contig-level, sample-independent)
     if include_gc_content:
