@@ -1073,13 +1073,15 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
 
     annotation_fig = make_bokeh_genemap(conn, contig_id, locus_name, locus_size, annotation_tool, subplot_size, shared_xrange, xstart, xend) if genbank_path else None
 
-    # Get sample characteristics
-    cur.execute("SELECT Sample_id, Sample_name FROM Sample WHERE Sample_name=?", (sample_name,))
-    row = cur.fetchone()
-    if row is None:
-        raise ValueError(f"Sample not found: {sample_name}")
-    sample_id, sample_name = row
-    print(f"Sample {sample_name} validated.", flush=True)
+    # Get sample characteristics (optional – contig-level features work without a sample)
+    sample_id = None
+    if sample_name:
+        cur.execute("SELECT Sample_id, Sample_name FROM Sample WHERE Sample_name=?", (sample_name,))
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError(f"Sample not found: {sample_name}")
+        sample_id, sample_name = row
+        print(f"Sample {sample_name} validated.", flush=True)
 
     # --- Add one subplot per feature requested ---
     # Requested features are variables like 'coverage', 'reads_starts', etc.
@@ -1118,21 +1120,23 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
         except Exception as e:
             print(f"Error processing GC Content: {e}", flush=True)
 
-    # Pre-fetch metadata for all features in one query
-    metadata_cache = get_variable_metadata_batch(cur, requested_features)
+    # Add sample-dependent features only when a sample is selected
+    if sample_id is not None and requested_features:
+        # Pre-fetch metadata for all features in one query
+        metadata_cache = get_variable_metadata_batch(cur, requested_features)
 
-    # Add other requested features
-    for feature in requested_features:
-        try:
-            list_feature_dict = get_feature_data(
-                cur, feature, contig_id, sample_id, xstart, xend,
-                variable_metadata=metadata_cache.get(feature)
-            )
-            subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, feature_name=feature)
-            if subplot_feature is not None:
-                subplots.append(subplot_feature)
-        except Exception as e:
-            print(f"Error processing feature '{feature}': {e}", flush=True)
+        # Add other requested features
+        for feature in requested_features:
+            try:
+                list_feature_dict = get_feature_data(
+                    cur, feature, contig_id, sample_id, xstart, xend,
+                    variable_metadata=metadata_cache.get(feature)
+                )
+                subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, feature_name=feature)
+                if subplot_feature is not None:
+                    subplots.append(subplot_feature)
+            except Exception as e:
+                print(f"Error processing feature '{feature}': {e}", flush=True)
 
     # --- Combine all figures in a single grid with one shared toolbar ---
     if annotation_fig:

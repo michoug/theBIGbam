@@ -86,6 +86,8 @@ Here several optional parameters are added:
 
 ### What input files do I need?
 
+TODO: allow only genbank file without mapping files
+
 #### Mapping files:
 
 **Parameter:** --bam_files DIRECTORY, short-version -b
