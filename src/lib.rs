@@ -77,7 +77,7 @@ mod python {
     ///         - "samples_failed": int
     ///         - "total_time": float (seconds)
     #[pyfunction]
-    #[pyo3(signature = (genbank_path, bam_files, output_db, modules, threads, sequencing_type=None, min_coverage=50.0, curve_ratio=10.0, bar_ratio=10.0, contig_variation_percentage=10.0, circular=false, create_indexes=true, autoblast_file=""))]
+    #[pyo3(signature = (genbank_path, bam_files, output_db, modules, threads, sequencing_type=None, min_coverage=50.0, curve_ratio=10.0, bar_ratio=10.0, contig_variation_percentage=10.0, circular=false, create_indexes=true, autoblast_file="", phagetermini_csv=""))]
     fn process_all_samples<'py>(
         py: Python<'py>,
         genbank_path: &str,
@@ -93,6 +93,7 @@ mod python {
         circular: bool,
         create_indexes: bool,
         autoblast_file: &str,
+        phagetermini_csv: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
         use crate::gc_content::GCParams;
         use crate::processing::{run_all_samples, ProcessConfig};
@@ -101,6 +102,13 @@ mod python {
 
         // Parse sequencing type: Some(type) if user provided valid value, None for per-sample auto-detection
         let seq_type = sequencing_type.and_then(|s| ProcessConfig::parse_sequencing_type(s));
+
+        // Parse phagetermini CSV path: Some(path) if non-empty, None otherwise
+        let csv_path = if phagetermini_csv.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(phagetermini_csv))
+        };
 
         let config = ProcessConfig {
             threads,
@@ -112,6 +120,7 @@ mod python {
             sequencing_type: seq_type,
             phagetermini_config: PhageTerminiConfig::default(),
             gc_params: GCParams::default(),
+            phagetermini_csv_path: csv_path,
         };
 
         // Convert string paths to PathBuf

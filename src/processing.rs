@@ -35,8 +35,8 @@ use crate::types::{
 };
 
 use crate::processing_phage_packaging::{
-    classify_packaging, filter_peaks_by_clippings,
-    is_valid_terminal_repeat, merge_peaks, DtrRegion, PhageTerminiConfig,
+    classify_packaging_areas, filter_and_merge_to_areas_with_diagnostics,
+    is_valid_terminal_repeat, DtrRegion, PhageTerminiConfig, TerminusDiagnostic,
 };
 use crate::processing_completeness::compute_completeness;
 
@@ -58,6 +58,8 @@ pub struct ProcessConfig {
     pub phagetermini_config: PhageTerminiConfig,
     /// GC content and GC skew parameters
     pub gc_params: GCParams,
+    /// Optional path for phage termini diagnostic CSV output
+    pub phagetermini_csv_path: Option<PathBuf>,
 }
 
 impl ProcessConfig {
@@ -227,6 +229,7 @@ fn validate_all_samples(
 /// Returns a tuple of:
 /// - Optional packaging data for phagetermini module
 /// - Optional completeness data for assemblycheck module
+/// - Terminus diagnostics for CSV export (contig_name, diagnostics, unclipped_ratio, coverage_reduced_mean)
 fn add_features_from_arrays(
     arrays: &mut FeatureArrays,
     contig_name: &str,
@@ -236,7 +239,7 @@ fn add_features_from_arrays(
     flags: ModuleFlags,
     repeats: &[RepeatsData],
     output: &mut Vec<FeaturePoint>,
-) -> (Option<PackagingData>, Option<CompletenessData>) {
+) -> (Option<PackagingData>, Option<CompletenessData>, Vec<TerminusDiagnostic>, f64, f64) {
     let pt_config = config.phagetermini_config;
 
     // Build DTR regions from repeats for this contig (used for both merging and classification)
@@ -458,7 +461,7 @@ fn add_features_from_arrays(
     }
 
     // Phagetermini features
-    let packaging_result = if flags.phagetermini {
+    let (packaging_result, terminus_diagnostics, unclipped_ratio, coverage_reduced_mean) = if flags.phagetermini {
         // === STEP 1: Save ORIGINAL data to database (before any DTR merging) ===
         // coverage_reduced (self-referential curve)
         let coverage_reduced_f64: Vec<f64> = arrays.coverage_reduced.iter().map(|&x| x as f64).collect();
@@ -531,7 +534,7 @@ fn add_features_from_arrays(
             }
         }
 
-        // === STEP 2: Calculate aligned fraction ===
+        // === STEP 2: Calculate aligned fraction and global metrics ===
         let aligned_count = arrays.coverage_reduced.iter().filter(|&&x| x > 0).count();
         let aligned_fraction = if arrays.coverage_reduced.is_empty() {
             0.0
@@ -539,60 +542,53 @@ fn add_features_from_arrays(
             (aligned_count as f64 / arrays.coverage_reduced.len() as f64) * 100.0
         };
 
-        // === STEP 3: Compress signals for peak detection ===
-        // Keep all peaks (no RLE merging) - DTR equivalence is handled in classify_packaging
-        let coverage_reduced_f64: Vec<f64> = arrays.coverage_reduced.iter().map(|&x| x as f64).collect();
-
         if aligned_fraction >= pt_config.min_aligned_fraction as f64 {
-            let reads_starts_f64: Vec<f64> = arrays.reads_starts.iter().map(|&x| x as f64).collect();
-            let reads_ends_f64: Vec<f64> = arrays.reads_ends.iter().map(|&x| x as f64).collect();
-            let reads_starts_runs = compress_signal_with_reference(&reads_starts_f64, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
-            let reads_ends_runs = compress_signal_with_reference(&reads_ends_f64, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
+            // Calculate global metrics for statistical filtering
+            let total_coverage_reduced: u64 = arrays.coverage_reduced.iter().sum();
+            let total_primary_reads: u64 = arrays.primary_reads.iter().sum();
 
-            let left_clip_counts: Vec<f64> = arrays.left_clipping_lengths.iter().map(|v| v.len() as f64).collect();
-            let right_clip_counts: Vec<f64> = arrays.right_clipping_lengths.iter().map(|v| v.len() as f64).collect();
-            let left_clip_runs = compress_signal_with_reference(&left_clip_counts, Some(&primary_reads_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
-            let right_clip_runs = compress_signal_with_reference(&right_clip_counts, Some(&primary_reads_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
+            // For long reads, coverage_reduced can contain 2× the reads because each
+            // read is split in two (start half and end half). Divide by 2 to normalize.
+            let unclipped_ratio = if total_primary_reads > 0 {
+                let ratio = total_coverage_reduced as f64 / total_primary_reads as f64;
+                if seq_type.is_long() { (ratio / 2.0).min(1.0) } else { ratio.min(1.0) }
+            } else {
+                1.0
+            };
+            let coverage_reduced_mean = total_coverage_reduced as f64 / contig_length as f64;
 
-            // === STEP 4: Filter peaks by clippings and merge nearby peaks ===
-            // DTR-aware distance is used here via dtr_aware_distance()
-            let (reads_starts_filtered, reads_ends_filtered) = filter_peaks_by_clippings(
-                &reads_starts_runs,
-                &reads_ends_runs,
-                &left_clip_runs,
-                &right_clip_runs,
-                pt_config.min_events as f64,
-                pt_config.max_distance_peaks,
+            // Get clipping counts as u64 arrays
+            let left_clip_counts: Vec<u64> = arrays.left_clipping_lengths.iter().map(|v| v.len() as u64).collect();
+            let right_clip_counts: Vec<u64> = arrays.right_clipping_lengths.iter().map(|v| v.len() as u64).collect();
+
+            // === STEP 3-5: Filter, statistical test, merge into areas, global filter ===
+            // Use the diagnostics version to collect filtering information
+            let (start_areas, end_areas, diagnostics) = filter_and_merge_to_areas_with_diagnostics(
+                &arrays.reads_starts,
+                &arrays.reads_ends,
+                &left_clip_counts,
+                &right_clip_counts,
+                &arrays.coverage_reduced,
+                &arrays.primary_reads,
+                unclipped_ratio,
+                coverage_reduced_mean,
+                &pt_config,
                 contig_length,
                 config.circular,
                 &dtr_regions,
             );
 
-            let start_peaks = merge_peaks(
-                &reads_starts_filtered,
-                pt_config.max_distance_peaks,
-                contig_length,
-                config.circular,
-                &dtr_regions,
-            );
-            let end_peaks = merge_peaks(
-                &reads_ends_filtered,
-                pt_config.max_distance_peaks,
-                contig_length,
-                config.circular,
-                &dtr_regions,
-            );
-
-            let (mechanism, left_termini, right_termini, duplication) = classify_packaging(
-                &start_peaks,
-                &end_peaks,
+            // === STEP 6: Classify packaging based on peak-areas ===
+            let (mechanism, left_termini, right_termini, duplication) = classify_packaging_areas(
+                &start_areas,
+                &end_areas,
                 contig_length,
                 config.circular,
                 &dtr_regions,
             );
 
             // Only return PackagingData if there's a detected mechanism (not "No_packaging")
-            if mechanism != "No_packaging" {
+            let packaging = if mechanism != "No_packaging" {
                 Some(PackagingData {
                     contig_name: contig_name.to_string(),
                     mechanism,
@@ -602,12 +598,13 @@ fn add_features_from_arrays(
                 })
             } else {
                 None
-            }
+            };
+            (packaging, diagnostics, unclipped_ratio, coverage_reduced_mean)
         } else {
-            None
+            (None, Vec::new(), 1.0, 0.0)
         }
     } else {
-        None
+        (None, Vec::new(), 1.0, 0.0)
     };
 
     // Compute completeness statistics when mapping_metrics is enabled
@@ -637,19 +634,27 @@ fn add_features_from_arrays(
         None
     };
 
-    (packaging_result, completeness_result)
+    (packaging_result, completeness_result, terminus_diagnostics, unclipped_ratio, coverage_reduced_mean)
+}
+
+/// Diagnostic data for a contig (for CSV export).
+pub struct ContigDiagnostics {
+    pub contig_name: String,
+    pub diagnostics: Vec<TerminusDiagnostic>,
+    pub unclipped_ratio: f64,
+    pub coverage_reduced_mean: f64,
 }
 
 /// Process one BAM file using streaming (single-pass, optimized).
 /// Parallelizes at the contig level for samples with many contigs.
-/// Returns (features, presences, packaging, completeness, sample_name, seq_type, total_reads, mapped_reads)
+/// Returns (features, presences, packaging, completeness, diagnostics, sample_name, seq_type, total_reads, mapped_reads)
 pub fn process_sample(
     bam_path: &Path,
     contigs: &[ContigInfo],
     modules: &[String],
     config: &ProcessConfig,
     repeats: &[RepeatsData],
-) -> Result<(Vec<FeaturePoint>, Vec<PresenceData>, Vec<PackagingData>, Vec<CompletenessData>, String, SequencingType, u64, u64)> {
+) -> Result<(Vec<FeaturePoint>, Vec<PresenceData>, Vec<PackagingData>, Vec<CompletenessData>, Vec<ContigDiagnostics>, String, SequencingType, u64, u64)> {
     let sample_name = bam_path
         .file_stem()
         .unwrap_or_default()
@@ -710,7 +715,7 @@ pub fn process_sample(
 
             // Calculate features for this contig
             let mut features = Vec::new();
-            let (packaging_info, completeness_info) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, seq_type, flags, repeats, &mut features);
+            let (packaging_info, completeness_info, diags, unclipped_ratio, coverage_reduced_mean) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, seq_type, flags, repeats, &mut features);
 
             // Calculate mean and median coverage depth
             let coverage_mean = arrays.coverage_mean() as f32;
@@ -764,7 +769,19 @@ pub fn process_sample(
                 coverage_median,
             };
 
-            Some((features, presence, packaging_info, completeness_info, primary_count))
+            // Collect diagnostics for this contig
+            let contig_diags = if !diags.is_empty() {
+                Some(ContigDiagnostics {
+                    contig_name: ref_name.clone(),
+                    diagnostics: diags,
+                    unclipped_ratio,
+                    coverage_reduced_mean,
+                })
+            } else {
+                None
+            };
+
+            Some((features, presence, packaging_info, completeness_info, contig_diags, primary_count))
         })
         .collect();
 
@@ -773,9 +790,10 @@ pub fn process_sample(
     let mut all_presences = Vec::new();
     let mut all_packaging = Vec::new();
     let mut all_completeness = Vec::new();
+    let mut all_diagnostics = Vec::new();
     let mut mapped_reads: u64 = 0;
 
-    for (features, presence, packaging, completeness, primary_count) in results {
+    for (features, presence, packaging, completeness, diags, primary_count) in results {
         all_features.extend(features);
         all_presences.push(presence);
         mapped_reads += primary_count;
@@ -785,9 +803,12 @@ pub fn process_sample(
         if let Some(comp) = completeness {
             all_completeness.push(comp);
         }
+        if let Some(d) = diags {
+            all_diagnostics.push(d);
+        }
     }
 
-    Ok((all_features, all_presences, all_packaging, all_completeness, sample_name, seq_type, total_reads, mapped_reads))
+    Ok((all_features, all_presences, all_packaging, all_completeness, all_diagnostics, sample_name, seq_type, total_reads, mapped_reads))
 }
 
 /// Extract contig information from BAM file headers.
@@ -953,6 +974,49 @@ pub fn run_all_samples(
     Ok(result)
 }
 
+/// Write phagetermini diagnostic CSV file.
+fn write_phagetermini_csv(
+    csv_path: &Path,
+    diagnostics: &[(String, String, Vec<TerminusDiagnostic>, f64, f64)], // (contig, sample, diags, unclipped_ratio, coverage_reduced_mean)
+) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = fs::File::create(csv_path)
+        .with_context(|| format!("Failed to create phagetermini CSV: {}", csv_path.display()))?;
+
+    // Write header
+    writeln!(
+        file,
+        "Contig_name,Sample_name,Unclipped_ratio,Coverage_reduced_mean,Type,Position,SPC,Clippings,Observed_ratio,Primary_reads,Coverage_reduced,Tau,Kept,Discarded_because"
+    )?;
+
+    // Write rows
+    for (contig_name, sample_name, diags, unclipped_ratio, coverage_reduced_mean) in diagnostics {
+        for diag in diags {
+            writeln!(
+                file,
+                "{},{},{:.4},{:.2},{},{},{},{},{:.4},{},{},{:.4},{},\"{}\"",
+                contig_name,
+                sample_name,
+                unclipped_ratio,
+                coverage_reduced_mean,
+                diag.terminus_type,
+                diag.position,
+                diag.spc,
+                diag.clippings,
+                diag.observed_ratio,
+                diag.primary_reads,
+                diag.coverage_reduced,
+                diag.tau,
+                if diag.kept { "yes" } else { "no" },
+                diag.discarded_because,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Holds processed sample data ready for database writing.
 struct SampleResult {
     sample_name: String,
@@ -963,6 +1027,7 @@ struct SampleResult {
     presences: Vec<PresenceData>,
     packaging: Vec<PackagingData>,
     completeness: Vec<CompletenessData>,
+    diagnostics: Vec<ContigDiagnostics>,
 }
 
 fn process_samples_parallel(
@@ -1040,11 +1105,13 @@ fn process_samples_parallel(
     let write_pb_clone = write_pb.clone();
     let is_tty_writer = is_tty;
     let total_writer = total;
+    let csv_path = config.phagetermini_csv_path.clone();
 
     // Spawn dedicated writer thread
     let writer_handle = thread::spawn(move || -> Result<(usize, std::time::Duration)> {
         let write_start = std::time::Instant::now();
         let mut written_count = 0usize;
+        let mut all_csv_diagnostics: Vec<(String, String, Vec<TerminusDiagnostic>, f64, f64)> = Vec::new();
 
         // Receive and write samples as they arrive
         for result in rx {
@@ -1083,6 +1150,30 @@ fn process_samples_parallel(
                 }
             }
             write_pb_clone.inc(1);
+
+            // Collect diagnostics for CSV
+            if csv_path.is_some() {
+                for contig_diags in result.diagnostics {
+                    if !contig_diags.diagnostics.is_empty() {
+                        all_csv_diagnostics.push((
+                            contig_diags.contig_name,
+                            result.sample_name.clone(),
+                            contig_diags.diagnostics,
+                            contig_diags.unclipped_ratio,
+                            contig_diags.coverage_reduced_mean,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Write phagetermini CSV if path is specified and we have diagnostics
+        if let Some(ref path) = csv_path {
+            if !all_csv_diagnostics.is_empty() {
+                if let Err(e) = write_phagetermini_csv(path, &all_csv_diagnostics) {
+                    eprintln!("Warning: Failed to write phagetermini CSV: {}", e);
+                }
+            }
         }
 
         // Finalize database
@@ -1098,7 +1189,7 @@ fn process_samples_parallel(
         let sample_start = std::time::Instant::now();
 
         match process_sample(bam_path, contigs, modules, config, repeats) {
-            Ok((features, presences, packaging, completeness, sample_name, sequencing_type, total_reads, mapped_reads)) => {
+            Ok((features, presences, packaging, completeness, diagnostics, sample_name, sequencing_type, total_reads, mapped_reads)) => {
                 let sample_time = sample_start.elapsed().as_secs_f64();
                 completed_count.fetch_add(1, Ordering::SeqCst);
                 let msg = format!("{} ({:.2}s)", sample_name, sample_time);
@@ -1118,6 +1209,7 @@ fn process_samples_parallel(
                     presences,
                     packaging,
                     completeness,
+                    diagnostics,
                 });
             }
             Err(e) => {
@@ -1194,12 +1286,13 @@ fn process_samples_sequential(
     let mut failed = 0usize;
     let mut processing_time_total = std::time::Duration::ZERO;
     let mut writing_time_total = std::time::Duration::ZERO;
+    let mut all_csv_diagnostics: Vec<(String, String, Vec<TerminusDiagnostic>, f64, f64)> = Vec::new();
 
     for bam_path in bam_files {
         let sample_start = std::time::Instant::now();
 
         match process_sample(bam_path, contigs, modules, config, repeats) {
-            Ok((features, presences, packaging, completeness, sample_name, sequencing_type, total_reads, mapped_reads)) => {
+            Ok((features, presences, packaging, completeness, diagnostics, sample_name, sequencing_type, total_reads, mapped_reads)) => {
                 let process_elapsed = sample_start.elapsed();
                 processing_time_total += process_elapsed;
 
@@ -1227,6 +1320,21 @@ fn process_samples_sequential(
                     processed += 1;
                 }
 
+                // Collect diagnostics for CSV
+                if config.phagetermini_csv_path.is_some() {
+                    for contig_diags in diagnostics {
+                        if !contig_diags.diagnostics.is_empty() {
+                            all_csv_diagnostics.push((
+                                contig_diags.contig_name,
+                                sample_name.clone(),
+                                contig_diags.diagnostics,
+                                contig_diags.unclipped_ratio,
+                                contig_diags.coverage_reduced_mean,
+                            ));
+                        }
+                    }
+                }
+
                 writing_time_total += write_start.elapsed();
 
                 let total_sample_time = sample_start.elapsed().as_secs_f64();
@@ -1247,6 +1355,15 @@ fn process_samples_sequential(
                 if !is_tty {
                     eprintln!("{}", msg);
                 }
+            }
+        }
+    }
+
+    // Write phagetermini CSV if path is specified and we have diagnostics
+    if let Some(ref path) = config.phagetermini_csv_path {
+        if !all_csv_diagnostics.is_empty() {
+            if let Err(e) = write_phagetermini_csv(path, &all_csv_diagnostics) {
+                eprintln!("Warning: Failed to write phagetermini CSV: {}", e);
             }
         }
     }

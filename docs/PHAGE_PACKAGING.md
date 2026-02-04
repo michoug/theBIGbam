@@ -1,119 +1,131 @@
 # Phage Packaging Classification Algorithm
 
-The processing_phage_packaging.rs file classifies phage packaging mechanisms
-through a multi-step pipeline:
+The `processing_phage_packaging.rs` module classifies phage packaging mechanisms through a multi-step filtering and classification pipeline.
 
-## Contig selection:
+## 1. Contig Selection
 
-Only contigs/sample pairs where more than **min_aligned_fraction** bp are covered
-by at least one read are considered (default 90%). This is calculated on the
-original coverage data before any processing.
+Only contigs where ≥ **min_aligned_fraction** (default 90%) of positions have at least one aligned read are processed.
 
-*processing.rs: lines 537-542*
+## 2. Terminal Repeat Detection (from autoblast)
 
-## Terminal repeat detection:
+Terminal repeats (DTR/ITR) are identified from autoblast results using:
+- Identity ≥ **min_identity_dtr** (default 90%)
+- One region within **max_distance_duplication** (default 100bp) of contig start
+- Other region within **max_distance_duplication** of contig end
 
-Terminal repeats (DTR/ITR) are identified using 2 criteria:
+These regions enable DTR-aware distance calculations and peak deduplication.
 
-- Both regions share ≥ **min_identity_dtr** identity (default 90%)
+## 3. Position Filtering
 
-- Both regions are located close to each contig end, at less than **max_distance_duplication** (default 100bp)
+Each position with read_starts > 0 or read_ends > 0 is evaluated:
 
-These regions are used for DTR-aware distance calculations and peak deduplication,
-but the original signal data is preserved (no merging or zeroing).
+### Step 3a: Local Filter
+Position must pass BOTH criteria:
+- SPC ≥ **min_frequency** × coverage_reduced (default 10%)
+- SPC ≥ **min_events** (default 10)
 
-*processing.rs: lines 247-282*
+Where SPC = read_starts (for start positions) or read_ends (for end positions).
 
-## Peak filtering (filter_peaks_by_clippings function):
+### Step 3b: Clipping Aggregation
+Clippings are summed within **max_distance_peaks** (default 20bp) of the peak position. This ensures that nearby clipping events are properly associated with the peak they relate to.
 
-Read start and end peaks are filtered based on three criteria:
+For start positions: sum left_clippings within ±max_distance_peaks  
+For end positions: sum right_clippings within ±max_distance_peaks
 
-- They must be more frequent than **min_frequency** compared to local coverage
-(default 0.1)
+### Step 3c: Clipping Pre-filter
+Aggregated clippings are only considered significant if they meet threshold:
+- clippings ≥ **min_frequency** × primary_reads (default 10%)
+- clippings ≥ **min_events** (default 10)
 
-- They must occur more than **min_events** times (default 10)
+If clippings don't meet threshold, they're treated as 0 (position auto-passes statistical test).
 
-- They must NOT have nearby clipping events within **max_distance_peaks** (default 20bp). Clipping events indicate alignment artifacts rather than true termini,
-so peaks near clippings are discarded
+### Step 3d: Statistical Test
+Tests whether position has **significantly more clippings** than expected globally.
 
-Distance calculations are **DTR/ITR-aware**: a clipping in the second repeat region
-is considered "near" a peak at the equivalent position in the first region.
-For DTR (direct): `second_start + offset` maps to `first_start + offset`.
-For ITR (inverted): `second_start + offset` maps to `first_end - offset`.
+- `observed_ratio = SPC / (SPC + effective_clippings)`
+- `expected_ratio = unclipped_ratio` (global proportion of unclipped reads)
 
-*processing.rs: lines 553-563*
+**Decision logic:**
+- If `observed_ratio ≥ expected_ratio` → **KEEP** (same or fewer clippings than average)
+- If `observed_ratio < expected_ratio` → test if significantly worse:
+  - z = (expected - observed) / std_error
+  - If z > z_critical → **DISCARD** (excess clippings indicate artifact)
+  - Otherwise → **KEEP** (not significantly worse)
 
-## Peak merging (merge_peaks function):
+The z_critical depends on **clipping_significance** (default 0.05 → z_critical = 1.645).
 
-Nearby peaks within **max_distance_peaks** (default 20bp) are merged into a single
-peak, keeping the peak with the strongest signal. Distance calculations use
-**dtr_aware_distance**, which treats positions in the second repeat region as
-equivalent to their counterparts in the first region (with proper DTR vs ITR mapping).
-For circular genomes, wrap-around merging also occurs.
+## 4. Peak Merging
 
-*processing.rs: lines 565-578*
+Positions passing all filters are merged into peak areas:
+- Nearby positions within **max_distance_peaks** (default 20bp) merge together
+- Distance calculations are **DTR-aware**: positions in second repeat region are treated as equivalent to their first region counterparts
+- For circular genomes, wrap-around merging occurs
+- Each area stores: start_pos, end_pos, center_pos (highest SPC), total_spc, tau
 
-## Packaging classification (classify_packaging function):
+## 5. DTR Deduplication
 
-Classification proceeds in two steps:
+Before classification, peak areas are deduplicated:
+- Areas in the second DTR region are translated to canonical (first region) positions
+- Duplicate areas at the same canonical position (within 20bp tolerance) are removed
+- Result: unique peak count for classification
 
-### Step 1: Deduplicate DTR-equivalent peaks
+**Important:** Canonical positions are used for distance calculation to ensure correct classification (e.g., T7 phage: start at pos 1, end at pos 160 → DTR distance = 159bp).
 
-The **deduplicate_dtr_equivalent** function:
-- Translates peaks from second DTR region to canonical (first region) positions
-- Removes duplicate peaks at the same canonical position
-- Tracks whether peaks are in DTR regions, ITR regions, or neither
-- Only applies to DTR (direct repeats); ITR peaks are not deduplicated
+## 6. Classification
 
-This determines the "real" unique peak count for classification.
+Based on unique peak count after deduplication:
 
-### Step 2: Classify based on unique peak count
+| Start Areas | End Areas | Classification |
+|-------------|-----------|----------------|
+| 0 | 0 | No_packaging |
+| 1 | 0 | PAC |
+| 0 | 1 | PAC |
+| 1 | 1 | See distance-based rules below |
+| >1 or >1 | | Unknown_packaging |
 
-Based on the number and configuration of unique peaks:
+### Distance-based Classification (1 start, 1 end)
 
-### (0 peaks in reads_starts, 0 peaks in read_ends) = "No_packaging"
+For ITR configuration (both peaks in ITR regions, distance ≤20bp):
+- ITR length ≤1000bp → **ITR_short_5'/3'**
+- ITR length ≤10% genome → **ITR_long_5'/3'**
+- ITR length >10% genome → **ITR_outlier_5'/3'**
 
-### (1, 0) or (0, 1) = **"PAC"** (headful packaging with single terminus)
+Otherwise, based on distance between canonical positions:
+- <2bp → **COS** (blunt cohesive ends)
+- ≤20bp → **COS_5'/3'** (cohesive with overhang)
+- ≤1000bp → **DTR_short_5'/3'**
+- ≤10% genome → **DTR_long_5'/3'**
+- >10% genome → **DTR_outlier_5'/3'**
 
-### (1, 1) = Classification depends on configuration and distance
+The suffix (_5' or _3') indicates overhang orientation based on whether end comes before or after start in genomic coordinates.
 
-If both termini are part of an ITR (**check_itr_configuration function**), they
-appear very close to each other on the sequence. In this case, the ITR length
-from autoblast is used instead of the physical distance between peaks:
+## 7. Output
 
-- ≤1000bp → **"ITR_short_5'/3'"** (short inverted terminal repeats)
+- **Mechanism**: Classification string (e.g., "DTR_short_5'")
+- **Left termini**: All original start area positions (including both DTR regions)
+- **Right termini**: All original end area positions
+- **Duplication status**: `true` if all in DTR, `false` if all in ITR, `null` otherwise
 
-- ≤10% genome → **"ITR_long_5'/3'"** (long inverted terminal repeats)
+## 8. Diagnostic CSV Output
 
-- >10% genome → **"ITR_outlier_5'/3'"**
+A diagnostic CSV file (`{db_name}_phagetermini.csv`) is generated with one row per position passing the local filter. Columns:
 
-Otherwise, the distance between peaks is used:
+| Column | Description |
+|--------|-------------|
+| Contig_name | Contig name |
+| Sample_name | Sample name |
+| Unclipped_ratio | Global unclipped read ratio |
+| Coverage_reduced_mean | Global mean coverage_reduced |
+| Type | "start" or "end" |
+| Position | 1-indexed position |
+| SPC | read_starts or read_ends count |
+| Clippings | Aggregated clippings within ±max_distance_peaks |
+| Observed_ratio | SPC/(SPC+effective_clippings) |
+| Primary_reads | Primary reads at position |
+| Coverage_reduced | Coverage_reduced at position |
+| Tau | SPC/coverage_reduced |
+| Kept | "yes" or "no" |
+| Discarded_because | Reason if discarded, empty if kept |
 
-- <2bp → **"COS"** (cohesive ends, blunt)
-
-- ≤20bp → **"COS_5'" or "COS_3'"** (cohesive with overhang directionality)
-
-- ≤1000bp → **"DTR_short_5'/3'"** (short direct terminal repeats)
-
-- ≤10% genome → **"DTR_long_5'/3'"** (long direct terminal repeats)
-
-- >10% genome → **"DTR_outlier_5'/3'"**
-
-### Other configurations → **"Unknown_packaging"**
-
-## Output:
-
-For all configurations:
-
-- **Termini positions**: All original peak positions are returned (including both
-  first and second DTR region positions if peaks exist in both). No expansion or
-  translation is applied to the output.
-
-- **Duplication status**: Determined during deduplication by tracking which regions
-  peaks belong to. The **combine_duplication_status** function merges the status
-  from start and end peaks: `Some(true)` if all peaks are in DTR regions,
-  `Some(false)` if all are in ITR regions, `None` otherwise.
-
-- **Suffix (_5' or _3')**: Indicates overhang orientation, determined by whether
-  the end peak comes before or after the start peak in genomic coordinates
-  (accounting for circularity).
+Discard reasons:
+- `statistical_test: excess_clippings z=X.XX > z_critical=X.XX` - significantly more clippings than expected

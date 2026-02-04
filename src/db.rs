@@ -161,27 +161,77 @@ impl DbWriter {
     }
 
     fn write_packaging(&self, conn: &Connection, sample_id: i64, packaging: &[PackagingData]) -> Result<()> {
-        let mut appender = conn.appender("PhageMechanisms")
+        // Track next packaging_id and terminus_id
+        // Query current max to ensure unique IDs
+        let mut packaging_id: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(Packaging_id), 0) FROM PhageMechanisms",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0) + 1;
+
+        let mut terminus_id: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(Terminus_id), 0) FROM PhageTermini",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0) + 1;
+
+        let mut mechanism_appender = conn.appender("PhageMechanisms")
             .context("Failed to create PhageMechanisms appender")?;
+        let mut termini_appender = conn.appender("PhageTermini")
+            .context("Failed to create PhageTermini appender")?;
 
         for pkg in packaging {
             if let Some(&contig_id) = self.contig_name_to_id.get(&pkg.contig_name) {
-                // Convert Vec<i32> to comma-separated strings (empty string if empty)
-                let left_str = if pkg.left_termini.is_empty() {
-                    String::new()
-                } else {
-                    pkg.left_termini.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
-                };
-                let right_str = if pkg.right_termini.is_empty() {
-                    String::new()
-                } else {
-                    pkg.right_termini.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")
-                };
-                appender.append_row(params![contig_id, sample_id, &pkg.mechanism, &left_str, &right_str, pkg.duplication])?;
+                // Insert into PhageMechanisms
+                mechanism_appender.append_row(params![
+                    packaging_id,
+                    contig_id,
+                    sample_id,
+                    &pkg.mechanism,
+                    pkg.duplication
+                ])?;
+
+                // Insert left termini (status = "start")
+                for terminus in &pkg.left_termini {
+                    // Store tau as integer (×100)
+                    let tau_int = (terminus.tau * 100.0).round() as i32;
+                    termini_appender.append_row(params![
+                        terminus_id,
+                        packaging_id,
+                        terminus.start_pos,
+                        terminus.end_pos,
+                        terminus.center_pos,
+                        "start",
+                        terminus.total_spc as i32,
+                        terminus.coverage as i32,
+                        tau_int
+                    ])?;
+                    terminus_id += 1;
+                }
+
+                // Insert right termini (status = "end")
+                for terminus in &pkg.right_termini {
+                    let tau_int = (terminus.tau * 100.0).round() as i32;
+                    termini_appender.append_row(params![
+                        terminus_id,
+                        packaging_id,
+                        terminus.start_pos,
+                        terminus.end_pos,
+                        terminus.center_pos,
+                        "end",
+                        terminus.total_spc as i32,
+                        terminus.coverage as i32,
+                        tau_int
+                    ])?;
+                    terminus_id += 1;
+                }
+
+                packaging_id += 1;
             }
         }
 
-        appender.flush().context("Failed to flush PhageMechanisms appender")?;
+        mechanism_appender.flush().context("Failed to flush PhageMechanisms appender")?;
+        termini_appender.flush().context("Failed to flush PhageTermini appender")?;
         Ok(())
     }
 
@@ -618,16 +668,33 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
 
     conn.execute(
         "CREATE TABLE PhageMechanisms (
-            Contig_id INTEGER,
-            Sample_id INTEGER,
-            Packaging_mechanism TEXT,
-            Left_termini TEXT,
-            Right_termini TEXT,
+            Packaging_id INTEGER PRIMARY KEY,
+            Contig_id INTEGER NOT NULL,
+            Sample_id INTEGER NOT NULL,
+            Packaging_mechanism TEXT NOT NULL,
             Duplication BOOLEAN
         )",
         [],
     )
     .context("Failed to create PhageMechanisms table")?;
+
+    // PhageTermini table - stores individual terminus areas with full metadata
+    // One row per terminus area, linked to PhageMechanisms via Packaging_id
+    conn.execute(
+        "CREATE TABLE PhageTermini (
+            Terminus_id INTEGER PRIMARY KEY,
+            Packaging_id INTEGER NOT NULL,
+            \"Start\" INTEGER NOT NULL,
+            \"End\" INTEGER NOT NULL,
+            Center INTEGER NOT NULL,
+            Status TEXT NOT NULL,
+            SPC INTEGER NOT NULL,
+            Coverage INTEGER NOT NULL,
+            Tau INTEGER NOT NULL
+        )",
+        [],
+    )
+    .context("Failed to create PhageTermini table")?;
 
     // Contig_directRepeats table - stores direct repeats (same orientation)
     // Pident stored as INTEGER (×100)
@@ -1172,15 +1239,25 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
     )
     .context("Failed to create Explicit_completeness VIEW")?;
 
-    // Explicit_phage_mechanisms VIEW
+    // Explicit_phage_mechanisms VIEW - backwards compatible with comma-separated termini
     conn.execute(
         "CREATE VIEW Explicit_phage_mechanisms AS
          SELECT
              c.Contig_name,
              s.Sample_name,
              m.Packaging_mechanism,
-             m.Left_termini,
-             m.Right_termini,
+             COALESCE(
+                 (SELECT STRING_AGG(CAST(pt.Center AS VARCHAR), ',' ORDER BY pt.Center)
+                  FROM PhageTermini pt
+                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Status = 'start'),
+                 ''
+             ) AS Left_termini,
+             COALESCE(
+                 (SELECT STRING_AGG(CAST(pt.Center AS VARCHAR), ',' ORDER BY pt.Center)
+                  FROM PhageTermini pt
+                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Status = 'end'),
+                 ''
+             ) AS Right_termini,
              CASE WHEN m.Duplication = true THEN 'DTR'
                   WHEN m.Duplication = false THEN 'ITR'
                   ELSE NULL END AS Duplication

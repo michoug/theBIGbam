@@ -440,9 +440,26 @@ pub struct PresenceData {
     pub coverage_median: f32,
 }
 
+/// A terminus area with full metadata for database storage.
+#[derive(Clone, Debug)]
+pub struct TerminusArea {
+    /// First position of the area (1-indexed)
+    pub start_pos: i32,
+    /// Last position of the area (1-indexed)
+    pub end_pos: i32,
+    /// Position with highest SPC (1-indexed)
+    pub center_pos: i32,
+    /// Total SPC (sum of read starts/ends in area)
+    pub total_spc: u32,
+    /// Coverage at center position
+    pub coverage: u32,
+    /// Tau value for the area
+    pub tau: f64,
+}
+
 /// Phage packaging mechanism data for a contig in a sample.
 ///
-/// Stores the detected packaging mechanism and terminus positions.
+/// Stores the detected packaging mechanism and terminus areas.
 /// Similar to CompletenessData, this is stored separately from PresenceData.
 #[derive(Clone, Debug)]
 pub struct PackagingData {
@@ -450,10 +467,10 @@ pub struct PackagingData {
     pub contig_name: String,
     /// Phage packaging mechanism (e.g., "PAC", "COS", "DTR_short_5'", etc.)
     pub mechanism: String,
-    /// Left terminus positions (1-indexed) - multiple positions for terminal repeats
-    pub left_termini: Vec<i32>,
-    /// Right terminus positions (1-indexed) - multiple positions for terminal repeats
-    pub right_termini: Vec<i32>,
+    /// Left terminus areas - start peaks with full metadata
+    pub left_termini: Vec<TerminusArea>,
+    /// Right terminus areas - end peaks with full metadata
+    pub right_termini: Vec<TerminusArea>,
     /// Whether termini are in a duplication: Some(true) = DTR, Some(false) = ITR, None = no/mixed
     pub duplication: Option<bool>,
 }
