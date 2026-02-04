@@ -42,7 +42,7 @@
 * I should understand where all reads start, sometimes weird that starts+clippings do not bring all answers
 * !important! Problem when start\_reads one bp away from other start\_reads but on the other side and in a duplication -> becomes one duplication away and thus not merged
 * I can use division by cov+ and cov- to get stronger signal for tau? Would imply different mathematical rules
-* Normally reads covering a position RP = reads starting with a match RM + reads starting with a clipping RC -> I could a check like that telling how reads start of average
+* Normally reads covering a position RP = reads starting with a match RM + reads starting with a clipping RC -> I could add a check like that telling how reads start of average
 * Plutôt que de regarder zones de départ pourquoi ne pas regarder reads qui crossent tel/tel endroit -> I should be able to know how each read is starting and based on that i can have view to calculate percentage or reads passing each spot (number starting there divided by number continuing-ish)
 * !important! Say that if too much coverage variation I cannot conclude safely on phage packaging: raise warning or stop?
 

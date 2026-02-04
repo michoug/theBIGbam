@@ -2,7 +2,6 @@
 
 use crate::compress::Run;
 use crate::db::RepeatsData;
-use crate::features::FeatureArrays;
 
 /// Peak for phage termini detection.
 #[derive(Clone, Debug)]
@@ -119,32 +118,33 @@ fn dtr_aware_distance(
     min_dist
 }
 
-/// Get the virtual position for a point near a DTR region.
-/// If the position is near the second DTR region, return the equivalent
-/// position near the first DTR region. Otherwise, return the original position.
+/// Get the virtual position for a point near a terminal repeat region.
+/// If the position is near the second region, return the equivalent
+/// position in the first region. Otherwise, return the original position.
+///
+/// Mapping differs by repeat type:
+/// - DTR (direct):   second_start + offset → first_start + offset
+/// - ITR (inverted): second_start + offset → first_end - offset
 fn get_virtual_position(pos: i32, dtr: &DtrRegion, max_distance: i32) -> i32 {
-    // Distance from pos to the start of second region
-    let dist_to_second_start = (pos - dtr.second_start).abs();
-    // Distance from pos to the end of second region
-    let dist_to_second_end = (pos - dtr.second_end).abs();
+    // Check if position is in or near second region
+    let in_second = pos >= dtr.second_start && pos <= dtr.second_end;
+    let near_second_start = (pos - dtr.second_start).abs() <= max_distance;
+    let near_second_end = (pos - dtr.second_end).abs() <= max_distance;
 
-    if dist_to_second_start <= max_distance {
-        // Position is near second region's start
-        // Map to equivalent position near first region's start
-        let offset = pos - dtr.second_start;
-        dtr.first_start + offset
-    } else if dist_to_second_end <= max_distance {
-        // Position is near second region's end
-        // Map to equivalent position near first region's end
-        let offset = pos - dtr.second_end;
-        dtr.first_end + offset
-    } else if pos >= dtr.second_start && pos <= dtr.second_end {
-        // Position is inside second region
-        let offset = pos - dtr.second_start;
+    if !in_second && !near_second_start && !near_second_end {
+        // Position is not near second region, keep as is
+        return pos;
+    }
+
+    // Calculate offset from second region start
+    let offset = pos - dtr.second_start;
+
+    if dtr.is_direct {
+        // DTR: same direction mapping
         dtr.first_start + offset
     } else {
-        // Position is not near second region, keep as is
-        pos
+        // ITR: inverted mapping
+        dtr.first_end - offset
     }
 }
 
@@ -325,94 +325,102 @@ pub fn is_valid_terminal_repeat(dup: &RepeatsData, contig_length: usize, max_dis
     (first_at_start && second_at_end) || (first_at_end && second_at_start)
 }
 
-/// Translate a terminus position from second region to first region if applicable.
-/// This ensures termini are always reported in the first (canonical) region.
-/// Returns the translated position (or original if not in second region).
-///
-/// Mapping (regions are same length for true duplications):
-/// - DTR: second_start → first_start, second_end → first_end
-/// - ITR: second_start → first_end, second_end → first_start
-fn translate_to_first_region(pos: i32, dtr_regions: &[DtrRegion]) -> i32 {
+
+/// Translate a position from second DTR region to first DTR region.
+/// Only applies to DTR (direct), not ITR (inverted).
+/// Returns the translated position (or original if not in a DTR second region).
+fn translate_to_first_dtr_region(pos: i32, dtr_regions: &[DtrRegion]) -> i32 {
     for dtr in dtr_regions {
+        // Only translate for DTR (direct), not ITR (inverted)
+        if !dtr.is_direct {
+            continue;
+        }
         // Check if pos is in second region
         if pos >= dtr.second_start && pos <= dtr.second_end {
             return dtr.first_start + pos - dtr.second_start;
         }
     }
-    // Not in any second region, return as-is
+    // Not in any DTR second region, return as-is
     pos
 }
 
-/// Expand a terminus position to include equivalent DTR positions.
-/// First translates to first region if in second region, then adds the equivalent position.
-fn expand_terminus_with_dtr(pos: i32, dtr_regions: &[DtrRegion]) -> Vec<i32> {
-    // First, translate to first region if in second region
-    let primary_pos = translate_to_first_region(pos, dtr_regions);
-    let mut positions = vec![primary_pos];
+/// Deduplicate peaks that are DTR-equivalent and determine duplication status.
+/// Groups peaks by equivalence and keeps the canonical (first region) position.
+/// Only applies to DTR (direct repeats), not ITR (inverted repeats).
+///
+/// Returns (unique_peaks, duplication_status):
+/// - unique_peaks: peaks with positions translated to first region
+/// - duplication_status: Some(true) if all in DTR, Some(false) if all in ITR, None otherwise
+fn deduplicate_dtr_equivalent(peaks: &[Peak], dtr_regions: &[DtrRegion]) -> (Vec<Peak>, Option<bool>) {
+    if peaks.is_empty() {
+        return (Vec::new(), None);
+    }
 
-    for dtr in dtr_regions {
-        // Check if primary_pos is in first region - add equivalent in second region
-        if primary_pos >= dtr.first_start && primary_pos <= dtr.first_end {
-            let offset = primary_pos - dtr.first_start;
-            let equivalent = dtr.second_start + offset;
-            if !positions.contains(&equivalent) {
-                positions.push(equivalent);
+    if dtr_regions.is_empty() {
+        return (peaks.to_vec(), None);
+    }
+
+    let mut unique: Vec<Peak> = Vec::new();
+    let mut all_in_dtr = true;
+    let mut all_in_itr = true;
+    let mut any_in_repeat = false;
+
+    for peak in peaks {
+        let pos = peak.position;
+
+        // Check which region type this peak is in
+        let mut in_dtr = false;
+        let mut in_itr = false;
+
+        for dtr in dtr_regions {
+            let in_first = pos >= dtr.first_start && pos <= dtr.first_end;
+            let in_second = pos >= dtr.second_start && pos <= dtr.second_end;
+
+            if in_first || in_second {
+                any_in_repeat = true;
+                if dtr.is_direct {
+                    in_dtr = true;
+                } else {
+                    in_itr = true;
+                }
             }
         }
-    }
 
-    positions.sort();
-    positions
-}
-
-/// Check if a position is within any duplication region.
-/// Returns Some(is_direct) if in a region, None otherwise.
-fn position_in_duplication(pos: i32, dtr_regions: &[DtrRegion]) -> Option<bool> {
-    for dtr in dtr_regions {
-        if (pos >= dtr.first_start && pos <= dtr.first_end) || (pos >= dtr.second_start && pos <= dtr.second_end)
-        {
-            return Some(dtr.is_direct);
+        if !in_dtr {
+            all_in_dtr = false;
         }
-    }
-    None
-}
+        if !in_itr {
+            all_in_itr = false;
+        }
 
-/// Determine duplication status for all termini.
-/// Returns Some(true) if ALL termini are in DTR regions,
-/// Some(false) if ALL termini are in ITR regions,
-/// None if no termini, mixed, or any terminus outside duplications.
-fn determine_duplication_status(
-    left_termini: &[i32],
-    right_termini: &[i32],
-    dtr_regions: &[DtrRegion],
-) -> Option<bool> {
-    // Collect all terminus positions (use just the first/original position, not expanded)
-    let all_termini: Vec<i32> = left_termini.iter().chain(right_termini.iter()).copied().collect();
+        // Translate to canonical (first region) position - only for DTR
+        let canonical_pos = translate_to_first_dtr_region(pos, dtr_regions);
 
-    if all_termini.is_empty() || dtr_regions.is_empty() {
-        return None;
-    }
+        // Check if this canonical position already exists
+        let is_duplicate = unique.iter().any(|existing| {
+            existing.position == canonical_pos
+        });
 
-    let mut all_direct = true;
-    let mut all_inverted = true;
-
-    for &pos in &all_termini {
-        // Translate to first region before checking (in case position is in second region)
-        let translated_pos = translate_to_first_region(pos, dtr_regions);
-        match position_in_duplication(translated_pos, dtr_regions) {
-            Some(true) => all_inverted = false,  // Found DTR
-            Some(false) => all_direct = false,   // Found ITR
-            None => return None,                  // Position not in any duplication
+        if !is_duplicate {
+            unique.push(Peak {
+                position: canonical_pos,
+                value: peak.value,
+            });
         }
     }
 
-    if all_direct && !all_inverted {
-        Some(true)  // All DTR
-    } else if all_inverted && !all_direct {
-        Some(false) // All ITR
+    // Determine duplication status
+    let status = if !any_in_repeat {
+        None
+    } else if all_in_dtr && !all_in_itr {
+        Some(true)  // All in DTR
+    } else if all_in_itr && !all_in_dtr {
+        Some(false) // All in ITR
     } else {
-        None // Mixed or none
-    }
+        None // Mixed or unclear
+    };
+
+    (unique, status)
 }
 
 /// Check if positions are in ITR regions: one in first, other in second.
@@ -438,8 +446,32 @@ fn check_itr_configuration(pos1: i32, pos2: i32, dtr_regions: &[DtrRegion]) -> O
     None
 }
 
+/// Combine duplication status from start and end peaks.
+/// Returns Some(true) if all in DTR, Some(false) if all in ITR, None otherwise.
+fn combine_duplication_status(
+    starts_status: Option<bool>,
+    ends_status: Option<bool>,
+    has_starts: bool,
+    has_ends: bool,
+) -> Option<bool> {
+    match (starts_status, ends_status, has_starts, has_ends) {
+        // Both have same status
+        (Some(true), Some(true), _, _) => Some(true),   // All DTR
+        (Some(false), Some(false), _, _) => Some(false), // All ITR
+        // Only one side has peaks - use that status
+        (s, _, true, false) => s,
+        (_, s, false, true) => s,
+        // Mixed or no peaks
+        _ => None,
+    }
+}
+
 /// Classify phage packaging mechanism based on peak configuration.
 /// Returns (mechanism, left_termini, right_termini, duplication_status).
+///
+/// DTR equivalence is handled here: peaks from both DTR regions are received,
+/// and we deduplicate equivalent peaks to determine the "real" peak count
+/// for classification. Termini positions are returned as-is (no expansion).
 pub fn classify_packaging(
     start_peaks: &[Peak],
     end_peaks: &[Peak],
@@ -447,27 +479,32 @@ pub fn classify_packaging(
     circular: bool,
     dtr_regions: &[DtrRegion],
 ) -> (String, Vec<i32>, Vec<i32>, Option<bool>) {
-    match (start_peaks.len(), end_peaks.len()) {
+    // Deduplicate DTR-equivalent peaks and get duplication status
+    let (unique_starts, starts_status) = deduplicate_dtr_equivalent(start_peaks, dtr_regions);
+    let (unique_ends, ends_status) = deduplicate_dtr_equivalent(end_peaks, dtr_regions);
+
+    // Use unique counts for classification logic
+    match (unique_starts.len(), unique_ends.len()) {
         (0, 0) => ("No_packaging".to_string(), vec![], vec![], None),
 
         (1, 0) => {
             // Only start peak - PAC
-            let left = expand_terminus_with_dtr(start_peaks[0].position, dtr_regions);
-            let dup_status = determine_duplication_status(&[start_peaks[0].position], &[], dtr_regions);
-            ("PAC".to_string(), left, vec![], dup_status)
+            // Return all original positions (not deduplicated)
+            let left: Vec<i32> = start_peaks.iter().map(|p| p.position).collect();
+            ("PAC".to_string(), left, vec![], starts_status)
         }
 
         (0, 1) => {
             // Only end peak - PAC
-            let right = expand_terminus_with_dtr(end_peaks[0].position, dtr_regions);
-            let dup_status = determine_duplication_status(&[], &[end_peaks[0].position], dtr_regions);
-            ("PAC".to_string(), vec![], right, dup_status)
+            let right: Vec<i32> = end_peaks.iter().map(|p| p.position).collect();
+            ("PAC".to_string(), vec![], right, ends_status)
         }
 
         (1, 1) => {
-            // Two peaks - classify based on distance and order
-            let start_pos = start_peaks[0].position;
-            let end_pos = end_peaks[0].position;
+            // Two unique peaks - classify based on distance and order
+            // Use the first unique peak positions for classification
+            let start_pos = unique_starts[0].position;
+            let end_pos = unique_ends[0].position;
 
             // Calculate actual genomic distance (shortest path in circular)
             let distance = if circular {
@@ -504,180 +541,62 @@ pub fn classify_packaging(
                 None
             };
 
-            let (mechanism, left_pos, right_pos) = if let Some(repeat_size) = itr_config {
-                // ITR detected - classify based on repeat size from autoblast
-                let suffix = if end_before_start { "_3'" } else { "_5'" };
-                let (left, right) = if end_before_start {
-                    (end_pos, start_pos)
-                } else {
-                    (start_pos, end_pos)
-                };
+            // Determine suffix and position ordering based on directionality
+            let suffix = if end_before_start { "_3'" } else { "_5'" };
+            let (_left_pos, _right_pos) = if end_before_start {
+                (end_pos, start_pos)
+            } else {
+                (start_pos, end_pos)
+            };
 
-                let itr_type = if repeat_size <= 1000 {
+            let mechanism = if let Some(repeat_size) = itr_config {
+                // ITR detected - classify based on repeat size from autoblast
+                if repeat_size <= 1000 {
                     format!("ITR_short{}", suffix)
                 } else if repeat_size <= genome_10pct {
                     format!("ITR_long{}", suffix)
                 } else {
                     format!("ITR_outlier{}", suffix)
-                };
-                (itr_type, left, right)
+                }
             } else if distance < 2 {
-                // Very close - cohesive ends
-                ("COS".to_string(), start_pos.min(end_pos), start_pos.max(end_pos))
+                // Very close - cohesive ends (no suffix)
+                "COS".to_string()
             } else if distance <= 20 {
                 // Close cohesive ends with directionality
-                if end_before_start {
-                    ("COS_3'".to_string(), end_pos, start_pos)
-                } else {
-                    ("COS_5'".to_string(), start_pos, end_pos)
-                }
+                format!("COS{}", suffix)
             } else if distance <= 1000 {
                 // Short direct terminal repeats
-                if end_before_start {
-                    ("DTR_short_3'".to_string(), end_pos, start_pos)
-                } else {
-                    ("DTR_short_5'".to_string(), start_pos, end_pos)
-                }
+                format!("DTR_short{}", suffix)
             } else if distance <= genome_10pct {
                 // Long direct terminal repeats
-                if end_before_start {
-                    ("DTR_long_3'".to_string(), end_pos, start_pos)
-                } else {
-                    ("DTR_long_5'".to_string(), start_pos, end_pos)
-                }
+                format!("DTR_long{}", suffix)
             } else {
                 // Very distant - outlier
-                if end_before_start {
-                    ("DTR_outlier_3'".to_string(), end_pos, start_pos)
-                } else {
-                    ("DTR_outlier_5'".to_string(), start_pos, end_pos)
-                }
+                format!("DTR_outlier{}", suffix)
             };
 
-            let left = expand_terminus_with_dtr(left_pos, dtr_regions);
-            let right = expand_terminus_with_dtr(right_pos, dtr_regions);
-            let dup_status = determine_duplication_status(&[left_pos], &[right_pos], dtr_regions);
+            // Return all original positions (not just deduplicated ones)
+            let mut left: Vec<i32> = start_peaks.iter().map(|p| p.position).collect();
+            let mut right: Vec<i32> = end_peaks.iter().map(|p| p.position).collect();
+            left.sort();
+            right.sort();
+            let dup_status = combine_duplication_status(starts_status, ends_status, true, true);
             (mechanism, left, right, dup_status)
         }
 
         _ => {
-            // Multiple peaks or other configurations - collect all original peak positions
-            let left_original: Vec<i32> = start_peaks.iter().map(|p| p.position).collect();
-            let right_original: Vec<i32> = end_peaks.iter().map(|p| p.position).collect();
+            // Multiple unique peaks - Unknown_packaging
+            // Return all original positions
+            let mut left_termini: Vec<i32> = start_peaks.iter().map(|p| p.position).collect();
+            let mut right_termini: Vec<i32> = end_peaks.iter().map(|p| p.position).collect();
 
-            // Expand to include DTR equivalents
-            let mut left_termini: Vec<i32> = start_peaks
-                .iter()
-                .flat_map(|p| expand_terminus_with_dtr(p.position, dtr_regions))
-                .collect();
-            let mut right_termini: Vec<i32> = end_peaks
-                .iter()
-                .flat_map(|p| expand_terminus_with_dtr(p.position, dtr_regions))
-                .collect();
-
-            // Remove duplicates and sort
+            // Sort for consistent output
             left_termini.sort();
-            left_termini.dedup();
             right_termini.sort();
-            right_termini.dedup();
 
-            let dup_status = determine_duplication_status(&left_original, &right_original, dtr_regions);
+            let dup_status = combine_duplication_status(starts_status, ends_status, !unique_starts.is_empty(), !unique_ends.is_empty());
             ("Unknown_packaging".to_string(), left_termini, right_termini, dup_status)
         }
     }
 }
 
-/// Apply terminal repeat merging for phagetermini analysis.
-///
-/// For duplications with ≥90% identity (both DTR and ITR):
-/// - Merge signals from second region into first region (position i → position i)
-/// - Zero out second region
-///
-/// This ensures termini detection isn't confused by duplicated regions.
-pub fn apply_dtr_merging(
-    arrays: &mut FeatureArrays,
-    dtr_regions: &[DtrRegion],
-) {
-    if dtr_regions.is_empty() {
-        return;
-    }
-
-    // Process each duplication pair using pre-built DtrRegion
-    // Only merge DTR (direct repeats), not ITR (inverted repeats)
-    for dtr in dtr_regions {
-        // Skip ITR - merging doesn't make sense for inverted repeats
-        if !dtr.is_direct {
-            continue;
-        }
-
-        // Convert from 1-indexed (DtrRegion) to 0-indexed (array indices)
-        let first_start = (dtr.first_start - 1) as usize;
-        let first_end = (dtr.first_end - 1) as usize;
-        let second_start = (dtr.second_start - 1) as usize;
-        let second_end = (dtr.second_end - 1) as usize;
-
-        let region_len = first_end.saturating_sub(first_start) + 1;
-        let second_region_len = second_end.saturating_sub(second_start) + 1;
-
-        // Skip if regions are different lengths or out of bounds
-        if region_len != second_region_len || second_end >= arrays.coverage_reduced.len() {
-            continue;
-        }
-
-        // Merge signals from second region to first region (DTR only)
-        for i in 0..region_len {
-            let second_idx = second_start + i;
-            let first_idx = first_start + i;
-
-            // Merge coverage_primary_reads
-            if first_idx < arrays.primary_reads.len() && second_idx < arrays.primary_reads.len() {
-                arrays.primary_reads[first_idx] += arrays.primary_reads[second_idx];
-                arrays.primary_reads[second_idx] = 0;
-            }
-
-            // Merge coverage_reduced
-            if first_idx < arrays.coverage_reduced.len() && second_idx < arrays.coverage_reduced.len() {
-                arrays.coverage_reduced[first_idx] += arrays.coverage_reduced[second_idx];
-                arrays.coverage_reduced[second_idx] = 0;
-            }
-
-            // Merge reads_starts
-            if first_idx < arrays.reads_starts.len() && second_idx < arrays.reads_starts.len() {
-                arrays.reads_starts[first_idx] += arrays.reads_starts[second_idx];
-                arrays.reads_starts[second_idx] = 0;
-            }
-
-            // Merge reads_ends
-            if first_idx < arrays.reads_ends.len() && second_idx < arrays.reads_ends.len() {
-                arrays.reads_ends[first_idx] += arrays.reads_ends[second_idx];
-                arrays.reads_ends[second_idx] = 0;
-            }
-
-            // Left clippings: keep only if present at both
-            if first_idx < arrays.left_clipping_lengths.len() && second_idx < arrays.left_clipping_lengths.len() {
-                let has_first = !arrays.left_clipping_lengths[first_idx].is_empty();
-                let has_second = !arrays.left_clipping_lengths[second_idx].is_empty();
-                if has_first && has_second {
-                    let second_clips: Vec<u32> = arrays.left_clipping_lengths[second_idx].drain(..).collect();
-                    arrays.left_clipping_lengths[first_idx].extend(second_clips);
-                } else {
-                    arrays.left_clipping_lengths[first_idx].clear();
-                    arrays.left_clipping_lengths[second_idx].clear();
-                }
-            }
-
-            // Right clippings: keep only if present at both
-            if first_idx < arrays.right_clipping_lengths.len() && second_idx < arrays.right_clipping_lengths.len() {
-                let has_first = !arrays.right_clipping_lengths[first_idx].is_empty();
-                let has_second = !arrays.right_clipping_lengths[second_idx].is_empty();
-                if has_first && has_second {
-                    let second_clips: Vec<u32> = arrays.right_clipping_lengths[second_idx].drain(..).collect();
-                    arrays.right_clipping_lengths[first_idx].extend(second_clips);
-                } else {
-                    arrays.right_clipping_lengths[first_idx].clear();
-                    arrays.right_clipping_lengths[second_idx].clear();
-                }
-            }
-        }
-    }
-}

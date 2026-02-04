@@ -35,7 +35,7 @@ use crate::types::{
 };
 
 use crate::processing_phage_packaging::{
-    apply_dtr_merging, classify_packaging, filter_peaks_by_clippings,
+    classify_packaging, filter_peaks_by_clippings,
     is_valid_terminal_repeat, merge_peaks, DtrRegion, PhageTerminiConfig,
 };
 use crate::processing_completeness::compute_completeness;
@@ -460,7 +460,6 @@ fn add_features_from_arrays(
     // Phagetermini features
     let packaging_result = if flags.phagetermini {
         // === STEP 1: Save ORIGINAL data to database (before any DTR merging) ===
-
         // coverage_reduced (self-referential curve)
         let coverage_reduced_f64: Vec<f64> = arrays.coverage_reduced.iter().map(|&x| x as f64).collect();
         add_compressed_feature(&coverage_reduced_f64, "coverage_reduced", contig_name, config, output);
@@ -532,37 +531,34 @@ fn add_features_from_arrays(
             }
         }
 
-        // === STEP 2: Apply DTR merging to arrays ===
-        if !dtr_regions.is_empty() {
-            apply_dtr_merging(arrays, &dtr_regions);
-        }
-
-        // === STEP 3: Recompute runs from MERGED data ===
-        let coverage_reduced_f64: Vec<f64> = arrays.coverage_reduced.iter().map(|&x| x as f64).collect();
-
-        // Check aligned fraction before proceeding with packaging detection
-        let aligned_count = coverage_reduced_f64.iter().filter(|&&x| x > 0.0).count();
-        let aligned_fraction = if coverage_reduced_f64.is_empty() {
+        // === STEP 2: Calculate aligned fraction ===
+        let aligned_count = arrays.coverage_reduced.iter().filter(|&&x| x > 0).count();
+        let aligned_fraction = if arrays.coverage_reduced.is_empty() {
             0.0
         } else {
-            (aligned_count as f64 / coverage_reduced_f64.len() as f64) * 100.0
+            (aligned_count as f64 / arrays.coverage_reduced.len() as f64) * 100.0
         };
 
+        // === STEP 3: Compress signals for peak detection ===
+        // Keep all peaks (no RLE merging) - DTR equivalence is handled in classify_packaging
+        let coverage_reduced_f64: Vec<f64> = arrays.coverage_reduced.iter().map(|&x| x as f64).collect();
+
         if aligned_fraction >= pt_config.min_aligned_fraction as f64 {
-            let reads_starts_merged: Vec<f64> = arrays.reads_starts.iter().map(|&x| x as f64).collect();
-            let reads_ends_merged: Vec<f64> = arrays.reads_ends.iter().map(|&x| x as f64).collect();
-            let reads_starts_runs_merged = compress_signal_with_reference(&reads_starts_merged, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
-            let reads_ends_runs_merged = compress_signal_with_reference(&reads_ends_merged, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
+            let reads_starts_f64: Vec<f64> = arrays.reads_starts.iter().map(|&x| x as f64).collect();
+            let reads_ends_f64: Vec<f64> = arrays.reads_ends.iter().map(|&x| x as f64).collect();
+            let reads_starts_runs = compress_signal_with_reference(&reads_starts_f64, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
+            let reads_ends_runs = compress_signal_with_reference(&reads_ends_f64, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
 
             let left_clip_counts: Vec<f64> = arrays.left_clipping_lengths.iter().map(|v| v.len() as f64).collect();
             let right_clip_counts: Vec<f64> = arrays.right_clipping_lengths.iter().map(|v| v.len() as f64).collect();
             let left_clip_runs = compress_signal_with_reference(&left_clip_counts, Some(&primary_reads_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
             let right_clip_runs = compress_signal_with_reference(&right_clip_counts, Some(&primary_reads_f64), PlotType::Bars, config.curve_ratio, pt_config.min_frequency as f64);
 
-            // === STEP 4: Filter and merge peaks ===
+            // === STEP 4: Filter peaks by clippings and merge nearby peaks ===
+            // DTR-aware distance is used here via dtr_aware_distance()
             let (reads_starts_filtered, reads_ends_filtered) = filter_peaks_by_clippings(
-                &reads_starts_runs_merged,
-                &reads_ends_runs_merged,
+                &reads_starts_runs,
+                &reads_ends_runs,
                 &left_clip_runs,
                 &right_clip_runs,
                 pt_config.min_events as f64,
