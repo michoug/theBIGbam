@@ -22,10 +22,6 @@ def calculating_all_features_parallel(list_modules, bam_files, output_db, min_co
 
     print(f"Using Rust bindings to process {len(bam_files)} samples with rayon ({n_sample_cores} threads)...", flush=True)
 
-    # Generate phagetermini CSV path for diagnostic output
-    output_dir = Path(output_db).parent
-    phagetermini_csv = str(output_dir / f"{Path(output_db).stem}_phagetermini.csv")
-
     try:
         result = _rust.process_all_samples(
             genbank_path=genbank_path if genbank_path else "",
@@ -41,7 +37,6 @@ def calculating_all_features_parallel(list_modules, bam_files, output_db, min_co
             circular=circular,
             create_indexes=True,
             autoblast_file=autoblast_file if autoblast_file else "",
-            phagetermini_csv=phagetermini_csv,
         )
     except Exception as e:
         print(f"ERROR: Rust processing failed: {e}", flush=True)

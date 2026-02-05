@@ -455,6 +455,16 @@ pub struct TerminusArea {
     pub coverage: u32,
     /// Tau value for the area
     pub tau: f64,
+    /// Number of positions merged into this area
+    pub number_peaks: u32,
+    /// Whether this terminus passed filtering
+    pub kept: bool,
+    /// Sum of pre-filtered clippings used for filtering
+    pub sum_clippings: u64,
+    /// Global clipped ratio for this contig/sample
+    pub clipped_ratio: f64,
+    /// Expected clippings (threshold from statistical test)
+    pub expected_clippings: f64,
 }
 
 /// Phage packaging mechanism data for a contig in a sample.
@@ -473,6 +483,8 @@ pub struct PackagingData {
     pub right_termini: Vec<TerminusArea>,
     /// Whether termini are in a duplication: Some(true) = DTR, Some(false) = ITR, None = no/mixed
     pub duplication: Option<bool>,
+    /// Distance between start and end peak centers (when exactly 1 of each), None otherwise
+    pub repeat_length: Option<i32>,
 }
 
 /// Type alias for feature calculation results.

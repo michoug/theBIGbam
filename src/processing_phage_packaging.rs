@@ -3,28 +3,6 @@
 use crate::db::RepeatsData;
 use crate::types::TerminusArea;
 
-/// Peak for phage termini detection (legacy, used internally).
-#[derive(Clone, Debug)]
-pub struct Peak {
-    pub position: i32,
-    pub value: f64,
-}
-
-/// Diagnostic information for a terminus position (for CSV export).
-#[derive(Clone, Debug)]
-pub struct TerminusDiagnostic {
-    pub position: i32,
-    pub terminus_type: String,  // "start" or "end"
-    pub spc: u64,
-    pub clippings: u64,
-    pub observed_ratio: f64,
-    pub primary_reads: u64,
-    pub coverage_reduced: u64,
-    pub tau: f64,
-    pub kept: bool,
-    pub discarded_because: String,
-}
-
 /// Peak area for phage termini detection.
 /// Represents a merged region of nearby positions with significant signal.
 #[derive(Clone, Debug)]
@@ -43,6 +21,16 @@ pub struct PeakArea {
     pub coverage: u32,
     /// Tau value at center position
     pub tau: f64,
+    /// Number of positions merged into this area
+    pub number_peaks: u32,
+    /// Sum of pre-filtered clippings used for filtering
+    pub sum_clippings: u64,
+    /// Whether this area passed the clipping test
+    pub kept: bool,
+    /// Global clipped ratio for this contig/sample
+    pub clipped_ratio: f64,
+    /// Expected clippings (threshold from statistical test)
+    pub expected_clippings: f64,
 }
 
 /// Configuration for phage termini detection.
@@ -110,334 +98,106 @@ pub struct DtrRegion {
     pub is_direct: bool,
 }
 
-/// Calculate minimum distance between two positions, considering DTR equivalence.
-///
-/// If a position is near the second DTR region, it's treated as being near
-/// the equivalent position in the first DTR region.
-fn dtr_aware_distance(
-    pos1: i32,
-    pos2: i32,
-    genome_length: usize,
-    circular: bool,
-    dtr_regions: &[DtrRegion],
-    max_distance: i32,
-) -> i32 {
-    // Start with regular distance
-    let regular_dist = if circular {
-        circular_distance(pos1, pos2, genome_length)
-    } else {
-        (pos1 - pos2).abs()
-    };
-
-    // If no DTR regions or already close enough, return regular distance
-    if dtr_regions.is_empty() || regular_dist <= max_distance {
-        return regular_dist;
-    }
-
-    // Check if either position is near a second DTR region
-    // If so, calculate distance using the equivalent first region position
-    let mut min_dist = regular_dist;
-
-    for dtr in dtr_regions {
-        // Check if pos1 is near second region - calculate virtual position
-        let pos1_virtual = get_virtual_position(pos1, dtr, max_distance);
-        // Check if pos2 is near second region - calculate virtual position
-        let pos2_virtual = get_virtual_position(pos2, dtr, max_distance);
-
-        // Calculate distance using virtual positions
-        let virtual_dist = if circular {
-            circular_distance(pos1_virtual, pos2_virtual, genome_length)
-        } else {
-            (pos1_virtual - pos2_virtual).abs()
-        };
-
-        min_dist = min_dist.min(virtual_dist);
-    }
-
-    min_dist
-}
-
-/// Get the virtual position for a point near a terminal repeat region.
-/// If the position is near the second region, return the equivalent
-/// position in the first region. Otherwise, return the original position.
-///
-/// Mapping differs by repeat type:
-/// - DTR (direct):   second_start + offset → first_start + offset
-/// - ITR (inverted): second_start + offset → first_end - offset
-fn get_virtual_position(pos: i32, dtr: &DtrRegion, max_distance: i32) -> i32 {
-    // Check if position is in or near second region
-    let in_second = pos >= dtr.second_start && pos <= dtr.second_end;
-    let near_second_start = (pos - dtr.second_start).abs() <= max_distance;
-    let near_second_end = (pos - dtr.second_end).abs() <= max_distance;
-
-    if !in_second && !near_second_start && !near_second_end {
-        // Position is not near second region, keep as is
-        return pos;
-    }
-
-    // Calculate offset from second region start
-    let offset = pos - dtr.second_start;
-
-    if dtr.is_direct {
-        // DTR: same direction mapping
-        dtr.first_start + offset
-    } else {
-        // ITR: inverted mapping
-        dtr.first_end - offset
-    }
-}
-
-/// Statistical test for clipping artifacts using binomial proportion test.
-///
-/// Tests whether the observed ratio of read_starts/(read_starts+clippings)
-/// is significantly LOWER than the expected unclipped_ratio (i.e., has
-/// significantly more clippings than expected).
-///
-/// H0: ratio = unclipped_ratio (position is normal)
-/// H1: ratio < unclipped_ratio (position has excess clippings → artifact)
-///
-/// Returns true if position should be KEPT (not a clipping artifact)
-/// Returns false if position should be DISCARDED (likely clipping artifact)
-fn is_significant_terminus(
-    read_starts: u32,
-    clippings: u32,
-    unclipped_ratio: f64,
+/// Statistical test for excess clippings with detailed reason for rejection.
+/// Returns (passes_test, expected_clippings, rejection_reason).
+fn is_area_clipping_acceptable_with_reason(
+    total_spc: u64,
+    sum_clippings: u64,
+    clipped_ratio: f64,
     clipping_significance: f64,
-) -> bool {
-    let n = read_starts + clippings;
-    if n == 0 {
-        return false;
-    }
-    if clippings == 0 {
-        return true; // No clipping → keep
+) -> (bool, f64, String) {
+    let expected_clippings = clipped_ratio * total_spc as f64;
+    
+    if sum_clippings == 0 {
+        return (true, expected_clippings, String::new());
     }
 
-    let p_obs = read_starts as f64 / n as f64;
-    let p_exp = unclipped_ratio;
-
-    // If observed is at or above expected, this position has same or fewer
-    // clippings than average → definitely not a clipping artifact → keep
-    if p_obs >= p_exp {
-        return true;
+    if (sum_clippings as f64) <= expected_clippings {
+        return (true, expected_clippings, String::new());
     }
 
-    // Observed is below expected - test if SIGNIFICANTLY more clippings
-    // Standard error under null hypothesis
-    let std_err = (p_exp * (1.0 - p_exp) / n as f64).sqrt();
+    let std_err = expected_clippings.sqrt();
     if std_err == 0.0 {
-        return true; // Can't compute, keep by default
+        if sum_clippings > 0 {
+            return (false, expected_clippings, "excess_clippings: expected=0".to_string());
+        }
+        return (true, expected_clippings, String::new());
     }
 
-    // Z-score: how many std errors below expected?
-    let z = (p_exp - p_obs) / std_err;
+    let z = (sum_clippings as f64 - expected_clippings) / std_err;
 
-    // Critical z-value for one-tailed test
     let z_critical = if clipping_significance >= 0.10 {
-        1.282 // 90% confidence
+        1.282
     } else if clipping_significance >= 0.05 {
-        1.645 // 95% confidence
+        1.645
     } else if clipping_significance >= 0.01 {
-        2.326 // 99% confidence
+        2.326
     } else {
-        2.576 // 99.5% confidence
+        2.576
     };
 
-    // If z > z_critical, position has significantly MORE clippings → discard
-    // Otherwise, not significantly worse → keep
-    z <= z_critical
-}
-
-/// Statistical test for clipping artifacts with detailed reason for rejection.
-/// Returns (passes_test, rejection_reason).
-///
-/// Tests if position has significantly MORE clippings than expected.
-/// If yes → discard (clipping artifact). If no → keep.
-fn is_significant_terminus_with_reason(
-    read_starts: u32,
-    clippings: u32,
-    unclipped_ratio: f64,
-    clipping_significance: f64,
-) -> (bool, String) {
-    let n = read_starts + clippings;
-    if n == 0 {
-        return (false, "no_data".to_string());
-    }
-    if clippings == 0 {
-        return (true, String::new()); // No clipping → keep
-    }
-
-    let p_obs = read_starts as f64 / n as f64;
-    let p_exp = unclipped_ratio;
-
-    // If observed is at or above expected, this position has same or fewer
-    // clippings than average → definitely not a clipping artifact → keep
-    if p_obs >= p_exp {
-        return (true, String::new());
-    }
-
-    // Observed is below expected - test if SIGNIFICANTLY more clippings
-    // Standard error under null hypothesis
-    let std_err = (p_exp * (1.0 - p_exp) / n as f64).sqrt();
-    if std_err == 0.0 {
-        return (true, String::new()); // Can't compute, keep by default
-    }
-
-    // Z-score: how many std errors below expected?
-    let z = (p_exp - p_obs) / std_err;
-
-    // Critical z-value for one-tailed test
-    let z_critical = if clipping_significance >= 0.10 {
-        1.282 // 90% confidence
-    } else if clipping_significance >= 0.05 {
-        1.645 // 95% confidence
-    } else if clipping_significance >= 0.01 {
-        2.326 // 99% confidence
-    } else {
-        2.576 // 99.5% confidence
-    };
-
-    // If z > z_critical, position has significantly MORE clippings → discard
     if z > z_critical {
-        (false, format!("statistical_test: excess_clippings z={:.2} > z_critical={:.2}", z, z_critical))
+        (false, expected_clippings, format!("excess_clippings: z={:.2} > z_critical={:.2}", z, z_critical))
     } else {
-        (true, String::new()) // Not significantly worse → keep
+        (true, expected_clippings, String::new())
     }
 }
 
-/// Sum clippings within max_distance of a center position.
-/// This ensures that clipping events near a peak are properly associated with it.
-fn sum_clippings_in_range(clippings: &[u64], center_idx: usize, max_distance: i32) -> u64 {
-    let start = center_idx.saturating_sub(max_distance as usize);
-    let end = (center_idx + max_distance as usize + 1).min(clippings.len());
-    clippings[start..end].iter().sum()
-}
-
-/// Filter positions and merge nearby ones into peak areas.
-///
-/// This implements the new flow:
-/// 1. Filter positions: read_starts >= 0.1*coverage_reduced AND read_starts >= min_events
-/// 2. Filter positions: statistical clipping test (with clipping pre-filter)
-/// 3. Merge nearby positions into peak-areas (DTR-aware)
-/// 4. Filter areas: total_spc >= 0.1 * coverage_reduced_mean
-///
-/// Returns (start_areas, end_areas) for classification.
-pub fn filter_and_merge_to_areas(
-    reads_starts: &[u64],
-    reads_ends: &[u64],
-    left_clippings: &[u64],
-    right_clippings: &[u64],
-    coverage_reduced: &[u64],
-    primary_reads: &[u64],
-    unclipped_ratio: f64,
-    _coverage_reduced_mean: f64,
-    config: &PhageTerminiConfig,
+/// Sum pre-filtered clippings within an area and max_distance_peaks of its edges.
+/// Uses simple circular/linear distance - DTR deduplication happens at classification.
+fn sum_prefiltered_clippings_for_area(
+    area: &PeakArea,
+    clippings: &[u64],           // already pre-filtered (zeros = insignificant)
+    max_distance_peaks: i32,
     genome_length: usize,
     circular: bool,
-    dtr_regions: &[DtrRegion],
-) -> (Vec<PeakArea>, Vec<PeakArea>) {
-    let min_events = config.min_events as u64;
-    let max_distance_peaks = config.max_distance_peaks;
-    let clipping_significance = config.clipping_significance;
+) -> u64 {
+    let mut sum = 0u64;
 
-    // Step 1-2: Filter positions for starts
-    let mut filtered_start_positions: Vec<(i32, u64, u64)> = Vec::new(); // (pos, spc, clips)
-    for (idx, &spc) in reads_starts.iter().enumerate() {
-        if spc == 0 {
+    for (idx, &clips) in clippings.iter().enumerate() {
+        if clips == 0 {
             continue;
         }
+
         let pos = (idx + 1) as i32; // 1-indexed
-        let cov = coverage_reduced.get(idx).copied().unwrap_or(0);
-        // Sum clippings within max_distance_peaks of this position
-        let clips = sum_clippings_in_range(left_clippings, idx, max_distance_peaks);
-        let prim = primary_reads.get(idx).copied().unwrap_or(0);
 
-        // Step 1: Local criteria
-        let local_threshold = (cov as f64 * 0.1) as u64;
-        if spc < local_threshold || spc < min_events {
-            continue;
-        }
+        // Check if position is within area bounds
+        let in_area = pos >= area.start_pos && pos <= area.end_pos;
 
-        // Pre-filter clippings: only consider them significant if they meet threshold
-        let effective_clips = if clips >= (prim as f64 * 0.1) as u64 && clips >= min_events {
-            clips
+        // Check if position is within max_distance_peaks of area edges
+        let dist_to_start = if circular {
+            circular_distance(pos, area.start_pos, genome_length)
         } else {
-            0
+            (pos - area.start_pos).abs()
+        };
+        let dist_to_end = if circular {
+            circular_distance(pos, area.end_pos, genome_length)
+        } else {
+            (pos - area.end_pos).abs()
         };
 
-        // Step 2: Statistical test
-        if !is_significant_terminus(spc as u32, effective_clips as u32, unclipped_ratio, clipping_significance) {
-            continue;
-        }
+        let near_area = dist_to_start <= max_distance_peaks || dist_to_end <= max_distance_peaks;
 
-        filtered_start_positions.push((pos, spc, effective_clips));
+        if in_area || near_area {
+            sum += clips;
+        }
     }
 
-    // Step 1-2: Filter positions for ends
-    let mut filtered_end_positions: Vec<(i32, u64, u64)> = Vec::new();
-    for (idx, &spc) in reads_ends.iter().enumerate() {
-        if spc == 0 {
-            continue;
-        }
-        let pos = (idx + 1) as i32;
-        let cov = coverage_reduced.get(idx).copied().unwrap_or(0);
-        // Sum clippings within max_distance_peaks of this position
-        let clips = sum_clippings_in_range(right_clippings, idx, max_distance_peaks);
-        let prim = primary_reads.get(idx).copied().unwrap_or(0);
-
-        let local_threshold = (cov as f64 * 0.1) as u64;
-        if spc < local_threshold || spc < min_events {
-            continue;
-        }
-
-        // Pre-filter clippings
-        let effective_clips = if clips >= (prim as f64 * 0.1) as u64 && clips >= min_events {
-            clips
-        } else {
-            0
-        };
-
-        if !is_significant_terminus(spc as u32, effective_clips as u32, unclipped_ratio, clipping_significance) {
-            continue;
-        }
-
-        filtered_end_positions.push((pos, spc, effective_clips));
-    }
-
-    // Step 3: Merge nearby positions into areas (starts)
-    let start_areas = merge_positions_to_areas(
-        &filtered_start_positions,
-        reads_starts,
-        reads_ends,
-        left_clippings,
-        coverage_reduced,
-        max_distance_peaks,
-        genome_length,
-        circular,
-        dtr_regions,
-    );
-
-    // Step 3: Merge nearby positions into areas (ends)
-    let end_areas = merge_positions_to_areas(
-        &filtered_end_positions,
-        reads_starts,
-        reads_ends,
-        right_clippings,
-        coverage_reduced,
-        max_distance_peaks,
-        genome_length,
-        circular,
-        dtr_regions,
-    );
-
-    (start_areas, end_areas)
+    sum
 }
 
-/// Filter positions and merge nearby ones into peak areas, with diagnostics.
+/// Filter positions and merge nearby ones into peak areas, returning ALL areas with metadata.
 ///
-/// This implements the same flow as filter_and_merge_to_areas but also
-/// collects diagnostic information for each position that passes the first filter.
+/// This implements:
+/// 1. Position Filtering: SPC >= 0.1*coverage_reduced AND SPC >= min_events
+/// 2. Peak Merging: merge nearby positions into areas (DTR-aware)
+/// 3. Clipping Pre-filter: identify significant clipping positions
+/// 4. Area Clipping Aggregation: sum pre-filtered clippings for each area
+/// 5. Statistical Test: filter areas with excess clippings
 ///
-/// Returns (start_areas, end_areas, diagnostics) for classification and CSV export.
+/// Returns ALL areas (both kept and discarded)
+/// Each area has its `kept` field set to indicate whether it passed filtering
+/// Sets filtering metadata on each area (kept, sum_clippings, expected_clippings, clipped_ratio)
 pub fn filter_and_merge_to_areas_with_diagnostics(
     reads_starts: &[u64],
     reads_ends: &[u64],
@@ -445,83 +205,35 @@ pub fn filter_and_merge_to_areas_with_diagnostics(
     right_clippings: &[u64],
     coverage_reduced: &[u64],
     primary_reads: &[u64],
-    unclipped_ratio: f64,
-    _coverage_reduced_mean: f64,
+    clipped_ratio: f64,
     config: &PhageTerminiConfig,
     genome_length: usize,
     circular: bool,
     dtr_regions: &[DtrRegion],
-) -> (Vec<PeakArea>, Vec<PeakArea>, Vec<TerminusDiagnostic>) {
+) -> (Vec<PeakArea>, Vec<PeakArea>) {
     let min_frequency = (config.min_frequency as f64) / 100.0;
     let min_events = config.min_events as u64;
     let max_distance_peaks = config.max_distance_peaks;
     let clipping_significance = config.clipping_significance;
 
-    let mut diagnostics: Vec<TerminusDiagnostic> = Vec::new();
-
-    // Step 1-2: Filter positions for starts (collecting diagnostics)
+    // Step 1: Position Filtering for starts (local criteria only)
     let mut filtered_start_positions: Vec<(i32, u64, u64)> = Vec::new();
     for (idx, &spc) in reads_starts.iter().enumerate() {
         if spc == 0 {
             continue;
         }
-        let pos = (idx + 1) as i32; // 1-indexed
+        let pos = (idx + 1) as i32;
         let cov = coverage_reduced.get(idx).copied().unwrap_or(0);
-        // Sum clippings within max_distance_peaks of this position
-        let clips = sum_clippings_in_range(left_clippings, idx, max_distance_peaks);
-        let prim = primary_reads.get(idx).copied().unwrap_or(0);
 
-        // Step 1: Local criteria (SPC >= 0.1*coverage_reduced AND SPC >= min_events)
         let local_threshold = (cov as f64 * min_frequency) as u64;
         if spc < local_threshold || spc < min_events {
-            continue;  // Does NOT pass first filter, skip entirely
+            continue;
         }
 
-        // Pre-filter clippings: only consider them significant if they meet threshold
-        // This avoids false positives in low-coverage scenarios
-        let effective_clips = if clips >= (prim as f64 * min_frequency) as u64 && clips >= min_events {
-            clips
-        } else {
-            0  // Treat as no clippings - statistical test will auto-pass
-        };
-
-        // Position passes first filter - create diagnostic entry
-        let observed_ratio = if spc + effective_clips > 0 {
-            spc as f64 / (spc + effective_clips) as f64
-        } else {
-            1.0
-        };
-        let tau = if cov > 0 {
-            spc as f64 / cov as f64
-        } else {
-            0.0
-        };
-
-        // Step 2: Statistical test (with reason tracking)
-        let (passes_stat_test, stat_reason) = is_significant_terminus_with_reason(
-            spc as u32, effective_clips as u32, unclipped_ratio, clipping_significance
-        );
-
-        let diag = TerminusDiagnostic {
-            position: pos,
-            terminus_type: "start".to_string(),
-            spc,
-            clippings: clips,  // Report raw clippings in diagnostic
-            observed_ratio,
-            primary_reads: prim,
-            coverage_reduced: cov,
-            tau,
-            kept: passes_stat_test,  // Will be updated after global filter
-            discarded_because: if passes_stat_test { String::new() } else { stat_reason },
-        };
-
-        if passes_stat_test {
-            filtered_start_positions.push((pos, spc, effective_clips));
-        }
-        diagnostics.push(diag);
+        filtered_start_positions.push((pos, spc, 0));
     }
 
-    // Step 1-2: Filter positions for ends (collecting diagnostics)
+    // Step 1: Position Filtering for ends (local criteria only)
     let mut filtered_end_positions: Vec<(i32, u64, u64)> = Vec::new();
     for (idx, &spc) in reads_ends.iter().enumerate() {
         if spc == 0 {
@@ -529,97 +241,155 @@ pub fn filter_and_merge_to_areas_with_diagnostics(
         }
         let pos = (idx + 1) as i32;
         let cov = coverage_reduced.get(idx).copied().unwrap_or(0);
-        // Sum clippings within max_distance_peaks of this position
-        let clips = sum_clippings_in_range(right_clippings, idx, max_distance_peaks);
-        let prim = primary_reads.get(idx).copied().unwrap_or(0);
 
-        let local_threshold = (cov as f64 * 0.1) as u64;
+        let local_threshold = (cov as f64 * min_frequency) as u64;
         if spc < local_threshold || spc < min_events {
-            continue;  // Does NOT pass first filter, skip entirely
+            continue;
         }
 
-        // Pre-filter clippings: only consider them significant if they meet threshold
-        let effective_clips = if clips >= (prim as f64 * 0.1) as u64 && clips >= min_events {
-            clips
-        } else {
-            0  // Treat as no clippings - statistical test will auto-pass
-        };
-
-        // Position passes first filter - create diagnostic entry
-        let observed_ratio = if spc + effective_clips > 0 {
-            spc as f64 / (spc + effective_clips) as f64
-        } else {
-            1.0
-        };
-        let tau = if cov > 0 {
-            spc as f64 / cov as f64
-        } else {
-            0.0
-        };
-
-        let (passes_stat_test, stat_reason) = is_significant_terminus_with_reason(
-            spc as u32, effective_clips as u32, unclipped_ratio, clipping_significance
-        );
-
-        let diag = TerminusDiagnostic {
-            position: pos,
-            terminus_type: "end".to_string(),
-            spc,
-            clippings: clips,  // Report raw clippings in diagnostic
-            observed_ratio,
-            primary_reads: prim,
-            coverage_reduced: cov,
-            tau,
-            kept: passes_stat_test,
-            discarded_because: if passes_stat_test { String::new() } else { stat_reason },
-        };
-
-        if passes_stat_test {
-            filtered_end_positions.push((pos, spc, effective_clips));
-        }
-        diagnostics.push(diag);
+        filtered_end_positions.push((pos, spc, 0));
     }
 
-    // Step 3: Merge nearby positions into areas (starts)
-    let start_areas = merge_positions_to_areas(
+    // Step 2: Peak Merging into areas
+    let mut start_areas = merge_positions_to_areas(
         &filtered_start_positions,
         reads_starts,
         reads_ends,
-        left_clippings,
         coverage_reduced,
         max_distance_peaks,
         genome_length,
         circular,
-        dtr_regions,
     );
 
-    // Step 3: Merge nearby positions into areas (ends)
-    let end_areas = merge_positions_to_areas(
+    let mut end_areas = merge_positions_to_areas(
         &filtered_end_positions,
         reads_starts,
         reads_ends,
-        right_clippings,
         coverage_reduced,
         max_distance_peaks,
         genome_length,
         circular,
-        dtr_regions,
     );
 
-    (start_areas, end_areas, diagnostics)
+    // Step 3: Pre-filter clippings (zero out non-significant positions)
+    let mut left_clippings_filtered: Vec<u64> = left_clippings.to_vec();
+    for (idx, clips) in left_clippings_filtered.iter_mut().enumerate() {
+        if *clips < min_events {
+            *clips = 0;
+            continue;
+        }
+        let prim = primary_reads.get(idx).copied().unwrap_or(0);
+        let threshold = (prim as f64 * min_frequency) as u64;
+        if *clips < threshold {
+            *clips = 0;
+        }
+    }
+
+    let mut right_clippings_filtered: Vec<u64> = right_clippings.to_vec();
+    for (idx, clips) in right_clippings_filtered.iter_mut().enumerate() {
+        if *clips < min_events {
+            *clips = 0;
+            continue;
+        }
+        let prim = primary_reads.get(idx).copied().unwrap_or(0);
+        let threshold = (prim as f64 * min_frequency) as u64;
+        if *clips < threshold {
+            *clips = 0;
+        }
+    }
+
+    // Step 3b: DTR both-copies confirmation
+    // In a doubled assembly with DTRs, boundary clippings are artifacts (reads
+    // can't extend past the contig edge). Real biological clippings appear at
+    // both DTR copies; artifacts appear at only one. Zero any clipping that
+    // lacks a counterpart at the equivalent position in the other copy.
+    for dtr in dtr_regions {
+        if !dtr.is_direct {
+            continue; // Only DTR, not ITR
+        }
+
+        let gl = genome_length as i32;
+
+        // Snapshot to avoid cascade: zeroing copy A shouldn't cause copy B
+        // to fail the check too.
+        let left_snapshot = left_clippings_filtered.clone();
+        let right_snapshot = right_clippings_filtered.clone();
+
+        // Check first region against second
+        for p in dtr.first_start..=dtr.first_end {
+            let q = dtr.second_start + (p - dtr.first_start);
+            if q < 1 || q > gl { continue; }
+            let pi = (p - 1) as usize;
+            let qi = (q - 1) as usize;
+            if left_snapshot[pi] > 0 && left_snapshot[qi] == 0 {
+                left_clippings_filtered[pi] = 0;
+            }
+            if right_snapshot[pi] > 0 && right_snapshot[qi] == 0 {
+                right_clippings_filtered[pi] = 0;
+            }
+        }
+
+        // Check second region against first
+        for p in dtr.second_start..=dtr.second_end {
+            let q = dtr.first_start + (p - dtr.second_start);
+            if q < 1 || q > gl { continue; }
+            let pi = (p - 1) as usize;
+            let qi = (q - 1) as usize;
+            if left_snapshot[pi] > 0 && left_snapshot[qi] == 0 {
+                left_clippings_filtered[pi] = 0;
+            }
+            if right_snapshot[pi] > 0 && right_snapshot[qi] == 0 {
+                right_clippings_filtered[pi] = 0;
+            }
+        }
+    }
+
+    // Step 4-5: Area Left Clipping Aggregation + Statistical Test for starts
+    // Update each area with filtering metadata and kept status
+    for area in &mut start_areas {
+        let sum_clips = sum_prefiltered_clippings_for_area(
+            area, &left_clippings_filtered,
+            max_distance_peaks, genome_length, circular
+        );
+        let (passes, expected_clippings, _reason) = is_area_clipping_acceptable_with_reason(
+            area.total_spc as u64, sum_clips, clipped_ratio, clipping_significance
+        );
+
+        area.sum_clippings = sum_clips;
+        area.clipped_ratio = clipped_ratio;
+        area.expected_clippings = expected_clippings;
+        area.kept = passes;
+    }
+
+    // Step 4-5: Area Right Clipping Aggregation + Statistical Test for ends
+    for area in &mut end_areas {
+        let sum_clips = sum_prefiltered_clippings_for_area(
+            area, &right_clippings_filtered,
+            max_distance_peaks, genome_length, circular
+        );
+        let (passes, expected_clippings, _reason) = is_area_clipping_acceptable_with_reason(
+            area.total_spc as u64, sum_clips, clipped_ratio, clipping_significance
+        );
+
+        area.sum_clippings = sum_clips;
+        area.clipped_ratio = clipped_ratio;
+        area.expected_clippings = expected_clippings;
+        area.kept = passes;
+    }
+
+    (start_areas, end_areas)
 }
 
-/// Merge filtered positions into peak areas based on proximity (DTR-aware).
+/// Merge filtered positions into peak areas based on proximity.
+/// Uses simple distance - DTR deduplication happens at classification time.
 fn merge_positions_to_areas(
     filtered_positions: &[(i32, u64, u64)], // (pos, spc, clips)
     reads_starts: &[u64],
     reads_ends: &[u64],
-    _clippings: &[u64], // Not used directly - clips are in filtered_positions tuple
     coverage_reduced: &[u64],
     max_distance_peaks: i32,
     genome_length: usize,
     circular: bool,
-    dtr_regions: &[DtrRegion],
 ) -> Vec<PeakArea> {
     if filtered_positions.is_empty() {
         return Vec::new();
@@ -639,22 +409,21 @@ fn merge_positions_to_areas(
     let mut current_max_spc = first_spc;
     let mut current_total_spc = first_spc;
     let mut current_total_clips = first_clips;
+    let mut current_number_peaks: u32 = 1; // Count of positions merged
 
     for &(pos, spc, clips) in positions.iter().skip(1) {
-        let dist = dtr_aware_distance(
-            current_end,
-            pos,
-            genome_length,
-            circular,
-            dtr_regions,
-            max_distance_peaks,
-        );
+        let dist = if circular {
+            circular_distance(current_end, pos, genome_length)
+        } else {
+            (current_end - pos).abs()
+        };
 
         if dist <= max_distance_peaks {
             // Extend current area
             current_end = pos;
             current_total_spc += spc;
             current_total_clips += clips;
+            current_number_peaks += 1;
             if spc > current_max_spc {
                 current_max_spc = spc;
                 current_center = pos;
@@ -671,6 +440,7 @@ fn merge_positions_to_areas(
                 0.0
             };
 
+            // Store original positions - DTR deduplication happens at classification
             areas.push(PeakArea {
                 start_pos: current_start,
                 end_pos: current_end,
@@ -679,6 +449,11 @@ fn merge_positions_to_areas(
                 total_clips: current_total_clips as u32,
                 coverage: cov,
                 tau,
+                number_peaks: current_number_peaks,
+                sum_clippings: 0,      // Will be set later in filter step
+                kept: true,            // Will be set later in filter step
+                clipped_ratio: 0.0,    // Will be set later in filter step
+                expected_clippings: 0.0, // Will be set later in filter step
             });
 
             // Start new area
@@ -688,6 +463,7 @@ fn merge_positions_to_areas(
             current_max_spc = spc;
             current_total_spc = spc;
             current_total_clips = clips;
+            current_number_peaks = 1;
         }
     }
 
@@ -702,6 +478,7 @@ fn merge_positions_to_areas(
         0.0
     };
 
+    // Store original positions - DTR deduplication happens at classification
     areas.push(PeakArea {
         start_pos: current_start,
         end_pos: current_end,
@@ -710,6 +487,11 @@ fn merge_positions_to_areas(
         total_clips: current_total_clips as u32,
         coverage: cov,
         tau,
+        number_peaks: current_number_peaks,
+        sum_clippings: 0,      // Will be set later in filter step
+        kept: true,            // Will be set later in filter step
+        clipped_ratio: 0.0,    // Will be set later in filter step
+        expected_clippings: 0.0, // Will be set later in filter step
     });
 
     // Handle circular wrap-around merge
@@ -722,6 +504,7 @@ fn merge_positions_to_areas(
         let first_coverage = areas[0].coverage;
         let first_tau = areas[0].tau;
         let first_start_pos = areas[0].start_pos;
+        let first_number_peaks = areas[0].number_peaks;
 
         let last_idx = areas.len() - 1;
         let last_end_pos = areas[last_idx].end_pos;
@@ -731,20 +514,15 @@ fn merge_positions_to_areas(
         let last_coverage = areas[last_idx].coverage;
         let last_tau = areas[last_idx].tau;
         let last_start_pos = areas[last_idx].start_pos;
+        let last_number_peaks = areas[last_idx].number_peaks;
 
-        let wrap_dist = dtr_aware_distance(
-            last_end_pos,
-            first_start_pos,
-            genome_length,
-            circular,
-            dtr_regions,
-            max_distance_peaks,
-        );
+        let wrap_dist = circular_distance(last_end_pos, first_start_pos, genome_length);
 
         if wrap_dist <= max_distance_peaks {
             // Merge first and last areas
             let merged_total_spc = first_total_spc + last_total_spc;
             let merged_total_clips = first_total_clips + last_total_clips;
+            let merged_number_peaks = first_number_peaks + last_number_peaks;
             let (merged_center, merged_cov, merged_tau) = if first_total_spc >= last_total_spc {
                 (first_center_pos, first_coverage, first_tau)
             } else {
@@ -754,15 +532,20 @@ fn merge_positions_to_areas(
             // Remove last area
             areas.pop();
 
-            // Update first area to include merged data
+            // Store original positions - wrap around: start from last area
             areas[0] = PeakArea {
-                start_pos: last_start_pos, // Wrap around: start from last area
+                start_pos: last_start_pos,
                 end_pos: first_end_pos,
                 center_pos: merged_center,
                 total_spc: merged_total_spc,
                 total_clips: merged_total_clips,
                 coverage: merged_cov,
                 tau: merged_tau,
+                number_peaks: merged_number_peaks,
+                sum_clippings: 0,
+                kept: true,
+                clipped_ratio: 0.0,
+                expected_clippings: 0.0,
             };
         }
     }
@@ -812,85 +595,6 @@ fn translate_to_first_dtr_region(pos: i32, dtr_regions: &[DtrRegion]) -> i32 {
     pos
 }
 
-/// Deduplicate peaks that are DTR-equivalent and determine duplication status.
-/// Groups peaks by equivalence and keeps the canonical (first region) position.
-/// Only applies to DTR (direct repeats), not ITR (inverted repeats).
-///
-/// Returns (unique_peaks, duplication_status):
-/// - unique_peaks: peaks with positions translated to first region
-/// - duplication_status: Some(true) if all in DTR, Some(false) if all in ITR, None otherwise
-fn deduplicate_dtr_equivalent(peaks: &[Peak], dtr_regions: &[DtrRegion]) -> (Vec<Peak>, Option<bool>) {
-    if peaks.is_empty() {
-        return (Vec::new(), None);
-    }
-
-    if dtr_regions.is_empty() {
-        return (peaks.to_vec(), None);
-    }
-
-    let mut unique: Vec<Peak> = Vec::new();
-    let mut all_in_dtr = true;
-    let mut all_in_itr = true;
-    let mut any_in_repeat = false;
-
-    for peak in peaks {
-        let pos = peak.position;
-
-        // Check which region type this peak is in
-        let mut in_dtr = false;
-        let mut in_itr = false;
-
-        for dtr in dtr_regions {
-            let in_first = pos >= dtr.first_start && pos <= dtr.first_end;
-            let in_second = pos >= dtr.second_start && pos <= dtr.second_end;
-
-            if in_first || in_second {
-                any_in_repeat = true;
-                if dtr.is_direct {
-                    in_dtr = true;
-                } else {
-                    in_itr = true;
-                }
-            }
-        }
-
-        if !in_dtr {
-            all_in_dtr = false;
-        }
-        if !in_itr {
-            all_in_itr = false;
-        }
-
-        // Translate to canonical (first region) position - only for DTR
-        let canonical_pos = translate_to_first_dtr_region(pos, dtr_regions);
-
-        // Check if this canonical position already exists
-        let is_duplicate = unique.iter().any(|existing| {
-            existing.position == canonical_pos
-        });
-
-        if !is_duplicate {
-            unique.push(Peak {
-                position: canonical_pos,
-                value: peak.value,
-            });
-        }
-    }
-
-    // Determine duplication status
-    let status = if !any_in_repeat {
-        None
-    } else if all_in_dtr && !all_in_itr {
-        Some(true)  // All in DTR
-    } else if all_in_itr && !all_in_dtr {
-        Some(false) // All in ITR
-    } else {
-        None // Mixed or unclear
-    };
-
-    (unique, status)
-}
-
 /// Check if positions are in ITR regions: one in first, other in second.
 /// Returns Some(repeat_size) if this is an ITR configuration, None otherwise.
 fn check_itr_configuration(pos1: i32, pos2: i32, dtr_regions: &[DtrRegion]) -> Option<i32> {
@@ -931,140 +635,6 @@ fn combine_duplication_status(
         (_, s, false, true) => s,
         // Mixed or no peaks
         _ => None,
-    }
-}
-
-/// Classify phage packaging mechanism based on peak configuration.
-/// Returns (mechanism, left_termini, right_termini, duplication_status).
-///
-/// DTR equivalence is handled here: peaks from both DTR regions are received,
-/// and we deduplicate equivalent peaks to determine the "real" peak count
-/// for classification. Termini positions are returned as-is (no expansion).
-pub fn classify_packaging(
-    start_peaks: &[Peak],
-    end_peaks: &[Peak],
-    genome_length: usize,
-    circular: bool,
-    dtr_regions: &[DtrRegion],
-) -> (String, Vec<i32>, Vec<i32>, Option<bool>) {
-    // Deduplicate DTR-equivalent peaks and get duplication status
-    let (unique_starts, starts_status) = deduplicate_dtr_equivalent(start_peaks, dtr_regions);
-    let (unique_ends, ends_status) = deduplicate_dtr_equivalent(end_peaks, dtr_regions);
-
-    // Use unique counts for classification logic
-    match (unique_starts.len(), unique_ends.len()) {
-        (0, 0) => ("No_packaging".to_string(), vec![], vec![], None),
-
-        (1, 0) => {
-            // Only start peak - PAC
-            // Return all original positions (not deduplicated)
-            let left: Vec<i32> = start_peaks.iter().map(|p| p.position).collect();
-            ("PAC".to_string(), left, vec![], starts_status)
-        }
-
-        (0, 1) => {
-            // Only end peak - PAC
-            let right: Vec<i32> = end_peaks.iter().map(|p| p.position).collect();
-            ("PAC".to_string(), vec![], right, ends_status)
-        }
-
-        (1, 1) => {
-            // Two unique peaks - classify based on distance and order
-            // Use the first unique peak positions for classification
-            let start_pos = unique_starts[0].position;
-            let end_pos = unique_ends[0].position;
-
-            // Calculate actual genomic distance (shortest path in circular)
-            let distance = if circular {
-                circular_distance(start_pos, end_pos, genome_length)
-            } else {
-                (start_pos - end_pos).abs()
-            };
-
-            let genome_10pct = (genome_length as f64 * 0.1) as i32;
-
-            // Determine order: which comes first going forward (clockwise in circular)
-            // For linear: simply check positions
-            // For circular: check which direction is shorter to go from start to end
-            let end_before_start = if circular {
-                // Calculate forward distance from start to end
-                let gl = genome_length as i32;
-                let forward_dist = if end_pos >= start_pos {
-                    end_pos - start_pos
-                } else {
-                    (gl - start_pos) + end_pos
-                };
-                // If forward distance equals circular_distance, end is ahead
-                // If they're different, end is behind (going backward is shorter)
-                forward_dist != distance
-            } else {
-                end_pos < start_pos
-            };
-
-            // Check for ITR configuration: COS-like peaks in ITR regions
-            // For ITR, we use the repeat size from autoblast, not the peak distance
-            let itr_config = if distance <= 20 {
-                check_itr_configuration(start_pos, end_pos, dtr_regions)
-            } else {
-                None
-            };
-
-            // Determine suffix and position ordering based on directionality
-            let suffix = if end_before_start { "_3'" } else { "_5'" };
-            let (_left_pos, _right_pos) = if end_before_start {
-                (end_pos, start_pos)
-            } else {
-                (start_pos, end_pos)
-            };
-
-            let mechanism = if let Some(repeat_size) = itr_config {
-                // ITR detected - classify based on repeat size from autoblast
-                if repeat_size <= 1000 {
-                    format!("ITR_short{}", suffix)
-                } else if repeat_size <= genome_10pct {
-                    format!("ITR_long{}", suffix)
-                } else {
-                    format!("ITR_outlier{}", suffix)
-                }
-            } else if distance < 2 {
-                // Very close - cohesive ends (no suffix)
-                "COS".to_string()
-            } else if distance <= 20 {
-                // Close cohesive ends with directionality
-                format!("COS{}", suffix)
-            } else if distance <= 1000 {
-                // Short direct terminal repeats
-                format!("DTR_short{}", suffix)
-            } else if distance <= genome_10pct {
-                // Long direct terminal repeats
-                format!("DTR_long{}", suffix)
-            } else {
-                // Very distant - outlier
-                format!("DTR_outlier{}", suffix)
-            };
-
-            // Return all original positions (not just deduplicated ones)
-            let mut left: Vec<i32> = start_peaks.iter().map(|p| p.position).collect();
-            let mut right: Vec<i32> = end_peaks.iter().map(|p| p.position).collect();
-            left.sort();
-            right.sort();
-            let dup_status = combine_duplication_status(starts_status, ends_status, true, true);
-            (mechanism, left, right, dup_status)
-        }
-
-        _ => {
-            // Multiple unique peaks - Unknown_packaging
-            // Return all original positions
-            let mut left_termini: Vec<i32> = start_peaks.iter().map(|p| p.position).collect();
-            let mut right_termini: Vec<i32> = end_peaks.iter().map(|p| p.position).collect();
-
-            // Sort for consistent output
-            left_termini.sort();
-            right_termini.sort();
-
-            let dup_status = combine_duplication_status(starts_status, ends_status, !unique_starts.is_empty(), !unique_ends.is_empty());
-            ("Unknown_packaging".to_string(), left_termini, right_termini, dup_status)
-        }
     }
 }
 
@@ -1156,42 +726,49 @@ fn peak_area_to_terminus_area(area: &PeakArea) -> TerminusArea {
         total_spc: area.total_spc,
         coverage: area.coverage,
         tau: area.tau,
+        number_peaks: area.number_peaks,
+        kept: area.kept,
+        sum_clippings: area.sum_clippings,
+        clipped_ratio: area.clipped_ratio,
+        expected_clippings: area.expected_clippings,
     }
 }
 
 /// Classify phage packaging mechanism based on peak areas.
-/// Returns (mechanism, left_termini, right_termini, duplication_status).
+/// Returns (mechanism, all_left_termini, all_right_termini, duplication_status, repeat_length).
 ///
-/// This is the new area-based version of classify_packaging.
 /// DTR equivalence is handled here: areas from both DTR regions are received,
 /// and we deduplicate equivalent areas to determine the "real" area count
 /// for classification.
+///
+/// Classification uses only KEPT areas (those that passed filtering),
+/// but ALL areas (kept and discarded) are returned for database storage.
+///
+/// `repeat_length` is the distance between start and end peak centers when there is
+/// exactly 1 unique start and 1 unique end area, None otherwise.
 pub fn classify_packaging_areas(
     start_areas: &[PeakArea],
     end_areas: &[PeakArea],
     genome_length: usize,
     circular: bool,
     dtr_regions: &[DtrRegion],
-) -> (String, Vec<TerminusArea>, Vec<TerminusArea>, Option<bool>) {
-    // Deduplicate DTR-equivalent areas and get duplication status
-    let (unique_starts, starts_status) = deduplicate_dtr_equivalent_areas(start_areas, dtr_regions);
-    let (unique_ends, ends_status) = deduplicate_dtr_equivalent_areas(end_areas, dtr_regions);
+) -> (String, Vec<TerminusArea>, Vec<TerminusArea>, Option<bool>, Option<i32>) {
+    // Filter to only kept areas for classification
+    let kept_start_areas: Vec<&PeakArea> = start_areas.iter().filter(|a| a.kept).collect();
+    let kept_end_areas: Vec<&PeakArea> = end_areas.iter().filter(|a| a.kept).collect();
 
-    // Use unique counts for classification logic
-    match (unique_starts.len(), unique_ends.len()) {
-        (0, 0) => ("No_packaging".to_string(), vec![], vec![], None),
+    // Deduplicate DTR-equivalent areas from KEPT areas only
+    let kept_start_clones: Vec<PeakArea> = kept_start_areas.iter().map(|&a| a.clone()).collect();
+    let kept_end_clones: Vec<PeakArea> = kept_end_areas.iter().map(|&a| a.clone()).collect();
+    let (unique_starts, starts_status) = deduplicate_dtr_equivalent_areas(&kept_start_clones, dtr_regions);
+    let (unique_ends, ends_status) = deduplicate_dtr_equivalent_areas(&kept_end_clones, dtr_regions);
 
-        (1, 0) => {
-            // Only start area - PAC
-            let left: Vec<TerminusArea> = start_areas.iter().map(peak_area_to_terminus_area).collect();
-            ("PAC".to_string(), left, vec![], starts_status)
-        }
+    // Use unique counts from KEPT areas for classification logic
+    let mut repeat_length: Option<i32> = None;
+    let mechanism = match (unique_starts.len(), unique_ends.len()) {
+        (0, 0) => "No_packaging".to_string(),
 
-        (0, 1) => {
-            // Only end area - PAC
-            let right: Vec<TerminusArea> = end_areas.iter().map(peak_area_to_terminus_area).collect();
-            ("PAC".to_string(), vec![], right, ends_status)
-        }
+        (1, 0) | (0, 1) => "PAC".to_string(),
 
         (1, 1) => {
             // Two unique areas - classify based on distance and order
@@ -1205,6 +782,9 @@ pub fn classify_packaging_areas(
             } else {
                 (start_pos - end_pos).abs()
             };
+
+            // Store repeat_length as the distance between start and end peak centers
+            repeat_length = Some(distance);
 
             let genome_10pct = (genome_length as f64 * 0.1) as i32;
 
@@ -1230,7 +810,7 @@ pub fn classify_packaging_areas(
 
             let suffix = if end_before_start { "_3'" } else { "_5'" };
 
-            let mechanism = if let Some(repeat_size) = itr_config {
+            if let Some(repeat_size) = itr_config {
                 if repeat_size <= 1000 {
                     format!("ITR_short{}", suffix)
                 } else if repeat_size <= genome_10pct {
@@ -1248,23 +828,17 @@ pub fn classify_packaging_areas(
                 format!("DTR_long{}", suffix)
             } else {
                 format!("DTR_outlier{}", suffix)
-            };
-
-            // Return all original areas (not just deduplicated ones)
-            let left: Vec<TerminusArea> = start_areas.iter().map(peak_area_to_terminus_area).collect();
-            let right: Vec<TerminusArea> = end_areas.iter().map(peak_area_to_terminus_area).collect();
-            let dup_status = combine_duplication_status(starts_status, ends_status, true, true);
-            (mechanism, left, right, dup_status)
+            }
         }
 
-        _ => {
-            // Multiple unique areas - Unknown_packaging
-            let left_termini: Vec<TerminusArea> = start_areas.iter().map(peak_area_to_terminus_area).collect();
-            let right_termini: Vec<TerminusArea> = end_areas.iter().map(peak_area_to_terminus_area).collect();
+        _ => "Unknown_packaging".to_string(),
+    };
 
-            let dup_status = combine_duplication_status(starts_status, ends_status, !unique_starts.is_empty(), !unique_ends.is_empty());
-            ("Unknown_packaging".to_string(), left_termini, right_termini, dup_status)
-        }
-    }
+    // Return ALL areas (both kept and discarded) for database storage
+    let all_left: Vec<TerminusArea> = start_areas.iter().map(peak_area_to_terminus_area).collect();
+    let all_right: Vec<TerminusArea> = end_areas.iter().map(peak_area_to_terminus_area).collect();
+    let dup_status = combine_duplication_status(starts_status, ends_status, !unique_starts.is_empty(), !unique_ends.is_empty());
+
+    (mechanism, all_left, all_right, dup_status, repeat_length)
 }
 

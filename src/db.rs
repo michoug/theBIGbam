@@ -182,19 +182,35 @@ impl DbWriter {
 
         for pkg in packaging {
             if let Some(&contig_id) = self.contig_name_to_id.get(&pkg.contig_name) {
+                // Collect kept terminus center positions for terminase distance calculation
+                let kept_terminus_positions: Vec<i32> = pkg.left_termini.iter()
+                    .chain(pkg.right_termini.iter())
+                    .filter(|t| t.kept)
+                    .map(|t| t.center_pos)
+                    .collect();
+
+                // Calculate terminase_distance: minimal distance from any kept terminus
+                // center to any terminase gene annotation
+                let terminase_distance = calculate_terminase_distance(
+                    conn, contig_id, &kept_terminus_positions,
+                );
+
                 // Insert into PhageMechanisms
                 mechanism_appender.append_row(params![
                     packaging_id,
                     contig_id,
                     sample_id,
                     &pkg.mechanism,
-                    pkg.duplication
+                    pkg.duplication,
+                    pkg.repeat_length,
+                    terminase_distance
                 ])?;
 
                 // Insert left termini (status = "start")
                 for terminus in &pkg.left_termini {
                     // Store tau as integer (×100)
                     let tau_int = (terminus.tau * 100.0).round() as i32;
+                    let kept_str = if terminus.kept { "yes" } else { "no" };
                     termini_appender.append_row(params![
                         terminus_id,
                         packaging_id,
@@ -204,7 +220,12 @@ impl DbWriter {
                         "start",
                         terminus.total_spc as i32,
                         terminus.coverage as i32,
-                        tau_int
+                        tau_int,
+                        terminus.number_peaks as i32,
+                        kept_str,
+                        terminus.sum_clippings as i64,
+                        (terminus.clipped_ratio * 100.0).round() as i32,
+                        terminus.expected_clippings.round() as i64
                     ])?;
                     terminus_id += 1;
                 }
@@ -212,6 +233,7 @@ impl DbWriter {
                 // Insert right termini (status = "end")
                 for terminus in &pkg.right_termini {
                     let tau_int = (terminus.tau * 100.0).round() as i32;
+                    let kept_str = if terminus.kept { "yes" } else { "no" };
                     termini_appender.append_row(params![
                         terminus_id,
                         packaging_id,
@@ -221,7 +243,12 @@ impl DbWriter {
                         "end",
                         terminus.total_spc as i32,
                         terminus.coverage as i32,
-                        tau_int
+                        tau_int,
+                        terminus.number_peaks as i32,
+                        kept_str,
+                        terminus.sum_clippings as i64,
+                        (terminus.clipped_ratio * 100.0).round() as i32,
+                        terminus.expected_clippings.round() as i64
                     ])?;
                     terminus_id += 1;
                 }
@@ -619,6 +646,54 @@ impl DbWriter {
     }
 }
 
+/// Calculate the minimal distance between any kept terminus center position
+/// and any terminase gene annotation for a given contig.
+/// Returns None if no terminase genes are found or no terminus positions are provided.
+fn calculate_terminase_distance(
+    conn: &Connection,
+    contig_id: i64,
+    terminus_positions: &[i32],
+) -> Option<i32> {
+    if terminus_positions.is_empty() {
+        return None;
+    }
+
+    // Query terminase gene annotations for this contig
+    let mut stmt = conn.prepare(
+        "SELECT \"Start\", \"End\" FROM Contig_annotation WHERE Contig_id = ? AND Product LIKE '%terminase%'"
+    ).ok()?;
+
+    let terminase_genes: Vec<(i32, i32)> = stmt
+        .query_map(params![contig_id], |row| {
+            Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?))
+        })
+        .ok()?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if terminase_genes.is_empty() {
+        return None;
+    }
+
+    // Calculate minimum distance from any terminus to any terminase gene edge
+    let mut min_dist = i32::MAX;
+    for &term_pos in terminus_positions {
+        for &(gene_start, gene_end) in &terminase_genes {
+            // Distance to nearest edge of the gene
+            let dist = if term_pos < gene_start {
+                gene_start - term_pos
+            } else if term_pos > gene_end {
+                term_pos - gene_end
+            } else {
+                0 // terminus is within the gene
+            };
+            min_dist = min_dist.min(dist);
+        }
+    }
+
+    Some(min_dist)
+}
+
 /// Create core database tables (no indexes - DuckDB uses zone maps).
 fn create_core_tables(conn: &Connection) -> Result<()> {
     conn.execute(
@@ -672,7 +747,9 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             Contig_id INTEGER NOT NULL,
             Sample_id INTEGER NOT NULL,
             Packaging_mechanism TEXT NOT NULL,
-            Duplication BOOLEAN
+            Duplication BOOLEAN,
+            Repeat_length INTEGER,
+            Terminase_distance INTEGER
         )",
         [],
     )
@@ -680,6 +757,7 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
 
     // PhageTermini table - stores individual terminus areas with full metadata
     // One row per terminus area, linked to PhageMechanisms via Packaging_id
+    // Includes filtering diagnostics: NumberPeaks, Kept, Clippings, Clipping_excess, Max_clippings_allowed
     conn.execute(
         "CREATE TABLE PhageTermini (
             Terminus_id INTEGER PRIMARY KEY,
@@ -690,7 +768,12 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             Status TEXT NOT NULL,
             SPC INTEGER NOT NULL,
             Coverage INTEGER NOT NULL,
-            Tau INTEGER NOT NULL
+            Tau INTEGER NOT NULL,
+            NumberPeaks INTEGER NOT NULL,
+            Kept TEXT NOT NULL,
+            Clippings INTEGER NOT NULL,
+            Clipping_excess INTEGER NOT NULL,
+            Max_clippings_allowed INTEGER NOT NULL
         )",
         [],
     )
@@ -1240,6 +1323,7 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
     .context("Failed to create Explicit_completeness VIEW")?;
 
     // Explicit_phage_mechanisms VIEW - backwards compatible with comma-separated termini
+    // Includes aggregated diagnostics columns from PhageTermini
     conn.execute(
         "CREATE VIEW Explicit_phage_mechanisms AS
          SELECT
@@ -1249,18 +1333,29 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
              COALESCE(
                  (SELECT STRING_AGG(CAST(pt.Center AS VARCHAR), ',' ORDER BY pt.Center)
                   FROM PhageTermini pt
-                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Status = 'start'),
+                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Status = 'start' AND pt.Kept = 'yes'),
                  ''
              ) AS Left_termini,
              COALESCE(
                  (SELECT STRING_AGG(CAST(pt.Center AS VARCHAR), ',' ORDER BY pt.Center)
                   FROM PhageTermini pt
-                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Status = 'end'),
+                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Status = 'end' AND pt.Kept = 'yes'),
                  ''
              ) AS Right_termini,
              CASE WHEN m.Duplication = true THEN 'DTR'
                   WHEN m.Duplication = false THEN 'ITR'
-                  ELSE NULL END AS Duplication
+                  ELSE NULL END AS Duplication,
+             COALESCE(
+                 (SELECT COUNT(*)
+                  FROM PhageTermini pt
+                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Kept = 'yes'),
+                 0
+             ) AS Total_peaks,
+             m.Repeat_length,
+             m.Terminase_distance,
+             CASE WHEN m.Terminase_distance IS NOT NULL AND c.Contig_length > 0
+                  THEN CAST(ROUND(CAST(m.Terminase_distance AS REAL) / c.Contig_length * 100) AS INTEGER)
+                  ELSE NULL END AS Terminase_percentage
          FROM Presences p
          JOIN Contig c ON p.Contig_id = c.Contig_id
          JOIN Sample s ON p.Sample_id = s.Sample_id
@@ -1268,6 +1363,40 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
         [],
     )
     .context("Failed to create Explicit_phage_mechanisms VIEW")?;
+
+    // Explicit_phage_termini VIEW
+    conn.execute_batch(
+        "CREATE VIEW Explicit_phage_termini AS
+         SELECT
+             c.Contig_name,
+             s.Sample_name,
+             m.Packaging_mechanism,
+             CASE WHEN m.Duplication = true THEN 'DTR'
+                  WHEN m.Duplication = false THEN 'ITR'
+                  ELSE NULL END AS Duplication,
+             m.Repeat_length,
+             m.Terminase_distance,
+             CASE WHEN m.Terminase_distance IS NOT NULL AND c.Contig_length > 0
+                  THEN CAST(ROUND(CAST(m.Terminase_distance AS REAL) / c.Contig_length * 100) AS INTEGER)
+                  ELSE NULL END AS Terminase_percentage,
+             t.\"Start\",
+             t.\"End\",
+             t.Center,
+             t.Status,
+             t.SPC,
+             t.Coverage,
+             t.Tau,
+             t.NumberPeaks,
+             t.Kept,
+             t.Clippings,
+             t.Clipping_excess,
+             t.Max_clippings_allowed
+         FROM PhageTermini t
+         JOIN PhageMechanisms m ON t.Packaging_id = m.Packaging_id
+         JOIN Contig c ON m.Contig_id = c.Contig_id
+         JOIN Sample s ON m.Sample_id = s.Sample_id",
+    )
+    .context("Failed to create Explicit_phage_termini VIEW")?;
 
     Ok(())
 }
