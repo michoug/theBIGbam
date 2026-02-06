@@ -65,8 +65,7 @@ sbatch -q serial -N 1 -n 1 -c 12 -t 20:00:00 --wrap="emapper.py --cpu 12 -i cont
 sbatch -q serial -N 1 -n 1 -c 8 -t 48:00:00 --wrap="thebigbam run-pipeline \
   -t 8 --read1 /work/river/ICEBIO/Hannes/Hydrurus.fastq.gz \
   -a /work/river/MGFeatureViewer/polished.assembly.fasta.gz \
-  -m coverage,assemblycheck \
-  -s short \
+  -s long \
   --annotation_tool pharokka \
   --annotation_db ${DB_DIR} \
   -o examples/outputs/HK97/pipeline_single_sample

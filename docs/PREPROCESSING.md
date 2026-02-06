@@ -15,7 +15,7 @@ Only read1 is required.
 Example of csv file (available in examples/inputs/HK97/mapping_rows.csv):
 
 ```
-examples/inputs/HK97/HK97_R1_illumina.fastq.gz,examples/inputs/HK97/HK97_R2_illumina.fastq.gz,short,examples/inputs/HK97/HK97_GCF_000848825.1.fasta
+examples/inputs/HK97/HK97_R1_illumina.fastq.gz,examples/inputs/HK97/HK97_R2_illumina.fastq.gz,paired-short,examples/inputs/HK97/HK97_GCF_000848825.1.fasta
 examples/inputs/HK97/HK97_nanopore.fastq.gz,,long,examples/inputs/HK97/HK97_GCF_000848825.1.fasta
 ```
 
@@ -27,7 +27,7 @@ Examples of commands to map a single sample or several:
 
 ```sh
 DIR="examples/inputs/HK97"
-thebigbam mapping-per-sample -s "short" -r1 "${DIR}/HK97_R1_illumina.fastq.gz" -r2 "${DIR}/HK97_R2_illumina.fastq.gz" -a "${DIR}/HK97_GCF_000848825.1.fasta" -o "${DIR}/HK97_GCF_000848825.1_with_MD.bam" --circular
+thebigbam mapping-per-sample -s "paired-short" -r1 "${DIR}/HK97_R1_illumina.fastq.gz" -r2 "${DIR}/HK97_R2_illumina.fastq.gz" -a "${DIR}/HK97_GCF_000848825.1.fasta" -o "${DIR}/HK97_GCF_000848825.1_with_MD.bam" --circular
 
 thebigbam mapping-all-samples --csv "${DIR}/mapping_rows.csv" -o "${DIR}/bams" --circular
 ```
@@ -70,20 +70,19 @@ thebigbam run-pipeline \
   --read1 "${DIR}/HK97_R1_illumina.fastq.gz" \
   --read2 "${DIR}/HK97_R2_illumina.fastq.gz" \
   -a "${DIR}/HK97_GCF_000848825.1.fasta" \
-  -s short \
+  -s paired-short \
   --annotation_tool pharokka \
   --annotation_db ${DB_DIR} \
-  -m coverage \
+  -m Coverage \
   -o examples/outputs/HK97/pipeline_single_sample
 
 # Multi-sample pipeline
 thebigbam run-pipeline \
   --csv "${DIR}/mapping_rows.csv" \
   -a "${DIR}/HK97_GCF_000848825.1.fasta" \
-  -s short \
+  -s paired-short \
   --annotation_tool pharokka \
   --annotation_db ${DB_DIR} \
-  -m coverage,phagetermini,assemblycheck \
   --circular \
   -o examples/outputs/HK97/pipeline_multi_sample
 ```
