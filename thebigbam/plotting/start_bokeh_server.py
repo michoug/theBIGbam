@@ -770,12 +770,14 @@ def create_layout(db_path):
                 main_placeholder.objects = [pn.pane.HTML(f"<pre>Error: Invalid position range - positions must satisfy 0 ≤ start &lt; end ≤ {contig_length}.</pre>")]
                 return
 
-            # Check whether to plot sequence (checkbox checked + region <= 1000 bp)
+            # Check whether to plot sequence (checkbox checked)
             plot_sequence = (
                 sequence_cbg is not None
                 and 0 in sequence_cbg.active
-                and (xend - xstart) <= 1000
             )
+
+            # Check whether to use same y scale for all subplots
+            same_y_scale = (0 in same_y_scale_cbg.active)
 
             # Check whether to preserve x-range from previous plot
             preserve_xrange = (
@@ -821,7 +823,7 @@ def create_layout(db_path):
                     filtered_samples = [s for s in filtered_samples if s in allowed_samples]
 
                 print(f"[start_bokeh_server] Generating plot for all samples with variable={selected_var}, contig={contig}, genome_features={genome_features}, filtered_samples={len(filtered_samples)}")
-                grid = generate_bokeh_plot_all_samples(conn, selected_var, contig, xstart=xstart, xend=xend, genbank_path=genbank_path, genome_features=genome_features if genome_features else None, allowed_samples=set(filtered_samples), feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_sequence=plot_sequence)
+                grid = generate_bokeh_plot_all_samples(conn, selected_var, contig, xstart=xstart, xend=xend, genbank_path=genbank_path, genome_features=genome_features if genome_features else None, allowed_samples=set(filtered_samples), feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_sequence=plot_sequence, same_y_scale=same_y_scale)
             else:
                 # One-sample view: collect possibly-many requested features and call per-sample plot
                 requested_features = []
@@ -837,7 +839,7 @@ def create_layout(db_path):
                         requested_features.append(cbg.labels[idx])
 
                 print(f"[start_bokeh_server] Generating plot for sample={sample}, contig={contig}, features={requested_features}")
-                grid = generate_bokeh_plot_per_sample(conn, requested_features, contig, sample, xstart=xstart, xend=xend, genbank_path=genbank_path, feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_isoforms=plot_isoforms, plot_sequence=plot_sequence)
+                grid = generate_bokeh_plot_per_sample(conn, requested_features, contig, sample, xstart=xstart, xend=xend, genbank_path=genbank_path, feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_isoforms=plot_isoforms, plot_sequence=plot_sequence, same_y_scale=same_y_scale)
 
             # Extract and cache plot data for instant downloads (no database round-trip)
             try:
@@ -1842,7 +1844,7 @@ def create_layout(db_path):
     sequence_cbg = None
     if has_sequence_data:
         sequence_cbg = CheckboxGroup(labels=["Plot sequence"], active=[])
-        sequence_help_tooltip = Tooltip(content="Only shown when plotting regions \u2264 1000 bp", position="right")
+        sequence_help_tooltip = Tooltip(content="Not recommended for regions larger than 1000 bp as it may slow down rendering", position="right")
         sequence_help_btn = HelpButton(
             tooltip=sequence_help_tooltip, width=20, height=20,
             align="center", button_type="light", stylesheets=[toggle_stylesheet]
@@ -1902,6 +1904,20 @@ def create_layout(db_path):
             return callback
 
         toggles.on_change("active", make_variable_callback(mc, toggles, lock))
+
+    ## Plotting parameters section
+    separator_plotting_params = Div(text="", height=2, sizing_mode="stretch_width",
+        styles={'background-color': '#333', 'margin-top': '10px', 'margin-bottom': '10px'})
+    plotting_params_title = Div(text="<span style='font-size: 1.2em;'><b>Plotting parameters:</b></span>")
+
+    same_y_scale_cbg = CheckboxGroup(labels=["Use same scale for all y axis"], active=[])
+    same_y_scale_tooltip = Tooltip(content=(
+        "All Samples view: all y axis share the global maximum y value. "
+        "One Sample view: all coverage-related y axis share the coverage maximum y value."
+    ), position="right")
+    same_y_scale_help = HelpButton(tooltip=same_y_scale_tooltip, width=20, height=20,
+        align="center", button_type="light", stylesheets=[toggle_stylesheet])
+    same_y_scale_row = row(same_y_scale_cbg, same_y_scale_help, sizing_mode="stretch_width")
 
     ## Create final Apply and Peruse data buttons
     apply_button = Button(label="APPLY", align="center", stylesheets=[stylesheet], css_classes=["apply-btn"])
@@ -1974,6 +1990,7 @@ def create_layout(db_path):
                              separator_variables,
                              variables_section_one,  # One Sample view (with module checkboxes)
                              variables_section_all,  # All Samples view (title headers only)
+                             separator_plotting_params, plotting_params_title, same_y_scale_row,
                              buttons_row]
         placeholder_text = "<i>No plot yet. Select one sample, one contig and at least one variable in \"One sample\" mode or one contig and one variable in \"All samples\" mode and click Apply.</i>"
     else:

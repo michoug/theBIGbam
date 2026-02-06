@@ -5,7 +5,7 @@ from bokeh.layouts import gridplot
 from .plotting_data_per_sample import get_contig_info, get_feature_data, get_feature_data_batch, get_variable_metadata, get_repeats_data, make_bokeh_subplot, make_bokeh_genemap, make_bokeh_sequence_subplot
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130, genbank_path=None, genome_features=None, allowed_samples=None, feature_types=None, use_phage_colors=False, plot_sequence=False):
+def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130, genbank_path=None, genome_features=None, allowed_samples=None, feature_types=None, use_phage_colors=False, plot_sequence=False, same_y_scale=False):
     """Generate a Bokeh plot showing all samples for a single variable.
 
     Args:
@@ -107,6 +107,8 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
     # Requested features are variables like 'coverage', 'reads_starts', etc.
     # Batch-fetch data for all samples in one query, then create subplots
     subplots = []
+    all_max_y = 0
+    all_min_y = 0
     try:
         var_metadata = get_variable_metadata(cur, variable)
         batch_results = get_feature_data_batch(cur, variable, contig_id, sample_ids, xstart, xend, variable_metadata=var_metadata)
@@ -114,11 +116,22 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
             list_feature_dict = batch_results.get(sample_id, [])
             if not list_feature_dict:
                 continue
+            if same_y_scale:
+                for d in list_feature_dict:
+                    if d["y"]:
+                        all_max_y = max(all_max_y, max(d["y"]))
+                        all_min_y = min(all_min_y, min(d["y"]))
             subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, sample_title=sample_name)
             if subplot_feature is not None:
                 subplots.append(subplot_feature)
     except Exception as e:
         print(f"Error batch-processing variable '{variable}': {e}", flush=True)
+
+    # Post-process y-ranges for same_y_scale (all-samples view)
+    if same_y_scale and all_max_y > 0 and subplots:
+        y_start = min(0, all_min_y)
+        for p in subplots:
+            p.y_range = Range1d(y_start, all_max_y)
 
     # --- Combine all figures in a single grid with one shared toolbar ---
     all_plots = []

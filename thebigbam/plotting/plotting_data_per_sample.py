@@ -342,7 +342,7 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None):
 def make_bokeh_sequence_subplot(conn, contig_name, xstart, xend, height, x_range):
     """Create a subplot showing colored nucleotide rectangles for a genomic region.
 
-    Only works for regions <= 1000 bp. Returns None if no sequence data is available
+    Returns None if no sequence data is available
     or the Contig_sequence table doesn't exist.
 
     Args:
@@ -1108,7 +1108,7 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
 
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=100, genbank_path=None, feature_types=None, use_phage_colors=False, plot_isoforms=True, plot_sequence=False):
+def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=100, genbank_path=None, feature_types=None, use_phage_colors=False, plot_isoforms=True, plot_sequence=False, same_y_scale=False):
     """Generate a Bokeh plot for a single sample.
 
     Args:
@@ -1200,7 +1200,15 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
             except Exception as e:
                 print(f"Error processing feature '{feature}': {e}", flush=True)
 
+    # Subplot names whose y-axis should be relative to Primary alignments max
+    PRIMARY_RELATIVE_SUBPLOTS = {
+        "Primary alignments", "Other alignments", "Clippings", "Indels",
+        "Mismatches", "Bad orientations", "Coverage reduced", "Reads termini",
+        "Non-inward pairs", "Missing mates"
+    }
+
     # Add sample-dependent features only when a sample is selected
+    feature_subplots = []  # track (feature_name, figure, max_y) for same_y_scale
     if sample_id is not None and sample_features:
         # Pre-fetch metadata for all features in one query
         metadata_cache = get_variable_metadata_batch(cur, sample_features)
@@ -1214,9 +1222,36 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
                 )
                 subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange)
                 if subplot_feature is not None:
+                    if same_y_scale:
+                        max_y = max((y for d in list_feature_dict for y in d["y"]), default=0)
+                        feature_subplots.append((feature, subplot_feature, max_y))
                     subplots.append(subplot_feature)
             except Exception as e:
                 print(f"Error processing feature '{feature}': {e}", flush=True)
+
+    # Post-process y-ranges for same_y_scale (per-sample view)
+    if same_y_scale and sample_id is not None and feature_subplots:
+        # Find primary_reads max y
+        primary_max = 0
+        for fname, fig, my in feature_subplots:
+            if fname == "Primary alignments":
+                primary_max = max(primary_max, my)
+
+        # If Primary alignments not plotted, fetch its data to find the max
+        if primary_max == 0:
+            try:
+                primary_data = get_feature_data(cur, "Primary alignments", contig_id, sample_id, xstart, xend)
+                for d in primary_data:
+                    if d["y"]:
+                        primary_max = max(primary_max, max(d["y"]))
+            except Exception:
+                pass
+
+        # Apply shared y-range to all primary-relative subplots
+        if primary_max > 0:
+            for fname, fig, my in feature_subplots:
+                if fname in PRIMARY_RELATIVE_SUBPLOTS:
+                    fig.y_range = Range1d(0, primary_max)
 
     # --- Combine all figures in a single grid with one shared toolbar ---
     if annotation_fig:
