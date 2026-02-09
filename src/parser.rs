@@ -474,6 +474,53 @@ pub fn parse_gff3(
     Ok((contigs, annotations))
 }
 
+// ============================================================================
+// FASTA Parser
+// ============================================================================
+
+/// Parse a FASTA file and return (name, sequence) pairs.
+///
+/// Reads `>name ...` headers (takes first whitespace-delimited word as name)
+/// and concatenates sequence lines as bytes.
+pub fn parse_fasta(path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    let file = File::open(path).with_context(|| format!("Failed to open FASTA file: {}", path.display()))?;
+    let reader = BufReader::new(file);
+
+    let mut records: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_seq: Vec<u8> = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.context("Failed to read FASTA line")?;
+        let line = line.trim_end();
+
+        if line.starts_with('>') {
+            // Save previous record
+            if let Some(name) = current_name.take() {
+                if !current_seq.is_empty() {
+                    records.push((name, current_seq.clone()));
+                }
+            }
+            // Parse header: take first whitespace-delimited word after '>'
+            let header = &line[1..];
+            let name = header.split_whitespace().next().unwrap_or("").to_string();
+            current_name = Some(name);
+            current_seq.clear();
+        } else if !line.is_empty() {
+            current_seq.extend_from_slice(line.as_bytes());
+        }
+    }
+
+    // Save last record
+    if let Some(name) = current_name {
+        if !current_seq.is_empty() {
+            records.push((name, current_seq));
+        }
+    }
+
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

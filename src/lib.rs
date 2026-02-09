@@ -37,7 +37,7 @@ pub use cigar::{Cigar, CigarElement, CigarOp, MdTag};
 pub use circular::{increment_circular, increment_range};
 pub use compress::compress_signal_with_reference;
 pub use features::{process_read, FeatureArrays, ModuleFlags};
-pub use parser::{parse_annotations, parse_genbank, parse_gff3};
+pub use parser::{parse_annotations, parse_fasta, parse_genbank, parse_gff3};
 pub use processing::{run_all_samples, ProcessConfig};
 pub use processing_phage_packaging::PhageTerminiConfig;
 pub use types::{
@@ -70,6 +70,7 @@ mod python {
     ///     compress_ratio: Compression ratio threshold (default 10.0)
     ///     circular: Whether the genome is circular (default False)
     ///     create_indexes: Whether to create database indexes (default True)
+    ///     assembly_path: Path to assembly FASTA file for autoblast (default "")
     ///
     /// Returns:
     ///     dict with keys:
@@ -77,7 +78,7 @@ mod python {
     ///         - "samples_failed": int
     ///         - "total_time": float (seconds)
     #[pyfunction]
-    #[pyo3(signature = (genbank_path, bam_files, output_db, modules, threads, sequencing_type=None, min_coverage=50.0, curve_ratio=10.0, bar_ratio=10.0, contig_variation_percentage=10.0, circular=false, create_indexes=true, autoblast_file=""))]
+    #[pyo3(signature = (genbank_path, bam_files, output_db, modules, threads, sequencing_type=None, min_coverage=50.0, curve_ratio=10.0, bar_ratio=10.0, contig_variation_percentage=10.0, circular=false, create_indexes=true, assembly_path=""))]
     fn process_all_samples<'py>(
         py: Python<'py>,
         genbank_path: &str,
@@ -92,7 +93,7 @@ mod python {
         contig_variation_percentage: f64,
         circular: bool,
         create_indexes: bool,
-        autoblast_file: &str,
+        assembly_path: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
         use crate::gc_content::GCParams;
         use crate::processing::{run_all_samples, ProcessConfig};
@@ -121,12 +122,12 @@ mod python {
         let process_result = py.allow_threads(|| {
             run_all_samples(
                 Path::new(genbank_path),
+                Path::new(assembly_path),
                 &bam_paths,
                 Path::new(output_db),
                 &modules,
                 &config,
                 create_indexes,
-                Path::new(autoblast_file),
             )
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))
         })?;

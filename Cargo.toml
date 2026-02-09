@@ -41,6 +41,9 @@ walkdir = "2"
 # DuckDB for metadata.db (columnar, better compression)
 duckdb = { version = "1.1", features = ["bundled"] }
 
+# Temp files for autoblast
+tempfile = "3"
+
 # PyO3 bindings (optional, enabled via "python" feature)
 pyo3 = { version = "0.23", features = ["extension-module", "anyhow"], optional = true }
 

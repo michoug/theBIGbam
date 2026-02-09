@@ -24,15 +24,16 @@ use crate::bam_reader::{detect_sequencing_type, get_total_read_count, process_co
 use crate::compress::{
     compress_signal_with_reference, Run,
     add_compressed_feature, add_compressed_feature_with_reference,
-    add_compressed_feature_with_stats, merge_identical_runs, 
+    add_compressed_feature_with_stats, merge_identical_runs,
 };
 use crate::db::{DbWriter, CompletenessData, GCContentData, RepeatsData};
 use crate::gc_content::{compute_gc_content, compute_gc_skew, GCParams};
 use crate::features::{FeatureArrays, ModuleFlags};
-use crate::parser::parse_annotations;
+use crate::parser::{parse_annotations};
 use crate::types::{
     ContigInfo, FeaturePoint, PackagingData, PlotType, PresenceData, SequencingType
 };
+use tempfile;
 
 use crate::processing_phage_packaging::{
     classify_packaging_areas, filter_and_merge_to_areas_with_diagnostics,
@@ -176,17 +177,20 @@ fn check_circularity_mismatch(
     None
 }
 
-/// Run validation checks on all BAM files before processing.
-/// Prints warnings for MD tags and circularity mismatches.
-fn validate_all_samples(
+/// Strict upfront validation of all inputs.
+/// Collects all errors across all samples, prints them, and returns Err if any found.
+/// This runs as the very first step before any parsing or database creation.
+fn validate_inputs(
     bam_files: &[PathBuf],
-    contigs: &[ContigInfo],
     modules: &[String],
-    circular: bool,
-) {
+    genbank_path: &Path,
+    assembly_path: &Path,
+) -> Result<()> {
     let flags = ModuleFlags::from_modules(modules);
     let needs_md = flags.needs_md();
+    let mut errors: Vec<String> = Vec::new();
 
+    // 1. BAM index check — for each BAM file, check .bam.bai or .bai exists on disk
     for bam_path in bam_files {
         let sample_name = bam_path
             .file_stem()
@@ -194,33 +198,267 @@ fn validate_all_samples(
             .to_string_lossy()
             .replace("_with_MD", "");
 
-        // Open BAM for checks
-        let bam = match IndexedReader::from_path(bam_path) {
-            Ok(b) => b,
-            Err(_) => continue, // Skip, will fail later during processing
-        };
-
-        // Circularity check
-        if let Some(warning) = check_circularity_mismatch(&bam, contigs, circular, &sample_name) {
-            eprintln!("{}", warning);
+        let bai_path1 = bam_path.with_extension("bam.bai");
+        let bai_path2 = bam_path.with_extension("bai");
+        if !bai_path1.exists() && !bai_path2.exists() {
+            errors.push(format!(
+                "ERROR: Sample '{}' is missing a BAM index (.bai).\n\
+                 If the file is coordinate-sorted, create the index with:\n\
+                 \x20 samtools index {}\n\
+                 Otherwise, sort and index with:\n\
+                 \x20 samtools sort {} -o {}_sorted.bam && samtools index {}_sorted.bam",
+                sample_name,
+                bam_path.display(),
+                bam_path.display(),
+                sample_name,
+                sample_name,
+            ));
         }
+    }
 
-        // MD tag check
-        if needs_md {
+    // 2. MD tag check (only when modules include Misalignment or Phage termini)
+    if needs_md {
+        let mut samples_missing_md: Vec<String> = Vec::new();
+        for bam_path in bam_files {
+            let sample_name = bam_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .replace("_with_MD", "");
+
+            // Only check BAMs that have an index (otherwise we already reported the error)
+            let bai_path1 = bam_path.with_extension("bam.bai");
+            let bai_path2 = bam_path.with_extension("bai");
+            if !bai_path1.exists() && !bai_path2.exists() {
+                continue;
+            }
+
             let mut check_bam = match IndexedReader::from_path(bam_path) {
                 Ok(b) => b,
                 Err(_) => continue,
             };
             if check_missing_md_tags(&mut check_bam) {
-                eprintln!(
-                    "Warning: in sample '{}', BAM file is missing MD tags. \
-                     MD tags are required for: Misalignment, Phage termini. \
-                     Consider using 'samtools calmd' to add them.",
-                    sample_name
-                );
+                samples_missing_md.push(sample_name);
             }
         }
+        if !samples_missing_md.is_empty() {
+            errors.push(format!(
+                "ERROR: Sample(s) missing MD tags (required by Misalignment, Phage termini modules): {}\n\
+                 MD tags encode reference base information needed for mismatch and soft-clipping analysis.\n\
+                 Add MD tags with:\n\
+                 \x20 samtools calmd -b <input>.bam reference.fa > <output>_md.bam && samtools index <output>_md.bam\n\
+                 Or remove these modules from -m/--modules.",
+                samples_missing_md.join(", "),
+            ));
+        }
     }
+
+    // 3. Sequence check (only when modules include Phage termini)
+    if flags.phagetermini {
+        let has_genbank = !genbank_path.as_os_str().is_empty() && genbank_path.exists();
+        let has_assembly = !assembly_path.as_os_str().is_empty() && assembly_path.exists();
+        if !has_genbank && !has_assembly {
+            errors.push(
+                "ERROR: Phage termini module requires sequence data for terminal repeat detection.\n\
+                 Provide either:\n\
+                 \x20 - A GenBank file with embedded sequences via -g/--genbank\n\
+                 \x20 - An assembly FASTA file via -a/--assembly\n\
+                 Or remove 'Phage termini' from -m/--modules."
+                    .to_string(),
+            );
+        }
+    }
+
+    if !errors.is_empty() {
+        // Include full error details in the anyhow error so they propagate
+        // through PyO3 into the Python exception message (visible without RUST_BACKTRACE)
+        let combined = errors.join("\n\n");
+        return Err(anyhow::anyhow!(
+            "Validation failed with {} error(s):\n\n{}",
+            errors.len(),
+            combined,
+        ));
+    }
+
+    Ok(())
+}
+
+/// Run circularity mismatch warnings (advisory only, not blocking).
+/// Called after annotation parsing since it needs contig info.
+fn warn_circularity_mismatches(
+    bam_files: &[PathBuf],
+    contigs: &[ContigInfo],
+    circular: bool,
+) {
+    for bam_path in bam_files {
+        let sample_name = bam_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .replace("_with_MD", "");
+
+        let bam = match IndexedReader::from_path(bam_path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        if let Some(warning) = check_circularity_mismatch(&bam, contigs, circular, &sample_name) {
+            eprintln!("{}", warning);
+        }
+    }
+}
+
+/// Merge sequences from a FASTA file into existing contig info.
+/// For each FASTA record, finds matching contig by name and sets contig.sequence.
+fn merge_sequences_from_fasta(contigs: &mut [ContigInfo], fasta_path: &Path) -> Result<()> {
+    let records = crate::parser::parse_fasta(fasta_path)?;
+    let mut matched = 0usize;
+    for (name, seq) in &records {
+        if let Some(contig) = contigs.iter_mut().find(|c| c.name == *name) {
+            contig.sequence = Some(seq.clone());
+            matched += 1;
+        } else {
+            eprintln!("Warning: FASTA sequence '{}' has no matching contig", name);
+        }
+    }
+    eprintln!("Merged sequences for {}/{} contigs from FASTA", matched, contigs.len());
+    Ok(())
+}
+
+/// Run autoblast (self-BLAST) on contigs that have sequence data.
+/// Uses rayon for per-contig parallelization.
+/// If blastn is not on PATH, prints a warning and returns empty vec.
+fn run_autoblast(contigs: &[ContigInfo], threads: usize) -> Result<Vec<RepeatsData>> {
+    // Filter contigs that have sequence data
+    let contigs_with_seq: Vec<&ContigInfo> = contigs.iter().filter(|c| c.sequence.is_some()).collect();
+    if contigs_with_seq.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Check if blastn is on PATH
+    match std::process::Command::new("blastn").arg("-version").output() {
+        Ok(output) if output.status.success() => {}
+        _ => {
+            eprintln!("Warning: blastn not found on PATH. Skipping repeat detection.");
+            eprintln!("Install BLAST+ to enable terminal repeat detection.");
+            return Ok(Vec::new());
+        }
+    }
+
+    eprintln!("\n### Running autoblast on {} contigs with sequences...", contigs_with_seq.len());
+
+    // Use rayon to parallelize across contigs
+    let _pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build();
+
+    let all_repeats: Vec<Vec<RepeatsData>> = contigs_with_seq
+        .par_iter()
+        .filter_map(|contig| {
+            let seq = contig.sequence.as_ref()?;
+
+            // Write contig sequence to temp FASTA file
+            let mut temp_file = match tempfile::NamedTempFile::new() {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Warning: Failed to create temp file for contig '{}': {}", contig.name, e);
+                    return None;
+                }
+            };
+
+            use std::io::Write;
+            if let Err(e) = writeln!(temp_file, ">{}", contig.name) {
+                eprintln!("Warning: Failed to write temp FASTA for '{}': {}", contig.name, e);
+                return None;
+            }
+            // Write sequence in 80-char lines
+            for chunk in seq.chunks(80) {
+                if let Err(e) = temp_file.write_all(chunk) {
+                    eprintln!("Warning: Failed to write temp FASTA for '{}': {}", contig.name, e);
+                    return None;
+                }
+                if let Err(e) = writeln!(temp_file) {
+                    eprintln!("Warning: Failed to write temp FASTA for '{}': {}", contig.name, e);
+                    return None;
+                }
+            }
+
+            // Flush to ensure all data is written before blastn reads it
+            if let Err(e) = temp_file.flush() {
+                eprintln!("Warning: Failed to flush temp FASTA for '{}': {}", contig.name, e);
+                return None;
+            }
+
+            let temp_path = temp_file.path().to_path_buf();
+
+            // Run blastn -query temp.fasta -subject temp.fasta -evalue 1e-10 -outfmt 6
+            let output = match std::process::Command::new("blastn")
+                .arg("-query").arg(&temp_path)
+                .arg("-subject").arg(&temp_path)
+                .arg("-evalue").arg("1e-10")
+                .arg("-outfmt").arg("6")
+                .output()
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("Warning: blastn failed for contig '{}': {}", contig.name, e);
+                    return None;
+                }
+            };
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("Warning: blastn returned non-zero for contig '{}': {}", contig.name, stderr);
+                return None;
+            }
+
+            // Parse stdout (outfmt 6: qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore)
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut repeats = Vec::new();
+
+            for line in stdout.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let fields: Vec<&str> = line.split('\t').collect();
+                if fields.len() < 10 {
+                    continue;
+                }
+
+                let pident: f64 = fields[2].parse().unwrap_or(0.0);
+                let qstart: i32 = fields[6].parse().unwrap_or(0);
+                let qend: i32 = fields[7].parse().unwrap_or(0);
+                let sstart: i32 = fields[8].parse().unwrap_or(0);
+                let send: i32 = fields[9].parse().unwrap_or(0);
+
+                // Skip self-hits (exact same region)
+                if qstart == sstart && qend == send {
+                    continue;
+                }
+
+                // Determine if direct (same orientation) or inverted (opposite orientation)
+                let is_direct = (qstart < qend && sstart < send) || (qstart > qend && sstart > send);
+
+                repeats.push(RepeatsData {
+                    contig_name: contig.name.clone(),
+                    position1: qstart,
+                    position2: qend,
+                    position1prime: sstart,
+                    position2prime: send,
+                    pident,
+                    is_direct,
+                });
+            }
+
+            // Temp file auto-cleaned on drop
+            Some(repeats)
+        })
+        .collect();
+
+    let total: Vec<RepeatsData> = all_repeats.into_iter().flatten().collect();
+    eprintln!("Found {} repeat hits across {} contigs", total.len(), contigs_with_seq.len());
+    Ok(total)
 }
 
 /// Add features from FeatureArrays to output (optimized path).
@@ -842,12 +1080,12 @@ fn extract_contigs_from_bams(bam_files: &[PathBuf], circular: bool) -> Result<Ve
 /// Run processing on all BAM files.
 pub fn run_all_samples(
     genbank_path: &Path,
+    assembly_path: &Path,
     bam_files: &[PathBuf],
     output_db: &Path,
     modules: &[String],
     config: &ProcessConfig,
     _create_indexes: bool, // Ignored - DuckDB uses zone maps instead of indexes
-    autoblast_file: &Path,
 ) -> Result<ProcessResult> {
     unsafe {
         htslib::hts_set_log_level(htslib::htsLogLevel_HTS_LOG_ERROR);
@@ -858,8 +1096,14 @@ pub fn run_all_samples(
         .build_global()
         .ok();
 
+    // 1. Strict upfront validation — fail early with actionable errors
+    if !bam_files.is_empty() {
+        validate_inputs(bam_files, modules, genbank_path, assembly_path)?;
+    }
+
+    // 2. Parse annotations (GenBank/GFF3) or extract contigs from BAMs
     eprintln!("\n### Parsing input files...");
-    let (contigs, annotations) = if genbank_path.as_os_str().is_empty() {
+    let (mut contigs, annotations) = if genbank_path.as_os_str().is_empty() {
         eprintln!("No GenBank file provided - extracting contigs from BAM headers");
         let contigs = extract_contigs_from_bams(bam_files, config.circular)?;
         eprintln!("Found {} contigs from BAM files", contigs.len());
@@ -875,32 +1119,39 @@ pub fn run_all_samples(
 
     eprintln!("Found {} BAM files", bam_files.len());
 
+    // 3. If assembly_path provided, parse FASTA and merge sequences into contigs
+    if !assembly_path.as_os_str().is_empty() && assembly_path.exists() {
+        eprintln!("\n### Merging sequences from assembly FASTA...");
+        merge_sequences_from_fasta(&mut contigs, assembly_path)?;
+    }
+
     if let Some(parent) = output_db.parent() {
         fs::create_dir_all(parent).context("Failed to create output directory")?;
     }
 
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    // Create database with schema and initial data
+    // 4. Create database, write annotations
     let db_writer = DbWriter::create(output_db, &contigs, &annotations)?;
 
-    // Parse and write repeats from autoblast file (if provided)
-    let repeats = if !autoblast_file.as_os_str().is_empty() && autoblast_file.exists() {
-        eprintln!("\n### Parsing autoblast results...");
-        let reps = crate::db::parse_autoblast_file(autoblast_file)?;
+    // 5. Circularity mismatch warnings (advisory, uses contigs + BAM headers)
+    if !bam_files.is_empty() {
+        warn_circularity_mismatches(bam_files, &contigs, config.circular);
+    }
+
+    // 6. If sequences available, run autoblast with rayon
+    let has_sequences = contigs.iter().any(|c| c.sequence.is_some());
+    let repeats = if has_sequences {
+        let reps = run_autoblast(&contigs, config.threads)?;
         if !reps.is_empty() {
             db_writer.write_repeats(&reps)?;
-        } else {
-            eprintln!("No repeats found in autoblast file");
         }
         reps
     } else {
         Vec::new()
     };
 
-    // Compute and write GC content and GC skew from sequence data (if available)
-    // Uses configurable window sizes (default 500bp for GC content, 1000bp for GC skew)
-    // and configurable RLE compression (default 0.1%)
+    // 7. Compute and write GC content and GC skew from sequence data (if available)
     let gc_data: Vec<GCContentData> = contigs
         .iter()
         .filter_map(|contig| {
@@ -929,7 +1180,7 @@ pub fn run_all_samples(
     if bam_files.is_empty() {
         eprintln!("\n### No BAM files provided - skipping sample processing");
         eprintln!("Database populated with {} contigs and {} annotations", contigs.len(), annotations.len());
-        
+
         return Ok(ProcessResult {
             samples_processed: 0,
             samples_failed: 0,
@@ -939,11 +1190,9 @@ pub fn run_all_samples(
         });
     }
 
+    // 8. Process samples
     eprintln!("\n### Processing {} samples with {} threads", bam_files.len(), config.threads);
     eprintln!("Modules: {}\n", modules.join(", "));
-
-    // Pre-validation: check all samples for warnings before processing starts
-    validate_all_samples(bam_files, &contigs, modules, config.circular);
 
     let result = process_samples_parallel(&bam_files, &contigs, modules, config, db_writer, &repeats)?;
 

@@ -14,7 +14,7 @@ from thebigbam.plotting import start_bokeh_server
 BASE_DIR = os.path.dirname(__file__)
 
 SCRIPTS = {
-    'calculate': "Run feature calculations over BAMs",
+    'calculate': "Run feature calculations over alignment files",
     'add-variable': "Add an external variable from CSV to DB",
     'remove-variable': "Remove a Custom variable from DB",
     'add-sample-metadata': "Add sample metadata from CSV as new columns in Sample table",

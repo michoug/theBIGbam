@@ -1,5 +1,4 @@
 import argparse, sys, os
-import tempfile
 import duckdb
 from pathlib import Path
 from multiprocessing import cpu_count
@@ -86,7 +85,7 @@ def _store_contig_sequences(db_path, assembly_path=None, genbank_path=None):
         print(f"  WARNING: Could not store sequences in database: {e}", flush=True)
 
 
-def calculating_all_features_parallel(list_modules, bam_files, output_db, min_coverage, curve_ratio, bar_ratio, contig_variation_percentage=0.1, circular=False, n_sample_cores=None, sequencing_type=None, genbank_path=None, autoblast_file=None):
+def calculating_all_features_parallel(list_modules, bam_files, output_db, min_coverage, curve_ratio, bar_ratio, contig_variation_percentage=0.1, circular=False, n_sample_cores=None, sequencing_type=None, genbank_path=None, assembly_path=None):
     """Process all BAM files in parallel using Rust bindings."""
     if not HAS_RUST:
         sys.exit("ERROR: Rust bindings (thebigbam_rs) are required but not available. Please install them first.")
@@ -110,7 +109,7 @@ def calculating_all_features_parallel(list_modules, bam_files, output_db, min_co
             contig_variation_percentage=float(contig_variation_percentage),
             circular=circular,
             create_indexes=True,
-            autoblast_file=autoblast_file if autoblast_file else "",
+            assembly_path=assembly_path if assembly_path else "",
         )
     except Exception as e:
         print(f"ERROR: Rust processing failed: {e}", flush=True)
@@ -198,61 +197,12 @@ def run_calculate_args(args):
     if assembly_path and not os.path.exists(assembly_path):
         sys.exit(f"ERROR: Assembly file not found: {assembly_path}")
 
-    # Warn if "Phage termini" is requested without any sequence source
-    if "Phage termini" in requested_modules and not genbank_path and not assembly_path:
-        print("WARNING: No annotation/assembly file was provided: phage packaging will not be determined properly for contigs harboring a terminal repeat at both ends. Rerun with an annotation file or at least an assembly file.", flush=True)
-
-    # Run autoblast to identify contig repeats (whenever sequence data is available)
-    autoblast_file = None
-    if genbank_path or assembly_path:
-        from thebigbam.utils.autoblast import perform_autoblast, extract_fasta_from_genbank
-        print("Running autoblast to identify contig repeats...", flush=True)
-
-        # Determine FASTA source: use assembly file if provided, otherwise extract from genbank
-        fasta_path = None
-        temp_fasta = None
-
-        if assembly_path:
-            fasta_path = Path(assembly_path)
-            print(f"  Using assembly file: {fasta_path}", flush=True)
-        elif genbank_path:
-            # Try to extract FASTA from genbank
-            temp_fasta = tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', delete=False)
-            temp_fasta.close()
-            temp_fasta_path = Path(temp_fasta.name)
-
-            if extract_fasta_from_genbank(Path(genbank_path), temp_fasta_path):
-                fasta_path = temp_fasta_path
-                print(f"  Extracted sequences from GenBank file", flush=True)
-            else:
-                os.unlink(temp_fasta_path)
-                print("  WARNING: Could not extract sequences from GenBank file (no sequence data found)", flush=True)
-                print("  Provide --assembly parameter for autoblast functionality", flush=True)
-
-        if fasta_path:
-            # Create autoblast output file next to the output database
-            output_dir = Path(output_db).parent
-            output_dir.mkdir(parents=True, exist_ok=True)
-            autoblast_output = output_dir / f"{Path(output_db).stem}_autoblast.tsv"
-
-            try:
-                perform_autoblast(n_cores, fasta_path, autoblast_output)
-                autoblast_file = str(autoblast_output)
-                print(f"  Autoblast results written to: {autoblast_file}", flush=True)
-            except Exception as e:
-                print(f"  WARNING: Autoblast failed: {e}", flush=True)
-                print("  Continuing without autoblast results...", flush=True)
-
-            # Clean up temp file if we created one
-            if temp_fasta and os.path.exists(temp_fasta.name):
-                os.unlink(temp_fasta.name)
-
     print("\nCalculating values for all requested features from mapping files...", flush=True)
     calculating_all_features_parallel(
         requested_modules, bam_files, output_db, min_coverage, variation_percentage, coverage_percentage,
         contig_variation_percentage=contig_variation_percentage, circular=circular, n_sample_cores=n_cores,
         sequencing_type=args.sequencing_type, genbank_path=genbank_path,
-        autoblast_file=autoblast_file
+        assembly_path=assembly_path,
     )
 
     # Store contig sequences for sequence visualization (if source files available)
