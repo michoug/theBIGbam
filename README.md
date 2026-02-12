@@ -144,11 +144,11 @@ First, the database is organised per contig per sample (qualified as a contig/sa
 
 To further reduce the size of the database, values per feature are compressed rather than saving all positions. The type of compression depends on the type of plots:
 
-- A **Run-Length Encoding approach (RLE)** is applied to the Curve plots (features from Coverage, Paired-reads and Long-reads module, "Coverage reduced" feature in Phage termini module). RLE consists in storing consecutive positions with similar values as a single entry, preserving the overall signal while drastically reducing storage size. RLE stores consecutive genomic positions with similar values as a single entry, preserving the overall signal while substantially reducing storage size. By default, a new entry is created only when the variation between two consecutive values exceeds a threshold, defined as: 
+- A **Run-Length Encoding approach (RLE)** is applied to the Curve plots (features from Coverage, Paired-reads and Long-reads module, "Coverage reduced" feature in Phage termini module). RLE stores consecutive genomic positions with similar values as a single entry, preserving the overall signal while substantially reducing storage size. The algorithm tracks the minimum and maximum values within each run, and a new entry is created when the range of values in the run exceeds a threshold relative to the smallest absolute value, defined as:
   
-  $∣x[i]−x[i−1]∣>0.5×min(x[i],x[i−1])$
+  $\text{max}(\text{run}) - \text{min}(\text{run}) > r \times \min(|\text{min}(\text{run})|, |\text{max}(\text{run})|)$
   
-  The allowed percentage of variation can be adjusted using the **--variation_percentage** parameter (default 50% ie 0.5) for mapping-related features, and the **--contig_variation_percentage** parameter (default: 10% ie 0.1) for contig-related features.
+  where $r$ is the allowed variation ratio. This range-based criterion is symmetric (independent of position order) and prevents drift on gradual monotonic changes. The stored value for each run is the average of all values in the run. The allowed percentage of variation can be adjusted using the **--variation_percentage** parameter (default 50% ie 0.5) for mapping-related features, and the **--contig_variation_percentage** parameter (default: 10% ie 0.1) for contig-related features.
   
   Contig features use a separate parameter with a lower default value because only one value needs to be computed per contig and per position (O(n²)), whereas mapping features require computing one value per contig, per position, and per sample in which the contig is present (O(n³)).
 

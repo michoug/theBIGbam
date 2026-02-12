@@ -27,27 +27,21 @@ pub struct Run {
 // MAIN COMPRESSION FUNCTION
 // ============================================================================
 
-/// Compress signal using adaptive run-length encoding.
-///
-/// # Algorithm
-/// 1. Start first run with position 0 and its value
-/// 2. For each subsequent position:
-///    - If |value - current_run_value| <= compress_ratio * |current_run_value|, extend run
-///    - Otherwise, close current run and start new one
-/// 3. Return runs as (start_pos, end_pos, value) tuples
-///
 /// Compress signal using adaptive RLE with optional coverage reference.
 ///
 /// # Parameters
 /// - `values`: The signal to compress (e.g., coverage at each position)
 /// - `reference`: Optional reference signal (e.g., coverage for bar plots). Use None for curves.
 /// - `plot_type`: Curve (self-referential RLE) or Bars (threshold filtering)
-/// - `compress_ratio`: Relative tolerance (e.g., 10 for 10% change threshold)
+/// - `curve_ratio`: Relative tolerance for curves (e.g., 10 for 10% range threshold)
+/// - `bar_ratio`: Relative tolerance for bars (e.g., 10 for 10% threshold)
 ///
 /// # Algorithm
-/// - **Curves** (reference=None): Adaptive RLE. Compresses based on value changes.
-/// - **Bars** (reference=Some): Threshold filtering. Saves positions where `value > coverage * compress_ratio`.
-///   Consecutive significant positions are grouped into runs with average values.
+/// - **Curves** (reference=None): Range-based adaptive RLE. Tracks the min and max values
+///   within the current run. A run is extended as long as `(max - min) <= ratio * min(|min|, |max|)`.
+///   This is symmetric (order-independent) and prevents drift on gradual monotonic changes.
+///   The stored value for each run is the average of all values in the run.
+/// - **Bars** (reference=Some): Threshold filtering. Saves positions where `value > coverage * bar_ratio`.
 ///
 /// # Example
 /// ```
@@ -95,41 +89,48 @@ pub fn compress_signal_with_reference(
         return runs;
     }
 
-    // For curves: use adaptive RLE compression
+    // For curves: use range-based adaptive RLE compression
+    // Track min/max within each run to prevent drift on gradual changes
     let mut run_start = 0;
-    let mut run_value = values[0];
     let mut run_sum = values[0];
     let mut run_count = 1;
+    let mut run_min = values[0];
+    let mut run_max = values[0];
 
     for i in 1..n {
         let val = values[i];
+        let new_min = run_min.min(val);
+        let new_max = run_max.max(val);
+        let range = new_max - new_min;
 
-        // RLE formula: |x[i] - x[i-1]| <= ratio × min(|x[i]|, |x[i-1]|)
-        let min_abs = val.abs().min(run_value.abs());
+        // Threshold relative to the smaller absolute value in the run
+        let min_abs = new_min.abs().min(new_max.abs());
         let threshold = if min_abs < 1e-9 {
-            curve_ratio
+            curve_ratio // absolute threshold for near-zero values
         } else {
             curve_ratio * min_abs
         };
 
-        if (val - run_value).abs() <= threshold {
+        if range <= threshold {
             // Extend current run
             run_sum += val;
             run_count += 1;
-            run_value = run_sum / run_count as f64;
+            run_min = new_min;
+            run_max = new_max;
         } else {
-            // Close current run and save it
+            // Close current run (store average as value)
             runs.push(Run {
                 start_pos: (run_start + 1) as i32,
                 end_pos: (run_start + run_count) as i32,
-                value: run_value as f32,
+                value: (run_sum / run_count as f64) as f32,
             });
 
             // Start new run
             run_start = i;
-            run_value = val;
             run_sum = val;
             run_count = 1;
+            run_min = val;
+            run_max = val;
         }
     }
 
@@ -137,7 +138,7 @@ pub fn compress_signal_with_reference(
     runs.push(Run {
         start_pos: (run_start + 1) as i32,
         end_pos: (run_start + run_count) as i32,
-        value: run_value as f32,
+        value: (run_sum / run_count as f64) as f32,
     });
 
     runs
@@ -365,6 +366,17 @@ mod tests {
         assert_eq!(runs[0].start_pos, 4);
         assert_eq!(runs[0].end_pos, 5);
         assert_eq!(runs[0].value, 5.0);
+    }
+
+    #[test]
+    fn test_adaptive_rle_gradual_decline() {
+        // Gradual decline from 1000 to 500 in steps of 10
+        // Old algorithm: single run (running average drifts along)
+        // New algorithm: must break into multiple runs (range exceeds 10%)
+        let values: Vec<f64> = (0..=50).map(|i| 1000.0 - i as f64 * 10.0).collect();
+        let runs = compress_signal_with_reference(&values, None, PlotType::Curve, 10.0, 10.0);
+        // Must NOT be a single run (that would mean infinite drift)
+        assert!(runs.len() > 1, "gradual decline must break into multiple runs, got {}", runs.len());
     }
 
     #[test]
