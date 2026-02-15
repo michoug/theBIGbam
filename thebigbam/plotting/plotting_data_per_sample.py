@@ -1483,7 +1483,7 @@ def parse_requested_features(list_features):
             features.extend(["Primary alignments", "Other alignments", "Other alignments"])
         # Module: Phage termini / phagetermini
         elif item_lower in ["phage termini", "phagetermini", "phage_termini"]:
-            features.extend(["Coverage reduced", "Reads termini", "Tau"])
+            features.extend(["Coverage reduced", "Reads termini", "Tau", "Read termini transformation"])
             include_repeat_count = True
             include_repeat_identity = True
         # Module: Assembly check / assemblycheck

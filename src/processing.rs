@@ -735,12 +735,32 @@ fn add_features_from_arrays(
             std: None,
         }));
 
-        // Tau: calculate tau values using original data
-        for run in reads_starts_runs.iter().chain(reads_ends_runs.iter()) {
+        // Tau: calculate from merged (deduplicated) position ranges
+        // Both starts and ends runs contribute positions, but tau uses both signals
+        // at each position, so we must avoid duplicates from overlapping ranges.
+        let mut tau_positions: Vec<(i32, i32)> = reads_starts_runs.iter()
+            .chain(reads_ends_runs.iter())
+            .map(|run| (run.start_pos, run.end_pos))
+            .collect();
+        tau_positions.sort_by_key(|&(s, _)| s);
+
+        // Merge overlapping intervals
+        let mut merged_ranges: Vec<(i32, i32)> = Vec::new();
+        for (s, e) in tau_positions {
+            if let Some(last) = merged_ranges.last_mut() {
+                if s <= last.1 + 1 {
+                    last.1 = last.1.max(e);
+                    continue;
+                }
+            }
+            merged_ranges.push((s, e));
+        }
+
+        for (start_pos, end_pos) in &merged_ranges {
             let mut tau_sum = 0.0;
             let mut count = 0;
 
-            for pos in run.start_pos..=run.end_pos {
+            for pos in *start_pos..=*end_pos {
                 let idx = (pos - 1) as usize;
                 if idx < arrays.coverage_reduced.len() {
                     let c = arrays.coverage_reduced[idx];
@@ -758,8 +778,8 @@ fn add_features_from_arrays(
                 output.push(FeaturePoint {
                     contig_name: contig_name.to_string(),
                     feature: "tau".to_string(),
-                    start_pos: run.start_pos,
-                    end_pos: run.end_pos,
+                    start_pos: *start_pos,
+                    end_pos: *end_pos,
                     value: tau_value as f32,
                     mean: None,
                     median: None,

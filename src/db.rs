@@ -200,7 +200,7 @@ impl DbWriter {
                 // Collect kept terminus center positions for terminase distance calculation
                 let kept_terminus_positions: Vec<i32> = pkg.left_termini.iter()
                     .chain(pkg.right_termini.iter())
-                    .filter(|t| t.kept)
+                    .filter(|t| t.passed_poisson_test && t.passed_clipping_test)
                     .map(|t| t.center_pos)
                     .collect();
 
@@ -232,19 +232,26 @@ impl DbWriter {
                 for terminus in &pkg.left_termini {
                     // Store tau as integer (×100)
                     let tau_int = (terminus.tau * 100.0).round() as i32;
-                    let kept_str = if terminus.kept { "yes" } else { "no" };
+                    let passed_poisson_str = if terminus.passed_poisson_test { "yes" } else { "no" };
+                    let passed_clipping_str = if terminus.passed_clipping_test { "yes" } else { "no" };
+                    let size = terminus.size;
                     termini_appender.append_row(params![
                         terminus_id,
                         packaging_id,
                         terminus.start_pos,
                         terminus.end_pos,
+                        size,
                         terminus.center_pos,
                         "start",
                         terminus.total_spc as i32,
                         terminus.coverage as i32,
                         tau_int,
                         terminus.number_peaks as i32,
-                        kept_str,
+                        passed_poisson_str,
+                        terminus.expected_spc.round() as i64,
+                        compact_pvalue(terminus.pvalue),
+                        compact_pvalue(terminus.adjusted_pvalue),
+                        passed_clipping_str,
                         terminus.sum_clippings as i64,
                         (terminus.clipped_ratio * 100.0).round() as i32,
                         terminus.expected_clippings.round() as i64
@@ -255,19 +262,26 @@ impl DbWriter {
                 // Insert right termini (status = "end")
                 for terminus in &pkg.right_termini {
                     let tau_int = (terminus.tau * 100.0).round() as i32;
-                    let kept_str = if terminus.kept { "yes" } else { "no" };
+                    let passed_poisson_str = if terminus.passed_poisson_test { "yes" } else { "no" };
+                    let passed_clipping_str = if terminus.passed_clipping_test { "yes" } else { "no" };
+                    let size = terminus.size;
                     termini_appender.append_row(params![
                         terminus_id,
                         packaging_id,
                         terminus.start_pos,
                         terminus.end_pos,
+                        size,
                         terminus.center_pos,
                         "end",
                         terminus.total_spc as i32,
                         terminus.coverage as i32,
                         tau_int,
                         terminus.number_peaks as i32,
-                        kept_str,
+                        passed_poisson_str,
+                        terminus.expected_spc.round() as i64,
+                        compact_pvalue(terminus.pvalue),
+                        compact_pvalue(terminus.adjusted_pvalue),
+                        passed_clipping_str,
                         terminus.sum_clippings as i64,
                         (terminus.clipped_ratio * 100.0).round() as i32,
                         terminus.expected_clippings.round() as i64
@@ -769,6 +783,37 @@ fn calculate_terminase_distance(
     Some(min_dist)
 }
 
+/// Compact a p-value into a short text representation with 2 significant digits.
+///
+/// Examples:
+/// - 3.45e-5  → "35e-6"  (3.45 rounded to 35, exponent shifted by -1)
+/// - 1.5e-10  → "15e-11"
+/// - 1.0      → "10e-1"
+/// - 0.0      → "0"
+fn compact_pvalue(p: f64) -> String {
+    if p == 0.0 {
+        return "0".to_string();
+    }
+    if p.is_nan() || p.is_infinite() {
+        return "0".to_string();
+    }
+
+    // Get the exponent (floor of log10)
+    let log10 = p.log10();
+    let exponent = log10.floor() as i32;
+
+    // Get the significand as a 2-digit integer
+    // p = significand * 10^exponent, where significand is in [1.0, 10.0)
+    // We want a 2-digit integer, so multiply by 10
+    let significand = p / 10.0_f64.powi(exponent);
+    let two_digits = (significand * 10.0).round() as i32;
+
+    // The effective exponent shifts by -1 since we multiplied significand by 10
+    let effective_exponent = exponent - 1;
+
+    format!("{}e{}", two_digits, effective_exponent)
+}
+
 /// Create core database tables (no indexes - DuckDB uses zone maps).
 fn create_core_tables(conn: &Connection) -> Result<()> {
     conn.execute(
@@ -833,20 +878,25 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
 
     // PhageTermini table - stores individual terminus areas with full metadata
     // One row per terminus area, linked to PhageMechanisms via Packaging_id
-    // Includes filtering diagnostics: NumberPeaks, Kept, Clippings, Clipping_excess, Max_clippings_allowed
+    // Includes filtering diagnostics for both Poisson and clipping tests
     conn.execute(
         "CREATE TABLE PhageTermini (
             Terminus_id INTEGER PRIMARY KEY,
             Packaging_id INTEGER NOT NULL,
             \"Start\" INTEGER NOT NULL,
             \"End\" INTEGER NOT NULL,
+            \"Size\" INTEGER NOT NULL,
             Center INTEGER NOT NULL,
             Status TEXT NOT NULL,
             SPC INTEGER NOT NULL,
             Coverage INTEGER NOT NULL,
             Tau INTEGER NOT NULL,
             NumberPeaks INTEGER NOT NULL,
-            Kept TEXT NOT NULL,
+            Passed_PoissonTest TEXT NOT NULL,
+            Expected_SPC INTEGER NOT NULL,
+            Pvalue TEXT NOT NULL,
+            Adjusted_pvalue TEXT NOT NULL,
+            Passed_ClippingTest TEXT NOT NULL,
             Clippings INTEGER NOT NULL,
             Clipping_excess INTEGER NOT NULL,
             Max_clippings_allowed INTEGER NOT NULL
@@ -1512,13 +1562,13 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
              COALESCE(
                  (SELECT STRING_AGG(CAST(pt.Center AS VARCHAR), ',' ORDER BY pt.Center)
                   FROM PhageTermini pt
-                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Status = 'start' AND pt.Kept = 'yes'),
+                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Status = 'start' AND pt.Passed_PoissonTest = 'yes' AND pt.Passed_ClippingTest = 'yes'),
                  ''
              ) AS Left_termini,
              COALESCE(
                  (SELECT STRING_AGG(CAST(pt.Center AS VARCHAR), ',' ORDER BY pt.Center)
                   FROM PhageTermini pt
-                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Status = 'end' AND pt.Kept = 'yes'),
+                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Status = 'end' AND pt.Passed_PoissonTest = 'yes' AND pt.Passed_ClippingTest = 'yes'),
                  ''
              ) AS Right_termini,
              CASE WHEN m.Duplication = true THEN 'DTR'
@@ -1527,7 +1577,7 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
              COALESCE(
                  (SELECT COUNT(*)
                   FROM PhageTermini pt
-                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Kept = 'yes'),
+                  WHERE pt.Packaging_id = m.Packaging_id AND pt.Passed_PoissonTest = 'yes' AND pt.Passed_ClippingTest = 'yes'),
                  0
              ) AS Total_peaks,
              m.Repeat_length,
@@ -1560,13 +1610,18 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
                   ELSE NULL END AS Terminase_percentage,
              t.\"Start\",
              t.\"End\",
+             t.\"Size\",
              t.Center,
              t.Status,
              t.SPC,
              t.Coverage,
              t.Tau,
              t.NumberPeaks,
-             t.Kept,
+             t.Passed_PoissonTest,
+             t.Expected_SPC,
+             t.Pvalue,
+             t.Adjusted_pvalue,
+             t.Passed_ClippingTest,
              t.Clippings,
              t.Clipping_excess,
              t.Max_clippings_allowed

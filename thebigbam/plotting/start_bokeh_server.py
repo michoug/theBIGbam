@@ -488,7 +488,11 @@ def create_layout(db_path):
         # Apply Filtering2 query builder filters
         filtered_pairs = get_filtering_filtered_pairs()
         if filtered_pairs is not None:
-            allowed_contigs = {pair[0] for pair in filtered_pairs}
+            if views.active == 0 and widgets['sample_select'].value:
+                sel_sample = widgets['sample_select'].value
+                allowed_contigs = {pair[0] for pair in filtered_pairs if pair[1] == sel_sample}
+            else:
+                allowed_contigs = {pair[0] for pair in filtered_pairs}
             completions = [c for c in completions if c in allowed_contigs]
 
         update_widget_completions(widgets['contig_select'], completions)
@@ -506,7 +510,11 @@ def create_layout(db_path):
         # Apply Filtering2 query builder filters
         filtered_pairs = get_filtering_filtered_pairs()
         if filtered_pairs is not None:
-            allowed_samples = {pair[1] for pair in filtered_pairs}
+            if views.active == 0 and widgets['contig_select'].value:
+                sel_contig = widgets['contig_select'].value
+                allowed_samples = {pair[1] for pair in filtered_pairs if pair[0] == sel_contig}
+            else:
+                allowed_samples = {pair[1] for pair in filtered_pairs}
             completions = [s for s in completions if s in allowed_samples]
 
         update_widget_completions(widgets['sample_select'], completions)

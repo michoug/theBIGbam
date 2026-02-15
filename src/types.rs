@@ -466,14 +466,24 @@ pub struct TerminusArea {
     pub tau: f64,
     /// Number of positions merged into this area
     pub number_peaks: u32,
-    /// Whether this terminus passed filtering
-    pub kept: bool,
+    /// Poisson test p-value (peak significance)
+    pub pvalue: f64,
+    /// Bonferroni-adjusted p-value
+    pub adjusted_pvalue: f64,
+    /// Whether this terminus passed the Poisson significance test
+    pub passed_poisson_test: bool,
+    /// Whether this terminus passed the clipping excess test
+    pub passed_clipping_test: bool,
     /// Sum of pre-filtered clippings used for filtering
     pub sum_clippings: u64,
     /// Global clipped ratio for this contig/sample
     pub clipped_ratio: f64,
     /// Expected clippings (threshold from statistical test)
     pub expected_clippings: f64,
+    /// Expected SPC from Poisson test (lambda_w)
+    pub expected_spc: f64,
+    /// DTR-aware effective size of the area
+    pub size: i32,
 }
 
 /// Phage packaging mechanism data for a contig in a sample.
