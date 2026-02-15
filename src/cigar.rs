@@ -528,6 +528,71 @@ pub fn raw_cigar_consumes_ref(op: u32) -> bool {
     matches!(c, 'M' | 'D' | 'N' | '=' | 'X')
 }
 
+/// Tolerant version of `raw_has_match_at_position` that treats small clips/insertions
+/// (shorter than `min_clipping_length`) as near-matches for phagetermini.
+///
+/// If the read has an exact match, returns true immediately.
+/// Otherwise, if the boundary operation is a small clip (S/H) or insertion (I),
+/// checks the MD tag to see if the adjacent aligned bases match.
+#[inline]
+pub fn raw_has_near_match_at_position(
+    cigar: &[(u32, u32)],
+    md: Option<&[u8]>,
+    at_start: bool,
+    min_clipping_length: u32,
+) -> bool {
+    // Exact match passes immediately
+    if raw_has_match_at_position(cigar, md, at_start) {
+        return true;
+    }
+
+    if cigar.is_empty() {
+        return false;
+    }
+
+    // Check if the boundary operation is a small clip/insertion
+    if at_start {
+        let (op, len) = cigar[0];
+        let c = op as u8 as char;
+        if !matches!(c, 'S' | 'H' | 'I') || len >= min_clipping_length {
+            return false;
+        }
+        // Need at least one more operation after the clip
+        if cigar.len() < 2 {
+            return false;
+        }
+        // Next operation must not be another clip/insertion
+        let (next_op, _) = cigar[1];
+        let nc = next_op as u8 as char;
+        if matches!(nc, 'S' | 'H' | 'I') {
+            return false;
+        }
+        // Check MD tag for match at start
+        match md {
+            Some(bytes) if !bytes.is_empty() => MdTag::new(bytes).has_match_at_start(),
+            _ => false,
+        }
+    } else {
+        let (op, len) = cigar[cigar.len() - 1];
+        let c = op as u8 as char;
+        if !matches!(c, 'S' | 'H' | 'I') || len >= min_clipping_length {
+            return false;
+        }
+        if cigar.len() < 2 {
+            return false;
+        }
+        let (prev_op, _) = cigar[cigar.len() - 2];
+        let pc = prev_op as u8 as char;
+        if matches!(pc, 'S' | 'H' | 'I') {
+            return false;
+        }
+        match md {
+            Some(bytes) if !bytes.is_empty() => MdTag::new(bytes).has_match_at_end(),
+            _ => false,
+        }
+    }
+}
+
 /// Check if a read starts/ends with match using raw CIGAR and MD tag (zero-allocation).
 ///
 /// This is the optimized version used in hot paths. Same logic as

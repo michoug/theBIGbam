@@ -5,7 +5,7 @@
 //!
 //! All features are calculated in a single pass through the BAM reads for efficiency.
 
-use crate::cigar::{raw_cigar_consumes_ref, raw_cigar_is_clipping, raw_has_match_at_position, MdTag};
+use crate::cigar::{raw_cigar_consumes_ref, raw_cigar_is_clipping, raw_has_near_match_at_position, MdTag};
 use crate::circular::{increment_circular, increment_circular_long, increment_range};
 use crate::types::{FeatureMap, SequencingType};
 use std::collections::HashMap;
@@ -133,6 +133,12 @@ pub struct FeatureArrays {
     /// Reads near contig ends with mate on a different contig.
     pub contig_end_mates_mapped_on_another_contig: u64,
 
+    /// Number of primary reads with at least one clean terminus (no clip/mismatch).
+    /// For long reads: each read is split in two, so a read with both termini clean
+    /// counts as 2, and a read with only one clean terminus counts as 1.
+    /// For short reads: counts reads where the start is clean.
+    pub clean_reads_count: u64,
+
     // -------------------------------------------------------------------------
     // Internal: Strand-specific tracking for phagetermini
     // -------------------------------------------------------------------------
@@ -190,6 +196,7 @@ impl FeatureArrays {
             all_proper_insert_sizes: Vec::new(),
             contig_end_unmapped_mates: 0,
             contig_end_mates_mapped_on_another_contig: 0,
+            clean_reads_count: 0,
             start_plus: vec![0u64; ref_length],
             start_minus: vec![0u64; ref_length],
             end_plus: vec![0u64; ref_length],
@@ -539,6 +546,7 @@ pub fn process_read(
     seq_type: SequencingType,
     flags: ModuleFlags,
     circular: bool,
+    min_clipping_length: u32,
 ) {
     // -------------------------------------------------------------------------
     // Calculate positions
@@ -778,13 +786,18 @@ pub fn process_read(
     if flags.phagetermini && !is_secondary && !is_supplementary {
         // Check if read has clean alignment at start (no clip/mismatch)
         // raw_has_match_at_position checks both CIGAR and MD tag
-        let start_matches = raw_has_match_at_position(cigar_raw, md_tag, !is_reverse);
+        let start_matches = raw_has_near_match_at_position(cigar_raw, md_tag, !is_reverse, min_clipping_length);
 
         if seq_type.is_long() {
             // Long reads: split read in half and check each terminus independently
             // This avoids losing ~80% of reads that have clipping at one end
-            let end_matches = raw_has_match_at_position(cigar_raw, md_tag, is_reverse);
+            let end_matches = raw_has_near_match_at_position(cigar_raw, md_tag, is_reverse, min_clipping_length);
             let midpoint = (raw_start as usize + raw_end as usize) / 2;
+
+            // Count clean termini for clipped_ratio calculation
+            // Each clean terminus counts as 1 (a read with both clean = 2)
+            if start_matches { arrays.clean_reads_count += 1; }
+            if end_matches { arrays.clean_reads_count += 1; }
 
             // Coverage: split based on which termini match
             // - Both match: full read coverage
@@ -847,6 +860,8 @@ pub fn process_read(
         } else {
             // Short reads: only check start, count both positions if valid
             if start_matches {
+                arrays.clean_reads_count += 1;
+
                 if circular {
                     increment_circular(&mut arrays.coverage_reduced, start, end, 1);
                 } else {

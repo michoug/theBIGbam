@@ -484,6 +484,8 @@ pub struct TerminusArea {
     pub expected_spc: f64,
     /// DTR-aware effective size of the area
     pub size: i32,
+    /// Median clipping length within this area (for diagnostics)
+    pub median_clippings: f64,
 }
 
 /// Phage packaging mechanism data for a contig in a sample.
@@ -504,6 +506,10 @@ pub struct PackagingData {
     pub duplication: Option<bool>,
     /// Distance between start and end peak centers (when exactly 1 of each), None otherwise
     pub repeat_length: Option<i32>,
+    /// Median clipping lengths for kept left termini (one per kept terminus)
+    pub median_left_termini_clippings: Vec<f64>,
+    /// Median clipping lengths for kept right termini (one per kept terminus)
+    pub median_right_termini_clippings: Vec<f64>,
 }
 
 /// Type alias for feature calculation results.

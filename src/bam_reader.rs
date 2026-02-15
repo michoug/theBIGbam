@@ -86,6 +86,7 @@ pub fn process_contig_streaming(
     flags: ModuleFlags,
     circular: bool,
     min_aligned_fraction: f64,
+    min_clipping_length: u32,
 ) -> Result<Option<(FeatureArrays, f64, u64)>> {
     // -------------------------------------------------------------------------
     // Step 1: Check if this contig exists in the BAM file
@@ -277,6 +278,7 @@ pub fn process_contig_streaming(
             seq_type,
             flags,
             circular,
+            min_clipping_length,
         );
     }
 

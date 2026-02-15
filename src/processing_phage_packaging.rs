@@ -40,6 +40,8 @@ pub struct PeakArea {
     pub expected_spc: f64,
     /// Size of the area (distance between start_pos and end_pos + 1)
     pub size: i32,
+    /// Median clipping length within this area (for diagnostics)
+    pub median_clippings: f64,
 }
 
 /// Configuration for phage termini detection.
@@ -53,15 +55,18 @@ pub struct PhageTerminiConfig {
     /// Duplications must have one region starting within this distance from position 1
     /// and the other region ending within this distance from the contig end.
     pub max_distance_duplication: i32,
+    /// Minimum clipping length to count a clip as "real" for phagetermini.
+    /// Reads with clips shorter than this are treated as clean (near-match).
+    pub min_clipping_length: u32,
     /// Minimum event count to consider a signal significant (applies to both peaks and clippings)
     pub min_events: i32,
     /// Minimum frequence of events to consider a signal significant (applies to both peaks and clippings)
     pub min_frequency: f64,
     /// Maximum distance (bp) between peaks to merge them
     pub max_distance_peaks: i32,
-    /// Significance threshold for clipping test (p-value threshold)
+    /// Significance threshold for Poisson and clipping test (p-value threshold)
     /// Lower values are more stringent (require higher confidence that peak is real terminus)
-    pub clipping_significance: f64,
+    pub threshold_significance: f64,
 }
 
 impl Default for PhageTerminiConfig {
@@ -70,10 +75,11 @@ impl Default for PhageTerminiConfig {
             min_aligned_fraction: 90,
             min_identity_dtr: 90,
             max_distance_duplication: 100,
+            min_clipping_length: 5,
             min_events: 10,
             min_frequency: 0.1, // 10% of coverage
             max_distance_peaks: 20,
-            clipping_significance: 0.05, // 95% confidence interval
+            threshold_significance: 0.05, // 95% confidence interval
         }
     }
 }
@@ -113,7 +119,7 @@ fn is_area_clipping_acceptable(
     total_spc: u64,
     sum_clippings: u64,
     clipped_ratio: f64,
-    clipping_significance: f64,
+    threshold_significance: f64,
 ) -> (bool, f64) {
     let expected_clippings = clipped_ratio * total_spc as f64;
 
@@ -136,7 +142,7 @@ fn is_area_clipping_acceptable(
     let z = (sum_clippings as f64 - expected_clippings) / std_err;
 
     let normal = Normal::new(0.0, 1.0).unwrap();
-    let z_critical = normal.inverse_cdf(1.0 - clipping_significance);
+    let z_critical = normal.inverse_cdf(1.0 - threshold_significance);
 
     if z > z_critical {
         (false, expected_clippings)
@@ -202,6 +208,7 @@ fn poisson_test_areas(
     coverage_reduced: &[u64],
     genome_length: usize,
     circular: bool,
+    threshold_significance: f64
 ) {
     if areas.is_empty() {
         return;
@@ -287,7 +294,7 @@ fn poisson_test_areas(
         area.pvalue = pvalue;
         area.adjusted_pvalue = adjusted;
 
-        if adjusted > 0.05 {
+        if adjusted > threshold_significance {
             area.passed_poisson_test = false;
         }
     }
@@ -321,7 +328,7 @@ pub fn filter_and_merge_to_areas_with_diagnostics(
     let min_frequency = config.min_frequency;
     let min_events = config.min_events as u64;
     let max_distance_peaks = config.max_distance_peaks;
-    let clipping_significance = config.clipping_significance;
+    let threshold_significance = config.threshold_significance;
 
     // Step 1: Position Filtering for starts (local criteria only)
     let mut filtered_start_positions: Vec<(i32, u64)> = Vec::new();
@@ -379,8 +386,8 @@ pub fn filter_and_merge_to_areas_with_diagnostics(
     );
 
     // Step 2b: Poisson peak significance test
-    poisson_test_areas(&mut start_areas, reads_starts, coverage_reduced, genome_length, circular);
-    poisson_test_areas(&mut end_areas, reads_ends, coverage_reduced, genome_length, circular);
+    poisson_test_areas(&mut start_areas, reads_starts, coverage_reduced, genome_length, circular, threshold_significance);
+    poisson_test_areas(&mut end_areas, reads_ends, coverage_reduced, genome_length, circular, threshold_significance);
 
     // Step 3: Pre-filter clippings (zero out non-significant positions)
     let mut left_clippings_filtered: Vec<u64> = left_clippings.to_vec();
@@ -463,7 +470,7 @@ pub fn filter_and_merge_to_areas_with_diagnostics(
             max_distance_peaks, genome_length, circular
         );
         let (passes, expected_clippings) = is_area_clipping_acceptable(
-            area.total_spc as u64, sum_clips, clipped_ratio, clipping_significance
+            area.total_spc as u64, sum_clips, clipped_ratio, threshold_significance
         );
 
         area.sum_clippings = sum_clips;
@@ -479,7 +486,7 @@ pub fn filter_and_merge_to_areas_with_diagnostics(
             max_distance_peaks, genome_length, circular
         );
         let (passes, expected_clippings) = is_area_clipping_acceptable(
-            area.total_spc as u64, sum_clips, clipped_ratio, clipping_significance
+            area.total_spc as u64, sum_clips, clipped_ratio, threshold_significance
         );
 
         area.sum_clippings = sum_clips;
@@ -566,6 +573,7 @@ fn merge_positions_to_areas(
                 expected_clippings: 0.0, // Will be set later in filter step
                 expected_spc: 0.0,     // Will be set by poisson_test_areas
                 size: 0,               // Will be set by poisson_test_areas
+                median_clippings: 0.0, // Will be set later
             });
 
             // Start new area
@@ -607,6 +615,7 @@ fn merge_positions_to_areas(
         expected_clippings: 0.0, // Will be set later in filter step
         expected_spc: 0.0,     // Will be set by poisson_test_areas
         size: 0,               // Will be set by poisson_test_areas
+        median_clippings: 0.0, // Will be set later
     });
 
     // Handle circular wrap-around merge
@@ -662,6 +671,7 @@ fn merge_positions_to_areas(
                 expected_clippings: 0.0,
                 expected_spc: 0.0,
                 size: 0,
+                median_clippings: 0.0,
             };
         }
     }
@@ -852,6 +862,7 @@ fn peak_area_to_terminus_area(area: &PeakArea) -> TerminusArea {
         expected_clippings: area.expected_clippings,
         expected_spc: area.expected_spc,
         size: area.size,
+        median_clippings: area.median_clippings,
     }
 }
 
@@ -873,7 +884,7 @@ pub fn classify_packaging_areas(
     genome_length: usize,
     circular: bool,
     dtr_regions: &[DtrRegion],
-) -> (String, Vec<TerminusArea>, Vec<TerminusArea>, Option<bool>, Option<i32>) {
+) -> (String, Vec<TerminusArea>, Vec<TerminusArea>, Option<bool>, Option<i32>, Vec<f64>, Vec<f64>) {
     // Filter to only kept areas for classification
     let kept_start_areas: Vec<&PeakArea> = start_areas.iter().filter(|a| a.passed_poisson_test && a.passed_clipping_test).collect();
     let kept_end_areas: Vec<&PeakArea> = end_areas.iter().filter(|a| a.passed_poisson_test && a.passed_clipping_test).collect();
@@ -960,6 +971,10 @@ pub fn classify_packaging_areas(
     let all_right: Vec<TerminusArea> = end_areas.iter().map(peak_area_to_terminus_area).collect();
     let dup_status = combine_duplication_status(starts_status, ends_status, !unique_starts.is_empty(), !unique_ends.is_empty());
 
-    (mechanism, all_left, all_right, dup_status, repeat_length)
+    // Collect median clippings from kept termini
+    let median_left: Vec<f64> = kept_start_areas.iter().map(|a| a.median_clippings).collect();
+    let median_right: Vec<f64> = kept_end_areas.iter().map(|a| a.median_clippings).collect();
+
+    (mechanism, all_left, all_right, dup_status, repeat_length, median_left, median_right)
 }
 

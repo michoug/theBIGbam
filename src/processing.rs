@@ -36,7 +36,7 @@ use crate::types::{
 
 use crate::processing_phage_packaging::{
     classify_packaging_areas, filter_and_merge_to_areas_with_diagnostics,
-    is_valid_terminal_repeat, DtrRegion, PhageTerminiConfig,
+    is_valid_terminal_repeat, DtrRegion, PeakArea, PhageTerminiConfig,
 };
 use crate::processing_completeness::compute_all_metrics;
 
@@ -461,6 +461,44 @@ fn run_autoblast(contigs: &[ContigInfo], threads: usize) -> Result<Vec<RepeatsDa
     Ok(total)
 }
 
+/// Compute median of clipping lengths for clean reads (exact-match + near-match) within an area.
+/// Clean reads are those with clipping < min_clipping_length. Exact-match reads (clipping = 0)
+/// are inferred from clean_reads count minus near-match count, and contribute zeros to the median.
+fn compute_area_median_clippings(
+    area: &PeakArea,
+    clipping_lengths: &[Vec<u32>],
+    clean_reads: &[u64],
+    min_clipping_length: u32,
+) -> f64 {
+    let mut lengths: Vec<u32> = Vec::new();
+    for pos in area.start_pos..=area.end_pos {
+        let idx = (pos - 1) as usize;
+        if idx < clipping_lengths.len() {
+            let near_match_clips: Vec<u32> = clipping_lengths[idx].iter()
+                .filter(|&&l| l > 0 && l < min_clipping_length)
+                .copied()
+                .collect();
+            let near_match_count = near_match_clips.len() as u64;
+            let total_clean = clean_reads.get(idx).copied().unwrap_or(0);
+            let exact_match_count = total_clean.saturating_sub(near_match_count);
+            // Add zeros for exact-match reads
+            lengths.extend(std::iter::repeat(0u32).take(exact_match_count as usize));
+            // Add actual clip lengths for near-match reads
+            lengths.extend(near_match_clips);
+        }
+    }
+    if lengths.is_empty() {
+        return 0.0;
+    }
+    lengths.sort_unstable();
+    let mid = lengths.len() / 2;
+    if lengths.len() % 2 == 0 {
+        (lengths[mid - 1] as f64 + lengths[mid] as f64) / 2.0
+    } else {
+        lengths[mid] as f64
+    }
+}
+
 /// Add features from FeatureArrays to output (optimized path).
 /// Returns a tuple of:
 /// - Optional packaging data for phagetermini module (includes all termini with filtering metadata)
@@ -472,6 +510,7 @@ fn add_features_from_arrays(
     config: &ProcessConfig,
     seq_type: SequencingType,
     flags: ModuleFlags,
+    primary_count: u64,
     repeats: &[RepeatsData],
     output: &mut Vec<FeaturePoint>,
 ) -> (Option<PackagingData>, Option<(MisassemblyData, MicrodiversityData, SideMisassemblyData, TopologyData)>) {
@@ -797,32 +836,34 @@ fn add_features_from_arrays(
         };
 
         if aligned_fraction >= pt_config.min_aligned_fraction as f64 {
-            // Calculate global metrics for statistical filtering
-            let total_coverage_reduced: u64 = arrays.coverage_reduced.iter().sum();
-            let total_primary_reads: u64 = arrays.primary_reads.iter().sum();
-
-            // Compute clipped_ratio = (total_primary_reads - total_coverage_reduced) / total_coverage_reduced
-            // This represents the fraction of reads that are soft-clipped at any position on average.
-            // For long reads, coverage_reduced can contain 2× the reads because each
-            // read is split in two (start half and end half). Normalize by dividing by 2.
-            let clipped_ratio = if total_coverage_reduced > 0 {
-                let effective_coverage_reduced = if seq_type.is_long() {
-                    total_coverage_reduced as f64 / 2.0
+            // Compute clipped_ratio = (number of primary reads - reads with clean termini) / reads with clean termini
+            // This represents the fraction of reads that are clipped relative to clean reads.
+            // For long reads, each read is split in two (start half and end half), so
+            // clean_reads_count already counts each clean terminus separately.
+            // We double primary_count to match (each read = 2 potential termini).
+            let clipped_ratio = if arrays.clean_reads_count > 0 {
+                let effective_primary = if seq_type.is_long() {
+                    primary_count as f64 * 2.0
                 } else {
-                    total_coverage_reduced as f64
+                    primary_count as f64
                 };
-                ((total_primary_reads as f64 - effective_coverage_reduced) / effective_coverage_reduced).max(0.0)
+                ((effective_primary - arrays.clean_reads_count as f64) / arrays.clean_reads_count as f64).max(0.0)
             } else {
                 1.0
             };
 
-            // Get clipping counts as u64 arrays
-            let left_clip_counts: Vec<u64> = arrays.left_clipping_lengths.iter().map(|v| v.len() as u64).collect();
-            let right_clip_counts: Vec<u64> = arrays.right_clipping_lengths.iter().map(|v| v.len() as u64).collect();
+            // Get clipping counts as u64 arrays, filtering by min_clipping_length
+            let min_clip_len = pt_config.min_clipping_length;
+            let left_clip_counts: Vec<u64> = arrays.left_clipping_lengths.iter()
+                .map(|v| v.iter().filter(|&&len| len >= min_clip_len).count() as u64)
+                .collect();
+            let right_clip_counts: Vec<u64> = arrays.right_clipping_lengths.iter()
+                .map(|v| v.iter().filter(|&&len| len >= min_clip_len).count() as u64)
+                .collect();
 
             // === STEP 3-5: Filter, statistical test, merge into areas, global filter ===
             // Returns ALL areas (both kept and discarded) with filtering metadata
-            let (start_areas, end_areas) = filter_and_merge_to_areas_with_diagnostics(
+            let (mut start_areas, mut end_areas) = filter_and_merge_to_areas_with_diagnostics(
                 &arrays.reads_starts,
                 &arrays.reads_ends,
                 &left_clip_counts,
@@ -836,8 +877,16 @@ fn add_features_from_arrays(
                 &dtr_regions,
             );
 
+            // Compute median clipping lengths per area
+            for area in &mut start_areas {
+                area.median_clippings = compute_area_median_clippings(area, &arrays.left_clipping_lengths, &arrays.reads_starts, min_clip_len);
+            }
+            for area in &mut end_areas {
+                area.median_clippings = compute_area_median_clippings(area, &arrays.right_clipping_lengths, &arrays.reads_ends, min_clip_len);
+            }
+
             // === STEP 6: Classify packaging based on peak-areas ===
-            let (mechanism, left_termini, right_termini, duplication, repeat_length) = classify_packaging_areas(
+            let (mechanism, left_termini, right_termini, duplication, repeat_length, median_left_clippings, median_right_clippings) = classify_packaging_areas(
                 &start_areas,
                 &end_areas,
                 contig_length,
@@ -855,6 +904,8 @@ fn add_features_from_arrays(
                     right_termini,
                     duplication,
                     repeat_length,
+                    median_left_termini_clippings: median_left_clippings,
+                    median_right_termini_clippings: median_right_clippings,
                 })
             } else {
                 None
@@ -951,7 +1002,7 @@ pub fn process_sample(
 
             // Process contig using streaming - single pass over reads
             // Early coverage check happens inside process_contig_streaming
-            let (mut arrays, coverage_pct, primary_count) = match process_contig_streaming(&mut bam, &ref_name, ref_length, seq_type, flags, config.circular, config.min_aligned_fraction) {
+            let (mut arrays, coverage_pct, primary_count) = match process_contig_streaming(&mut bam, &ref_name, ref_length, seq_type, flags, config.circular, config.min_aligned_fraction, config.phagetermini_config.min_clipping_length) {
                 Ok(Some(result)) => result,
                 Ok(None) => return None,
                 Err(e) => {
@@ -970,7 +1021,7 @@ pub fn process_sample(
 
             // Calculate features for this contig
             let mut features = Vec::new();
-            let (packaging_info, metrics_info) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, seq_type, flags, repeats, &mut features);
+            let (packaging_info, metrics_info) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, seq_type, flags, primary_count, repeats, &mut features);
             let coverage_median = arrays.coverage_median() as f32;
             let coverage_trimmed_mean = arrays.coverage_trimmed_mean(0.05) as f32;
 

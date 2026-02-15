@@ -217,6 +217,16 @@ impl DbWriter {
                     conn, contig_id, &kept_terminus_positions, genome_length, circular,
                 );
 
+                // Format median clippings as comma-separated integer strings
+                let median_left_str: String = pkg.median_left_termini_clippings.iter()
+                    .map(|v| format!("{}", v.round() as i32))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let median_right_str: String = pkg.median_right_termini_clippings.iter()
+                    .map(|v| format!("{}", v.round() as i32))
+                    .collect::<Vec<_>>()
+                    .join(",");
+
                 // Insert into PhageMechanisms
                 mechanism_appender.append_row(params![
                     packaging_id,
@@ -225,7 +235,9 @@ impl DbWriter {
                     &pkg.mechanism,
                     pkg.duplication,
                     pkg.repeat_length,
-                    terminase_distance
+                    terminase_distance,
+                    &median_left_str,
+                    &median_right_str
                 ])?;
 
                 // Insert left termini (status = "start")
@@ -244,6 +256,7 @@ impl DbWriter {
                         terminus.center_pos,
                         "start",
                         terminus.total_spc as i32,
+                        terminus.median_clippings.round() as i32,
                         terminus.coverage as i32,
                         tau_int,
                         terminus.number_peaks as i32,
@@ -274,6 +287,7 @@ impl DbWriter {
                         terminus.center_pos,
                         "end",
                         terminus.total_spc as i32,
+                        terminus.median_clippings.round() as i32,
                         terminus.coverage as i32,
                         tau_int,
                         terminus.number_peaks as i32,
@@ -870,7 +884,9 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             Packaging_mechanism TEXT NOT NULL,
             Duplication BOOLEAN,
             Repeat_length INTEGER,
-            Terminase_distance INTEGER
+            Terminase_distance INTEGER,
+            Median_left_termini_clippings TEXT,
+            Median_right_termini_clippings TEXT
         )",
         [],
     )
@@ -889,6 +905,7 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             Center INTEGER NOT NULL,
             Status TEXT NOT NULL,
             SPC INTEGER NOT NULL,
+            Median_clippings INTEGER NOT NULL,
             Coverage INTEGER NOT NULL,
             Tau INTEGER NOT NULL,
             NumberPeaks INTEGER NOT NULL,
@@ -1565,12 +1582,14 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
                   WHERE pt.Packaging_id = m.Packaging_id AND pt.Status = 'start' AND pt.Passed_PoissonTest = 'yes' AND pt.Passed_ClippingTest = 'yes'),
                  ''
              ) AS Left_termini,
+             m.Median_left_termini_clippings,
              COALESCE(
                  (SELECT STRING_AGG(CAST(pt.Center AS VARCHAR), ',' ORDER BY pt.Center)
                   FROM PhageTermini pt
                   WHERE pt.Packaging_id = m.Packaging_id AND pt.Status = 'end' AND pt.Passed_PoissonTest = 'yes' AND pt.Passed_ClippingTest = 'yes'),
                  ''
              ) AS Right_termini,
+             m.Median_right_termini_clippings,
              CASE WHEN m.Duplication = true THEN 'DTR'
                   WHEN m.Duplication = false THEN 'ITR'
                   ELSE NULL END AS Duplication,
@@ -1614,6 +1633,7 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
              t.Center,
              t.Status,
              t.SPC,
+             t.Median_clippings,
              t.Coverage,
              t.Tau,
              t.NumberPeaks,

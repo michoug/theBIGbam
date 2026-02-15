@@ -58,9 +58,11 @@ Positions passing the filter are merged into peak areas:
 - For circular genomes, wrap-around merging occurs
 - Each area stores: start_pos, end_pos, peak_size, center_pos (position with highest signal), total_spc (spc stands for Starting Position Coverage)
 
-## 5. Peak Testing (Poisson Significance)
+## 5. Peak Testing
 
-After merging, each peak area is tested for statistical significance using a Poisson model. Under uniform random fragmentation, read starts at each position follow a Poisson distribution with rate proportional to local coverage.
+2 tests are performed to identify real termini. The Poisson test validates that the peak itself is significant (more starts than expected under uniform fragmentation). The subsequent clipping test checks whether a significant peak is an artifact (excess clippings indicating misalignment). These are complementary: the Poisson test filters noise, the clipping test filters artifacts. An area must pass **both** tests (`passed_poisson_test && passed_clipping_test`) to be kept.
+
+First, each peak area is tested for statistical significance using a **true Poisson exact test**. Under uniform random fragmentation, read starts at each position follow a Poisson distribution with rate proportional to local coverage.
 
 **Background rate computation:**
 
@@ -72,10 +74,6 @@ After merging, each peak area is tested for statistical significance using a Poi
 - `λ_W = sum(coverage_reduced[i] × pstart)` for all positions i in the window
 - This accounts for variable coverage across the window
 
-**Size:**
-
-- Each area's `size` field is computed as the distance between `start_pos` and `end_pos` + 1
-
 **Observed count:**
 
 - `X_W = area.total_spc` (total read starts/ends in the window)
@@ -85,11 +83,7 @@ After merging, each peak area is tested for statistical significance using a Poi
 - Model: `X_W ~ Poisson(λ_W)`
 - p-value: `P(X >= X_W | Poisson(λ_W))` (upper-tail, via `statrs` crate)
 - Bonferroni correction: `adjusted_pvalue = pvalue × K` where K = number of windows tested (separate K for starts and ends)
-- Areas with `adjusted_pvalue > 0.05` have `passed_poisson_test` set to false
-
-**Wrap-around handling:** For circular genomes where `start_pos > end_pos`, the expected count sums coverage from `start_pos` to genome end plus position 1 to `end_pos`.
-
-The Poisson test validates that the peak itself is significant (more starts than expected under uniform fragmentation). The subsequent clipping test checks whether a significant peak is an artifact (excess clippings indicating misalignment). These are complementary: the Poisson test filters noise, the clipping test filters artifacts. An area must pass **both** tests (`passed_poisson_test && passed_clipping_test`) to be kept.
+- Areas with `adjusted_pvalue > 0.05` pass the test
 
 ## 6. Clipping Testing
 
@@ -116,17 +110,9 @@ For each peak area, sum all pre-filtered clippings:
 - Within the area bounds (start_pos to end_pos)
 - OR within **max_distance_peaks** of area edges
 
-**Distance calculation uses circular-aware distance only** (not DTR-aware). DTR deduplication happens at classification time, not during clipping aggregation.
-
-| Repeat Type | Distance Calculation | Rationale                                                                            |
-| ----------- | -------------------- | ------------------------------------------------------------------------------------ |
-| **DTR**     | Circular-aware only  | DTR deduplication handled separately at classification                               |
-| **ITR**     | Circular-aware only  | Left clippings in first ITR ≠ left clippings in second ITR (orientation is inverted) |
-| **None**    | Circular-aware only  | Standard distance calculation                                                        |
-
 ### 6d. Statistical Test
 
-Tests whether a peak area has **significantly more clippings** than expected globally.
+Test whether a peak area has **significantly more clippings** than expected globally using a **z-test with a normal approximation to a binomial model**.
 
 **Expected clippings calculation:**
 
@@ -138,7 +124,7 @@ Tests whether a peak area has **significantly more clippings** than expected glo
 - If `sum_clippings > expected_clippings` significantly → **DISCARD** (`passed_clipping_test = false`)
 - Otherwise → **KEEP**
 
-Statistical significance is determined using **clipping_significance** (default 0.05 → z_critical = 1.645).
+Statistical significance is determined using **clipping_significance** (default 0.05 → z_critical = 1.645). Only peaks that do not have too many clippings within their area are kept.
 
 ## 7. DTR Deduplication
 
@@ -162,6 +148,8 @@ Based on unique peak count after deduplication:
 | 1           | 1         | See distance-based rules below |
 | >1 or >1    |           | Unknown_packaging              |
 
+For contigs harboring DTR, 2 peaks that are located at equivalent positions on both DTR count as only 1 peak.
+
 ### Distance-based Classification (1 start, 1 end)
 
 For ITR configuration (both peaks in ITR regions, distance ≤20bp):
@@ -176,29 +164,59 @@ Otherwise, based on distance between canonical positions:
 - ≤20bp → **COS_5'/3'** (cohesive with overhang)
 - ≤1000bp → **DTR_short_5'/3'**
 - ≤10% genome → **DTR_long_5'/3'**
-- > 10% genome → **DTR_outlier_5'/3'**
+- \>10% genome → **DTR_outlier_5'/3'**
 
 The suffix (_5' or _3') indicates overhang orientation based on whether end comes before or after start in genomic coordinates.
 
 ## 9. Output
 
-- **Mechanism**: Classification string (e.g., "DTR_short_5'")
-- **Left termini**: All start area positions (original positions)
-- **Right termini**: All end area positions (original positions)
-- **Duplication status**: `true` if all peaks in DTR, `false` if all in ITR, `null` otherwise
-- **Repeat length**: Distance between start and end peak centers (when exactly 1 unique of each after deduplication)
+Results are stored as two DuckDB views in the database: `Explicit_phage_mechanisms` (one row per contig×sample) and `Explicit_phage_termini` (one row per terminus area).
 
-## Summary: DTR vs ITR Handling
+### Explicit_phage_mechanisms
 
-| Aspect                   | DTR (Direct)                  | ITR (Inverted)                               |
-| ------------------------ | ----------------------------- | -------------------------------------------- |
-| Peak merging             | Simple distance               | Simple distance                              |
-| Position storage         | Original positions            | Original positions                           |
-| Both-copies confirmation | Yes (zeros artifacts)         | No                                           |
-| Clipping aggregation     | Circular-aware only           | Circular-aware only                          |
-| Deduplication            | At classification (canonical) | At classification (no merge)                 |
-| ITR repeat length        | N/A                           | From autoblast (first_end - first_start + 1) |
+| Column               | Description                                                                                                                                      |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Contig_name          | Contig identifier                                                                                                                                |
+| Sample_name          | Sample identifier                                                                                                                                |
+| Packaging_mechanism  | Classification string (e.g., "DTR_short_5'")                                                                                                     |
+| Left_termini         | Comma-separated center positions of kept start areas                                                                                             |
+| Right_termini        | Comma-separated center positions of kept end areas                                                                                               |
+| Duplication          | "DTR" if all peaks in DTR, "ITR" if all in ITR, NULL otherwise                                                                                   |
+| Total_peaks          | Count of areas that passed both Poisson and clipping tests                                                                                       |
+| Repeat_length        | Distance between start and end peak centers (if 1 of each)                                                                                       |
+| Terminase_distance   | Distance between the two peak centers (if applicable, from terminase large subunit annotation — comes from external metadata, not this pipeline) |
+| Terminase_percentage | `Terminase_distance / Contig_length × 100`                                                                                                       |
 
-**Simplified architecture**: Peak areas are processed independently until classification. DTR-equivalent areas (from both copies of the repeat) are stored separately in the database, then deduplicated at classification time using canonical positions. This ensures all original peak information is preserved while correctly classifying DTR/ITR mechanisms.
+### Explicit_phage_termini
 
-The key difference at classification: DTR copies are directly equivalent (same sequence, same orientation), so areas from both regions are merged to a single canonical area for counting. ITR copies are inverted, so one peak in each region represents a legitimate COS-like configuration, not duplication.
+Contains all columns from `Explicit_phage_mechanisms` (Contig_name through Terminase_percentage) plus the following per-area columns:
+
+| Column                | Description                                                                                                                                                                                                                                                                                                                                                                                                               |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Start                 | First position of the merged area                                                                                                                                                                                                                                                                                                                                                                                         |
+| End                   | Last position of the merged area                                                                                                                                                                                                                                                                                                                                                                                          |
+| Size                  | Distance between Start and End + 1                                                                                                                                                                                                                                                                                                                                                                                        |
+| Center                | Position with highest SPC in the area                                                                                                                                                                                                                                                                                                                                                                                     |
+| Status                | "start" (left terminus) or "end" (right terminus)                                                                                                                                                                                                                                                                                                                                                                         |
+| SPC                   | Total starting position coverage in the area                                                                                                                                                                                                                                                                                                                                                                              |
+| Coverage              | Coverage at center position                                                                                                                                                                                                                                                                                                                                                                                               |
+| Tau                   | SPC / Coverage × 100 (stored as integer)                                                                                                                                                                                                                                                                                                                                                                                  |
+| NumberPeaks           | Number of positions merged into this area                                                                                                                                                                                                                                                                                                                                                                                 |
+| Passed_PoissonTest    | "yes" or "no"                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Expected_SPC          | Expected SPC from Poisson model (λ_W, rounded)                                                                                                                                                                                                                                                                                                                                                                            |
+| Pvalue                | Raw Poisson p-value (compact format)                                                                                                                                                                                                                                                                                                                                                                                      |
+| Adjusted_pvalue       | Bonferroni-adjusted p-value (compact format)                                                                                                                                                                                                                                                                                                                                                                              |
+| Passed_ClippingTest   | "yes" or "no"                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Clippings             | Sum of pre-filtered clippings in/near area                                                                                                                                                                                                                                                                                                                                                                                |
+| Clipping_excess       | Relative amount of clipped reads to the number of reads starting with a match: `100*(#reads-# reads_starting_with_a_match)/# reads_starting_with_a_match`. `#reads-# reads_starting_with_a_match` corresponds to the number of clipped reads. For long reads, each read is split in two to account for both termini so the formula becomes:  `100*(2*#reads-# reads_starting_with_a_match)/# reads_starting_with_a_match` |
+| Max_clippings_allowed | `ROUND(expected_clippings)` — threshold from statistical test determined from the local SPC and the clipping_excess value for this contig/sample                                                                                                                                                                                                                                                                          |
+
+### Accessing the results
+
+Both DuckDB views can be explored with a database viewer allowing DuckDB databases like DBeaver or directly in the terminal via:
+
+- duckdb <DATABASE_NAME> "SELECT * FROM Explicit_phage_mechanisms"
+
+- duckdb "SELECT * FROM Explicit_phage_termini"
+
+The `Explicit_phage_mechanisms` results are also integrated in the visualization local webpage.
