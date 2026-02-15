@@ -8,7 +8,7 @@ The phage termini detection relies on **reads_starts** and **reads_ends** arrays
 
 ### Filtering: Only Matching Termini
 
-A read's terminus is only counted if it starts with a **match** (no soft-clipping or mismatch). This is verified using both the CIGAR string and MD tag. Reads starting with clipping or mismatches are excluded because they likely represent sequencing artifacts or misalignments rather than true biological termini.
+A read's terminus is only counted if it starts with a **match** within the first min_clipping_length basepairs (default 5). This is verified using both the CIGAR string and MD tag. Reads starting with clippings or insertions longer than 5bp are excluded because they likely represent sequencing artifacts or misalignments rather than true biological termini. Reads where the terminus is counted are called "clean reads".
 
 ### Short vs Long Reads
 
@@ -174,18 +174,20 @@ Results are stored as two DuckDB views in the database: `Explicit_phage_mechanis
 
 ### Explicit_phage_mechanisms
 
-| Column               | Description                                                                                                                                      |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Contig_name          | Contig identifier                                                                                                                                |
-| Sample_name          | Sample identifier                                                                                                                                |
-| Packaging_mechanism  | Classification string (e.g., "DTR_short_5'")                                                                                                     |
-| Left_termini         | Comma-separated center positions of kept start areas                                                                                             |
-| Right_termini        | Comma-separated center positions of kept end areas                                                                                               |
-| Duplication          | "DTR" if all peaks in DTR, "ITR" if all in ITR, NULL otherwise                                                                                   |
-| Total_peaks          | Count of areas that passed both Poisson and clipping tests                                                                                       |
-| Repeat_length        | Distance between start and end peak centers (if 1 of each)                                                                                       |
-| Terminase_distance   | Distance between the two peak centers (if applicable, from terminase large subunit annotation — comes from external metadata, not this pipeline) |
-| Terminase_percentage | `Terminase_distance / Contig_length × 100`                                                                                                       |
+| Column                         | Description                                                                                                                                      |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Contig_name                    | Contig identifier                                                                                                                                |
+| Sample_name                    | Sample identifier                                                                                                                                |
+| Packaging_mechanism            | Classification string (e.g., "DTR_short_5'")                                                                                                     |
+| Left_termini                   | Comma-separated center positions of kept start areas                                                                                             |
+| Median_left_termini_clippings  | Comma-separated median clipping lengths of clean starts per left terminus (one value per terminus, same order as Left_termini)                   |
+| Right_termini                  | Comma-separated center positions of kept end areas                                                                                               |
+| Median_right_termini_clippings | Comma-separated median clipping lengths of clean starts per right terminus (one value per terminus, same order as Right_termini)                 |
+| Duplication                    | "DTR" if all peaks in DTR, "ITR" if all in ITR, NULL otherwise                                                                                   |
+| Total_peaks                    | Count of areas that passed both Poisson and clipping tests                                                                                       |
+| Repeat_length                  | Distance between start and end peak centers (if 1 of each)                                                                                       |
+| Terminase_distance             | Distance between the two peak centers (if applicable, from terminase large subunit annotation — comes from external metadata, not this pipeline) |
+| Terminase_percentage           | `Terminase_distance / Contig_length × 100`                                                                                                       |
 
 ### Explicit_phage_termini
 
@@ -199,6 +201,7 @@ Contains all columns from `Explicit_phage_mechanisms` (Contig_name through Termi
 | Center                | Position with highest SPC in the area                                                                                                                                                                                                                                                                                                                                                                                     |
 | Status                | "start" (left terminus) or "end" (right terminus)                                                                                                                                                                                                                                                                                                                                                                         |
 | SPC                   | Total starting position coverage in the area                                                                                                                                                                                                                                                                                                                                                                              |
+| Median_clippings      | Median clipping length across all clean reads in the area. Clean reads are those with clipping < min_clipping_length (default 5): exact-match reads contribute 0, near-match reads contribute their actual clip length (1–4). Values range from 0 to min_clipping_length − 1                                                                                                                                              |
 | Coverage              | Coverage at center position                                                                                                                                                                                                                                                                                                                                                                                               |
 | Tau                   | SPC / Coverage × 100 (stored as integer)                                                                                                                                                                                                                                                                                                                                                                                  |
 | NumberPeaks           | Number of positions merged into this area                                                                                                                                                                                                                                                                                                                                                                                 |
