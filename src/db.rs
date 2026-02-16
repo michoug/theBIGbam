@@ -393,7 +393,7 @@ impl DbWriter {
 
     fn write_features(&self, conn: &Connection, sample_id: i64, features: &[FeaturePoint]) -> Result<()> {
         // Features that have statistics columns
-        let features_with_stats = ["left_clippings", "right_clippings", "insertions"];
+        let features_with_stats = ["left_clippings", "right_clippings", "insertions", "reads_starts", "reads_ends"];
 
         // Group features by variable name for efficient batch inserts
         let mut by_variable: HashMap<&str, Vec<&FeaturePoint>> = HashMap::new();
@@ -916,7 +916,7 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             Passed_ClippingTest TEXT NOT NULL,
             Clippings INTEGER NOT NULL,
             Clipping_excess INTEGER NOT NULL,
-            Max_clippings_allowed INTEGER NOT NULL
+            Expected_clippings INTEGER NOT NULL
         )",
         [],
     )
@@ -1644,7 +1644,7 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
              t.Passed_ClippingTest,
              t.Clippings,
              t.Clipping_excess,
-             t.Max_clippings_allowed
+             t.Expected_clippings
          FROM PhageTermini t
          JOIN PhageMechanisms m ON t.Packaging_id = m.Packaging_id
          JOIN Contig c ON m.Contig_id = c.Contig_id

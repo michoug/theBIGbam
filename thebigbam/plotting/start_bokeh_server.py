@@ -405,6 +405,16 @@ def create_layout(db_path):
                     WHERE "{column_name}" {operator} ?
                 '''
 
+            # Coerce value type to match column type (prevents DuckDB implicit cast errors)
+            col_type = col_info.get('type', 'numeric')
+            if col_type == 'text' and not isinstance(value, str):
+                value = str(value)
+            elif col_type == 'numeric' and isinstance(value, str):
+                try:
+                    value = float(value)
+                except (ValueError, TypeError):
+                    return set()
+
             try:
                 cur.execute(query, [value])
                 return {(row[0], row[1]) for row in cur.fetchall()}

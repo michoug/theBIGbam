@@ -5,7 +5,7 @@
 //!
 //! All features are calculated in a single pass through the BAM reads for efficiency.
 
-use crate::cigar::{raw_cigar_consumes_ref, raw_cigar_is_clipping, raw_has_near_match_at_position, MdTag};
+use crate::cigar::{raw_cigar_consumes_ref, raw_cigar_is_clipping, raw_boundary_event_length, MdTag};
 use crate::circular::{increment_circular, increment_circular_long, increment_range};
 use crate::types::{FeatureMap, SequencingType};
 use std::collections::HashMap;
@@ -67,6 +67,14 @@ pub struct FeatureArrays {
     /// Count of read 3' ends at each position.
     /// Combined with reads_starts to identify terminus types.
     pub reads_ends: Vec<u64>,
+
+    /// Event lengths at each read start position (0 for exact match, clip/insertion length for near-match).
+    /// Used for per-position Mean/Median/Std statistics on reads_starts.
+    pub start_event_lengths: Vec<Vec<u32>>,
+
+    /// Event lengths at each read end position (0 for exact match, clip/insertion length for near-match).
+    /// Used for per-position Mean/Median/Std statistics on reads_ends.
+    pub end_event_lengths: Vec<Vec<u32>>,
 
     // -------------------------------------------------------------------------
     // Assemblycheck Module
@@ -177,6 +185,8 @@ impl FeatureArrays {
             coverage_reduced: vec![0u64; ref_length],
             reads_starts: vec![0u64; ref_length],
             reads_ends: vec![0u64; ref_length],
+            start_event_lengths: vec![Vec::new(); ref_length],
+            end_event_lengths: vec![Vec::new(); ref_length],
             left_clipping_lengths: vec![Vec::new(); ref_length],
             right_clipping_lengths: vec![Vec::new(); ref_length],
             insertion_lengths: vec![Vec::new(); ref_length],
@@ -784,14 +794,15 @@ pub fn process_read(
     // Phagetermini module - primary mappings only
     // -------------------------------------------------------------------------
     if flags.phagetermini && !is_secondary && !is_supplementary {
-        // Check if read has clean alignment at start (no clip/mismatch)
-        // raw_has_match_at_position checks both CIGAR and MD tag
-        let start_matches = raw_has_near_match_at_position(cigar_raw, md_tag, !is_reverse, min_clipping_length);
+        // Compute boundary event lengths: Some(0) for exact match, Some(len) for near-match, None if neither
+        let start_event = raw_boundary_event_length(cigar_raw, md_tag, !is_reverse, min_clipping_length);
+        let start_matches = start_event.is_some();
 
         if seq_type.is_long() {
             // Long reads: split read in half and check each terminus independently
             // This avoids losing ~80% of reads that have clipping at one end
-            let end_matches = raw_has_near_match_at_position(cigar_raw, md_tag, is_reverse, min_clipping_length);
+            let end_event = raw_boundary_event_length(cigar_raw, md_tag, is_reverse, min_clipping_length);
+            let end_matches = end_event.is_some();
             let midpoint = (raw_start as usize + raw_end as usize) / 2;
 
             // Count clean termini for clipped_ratio calculation
@@ -833,8 +844,9 @@ pub fn process_read(
                 }
             }
 
-            // Count start position only if start matches
-            if start_matches {
+            // Count start position and collect event length only if start matches
+            if let Some(evt_len) = start_event {
+                arrays.start_event_lengths[start].push(evt_len);
                 if is_reverse {
                     arrays.start_minus[start] += 1;
                 } else {
@@ -842,8 +854,8 @@ pub fn process_read(
                 }
             }
 
-            // Count end position only if end matches
-            if end_matches {
+            // Count end position and collect event length only if end matches
+            if let Some(evt_len) = end_event {
                 let end_pos = if end > 0 {
                     let pos = end - 1;
                     if circular { pos % ref_length } else { pos }
@@ -851,6 +863,7 @@ pub fn process_read(
                     0
                 };
 
+                arrays.end_event_lengths[end_pos].push(evt_len);
                 if is_reverse {
                     arrays.end_minus[end_pos] += 1;
                 } else {
@@ -874,6 +887,13 @@ pub fn process_read(
                 } else {
                     0
                 };
+
+                // Collect start event length
+                arrays.start_event_lengths[start].push(start_event.unwrap());
+
+                // Compute and collect end event length separately
+                let end_event = raw_boundary_event_length(cigar_raw, md_tag, is_reverse, min_clipping_length);
+                arrays.end_event_lengths[end_pos].push(end_event.unwrap_or(0));
 
                 if is_reverse {
                     arrays.start_minus[start] += 1;

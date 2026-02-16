@@ -311,13 +311,20 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None):
             ("Value", "@y{0.00}")
         ]
     elif has_any_stats:
+        # Check if mean/std are all None (median-only features like reads_starts/reads_ends)
+        has_mean = any(
+            any(m is not None for m in d.get("mean", []))
+            for d in feature_dict if d.get("has_stats", False)
+        )
         tooltips = [
             ("Position", "@x{0,00}"),
             ("Value", "@y{0.00}"),
-            ("Mean", "@mean{0.00}"),
-            ("Median", "@median{0.00}"),
-            ("Std", "@std{0.00}")
         ]
+        if has_mean:
+            tooltips.append(("Mean", "@mean{0.00}"))
+        tooltips.append(("Median clipping", "@median{0.00}") if not has_mean else ("Median", "@median{0.00}"))
+        if has_mean:
+            tooltips.append(("Std", "@std{0.00}"))
     else:
         tooltips = [("Position", "@x{0,0}"), ("Value", "@y{0.00}")]
     
@@ -861,7 +868,7 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
         }
 
         # Check if this feature has statistics columns
-        features_with_stats = ["left_clippings", "right_clippings", "insertions"]
+        features_with_stats = ["left_clippings", "right_clippings", "insertions", "reads_starts", "reads_ends"]
         has_stats = feature_table in [f"Feature_{f}" for f in features_with_stats]
 
         # Check if this feature stores scaled values (stored as INTEGER ×100)
@@ -1158,7 +1165,7 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
     for row in rows:
         type_picked, color, alpha, fill_alpha, size, title, feature_table = row
 
-        features_with_stats = ["left_clippings", "right_clippings", "insertions"]
+        features_with_stats = ["left_clippings", "right_clippings", "insertions", "reads_starts", "reads_ends"]
         has_stats = feature_table in [f"Feature_{f}" for f in features_with_stats]
         scaled_features = ["Feature_tau", "Feature_mapq"]
         is_scaled = feature_table in scaled_features

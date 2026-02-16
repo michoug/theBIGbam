@@ -24,7 +24,8 @@ use crate::bam_reader::{detect_sequencing_type, get_total_read_count, process_co
 use crate::compress::{
     compress_signal_with_reference, Run,
     add_compressed_feature, add_compressed_feature_with_reference,
-    add_compressed_feature_with_stats, merge_identical_runs,
+    add_compressed_feature_with_stats, add_compressed_feature_with_median,
+    merge_identical_runs,
 };
 use crate::db::{DbWriter, MisassemblyData, MicrodiversityData, SideMisassemblyData, TopologyData, GCContentData, RepeatsData};
 use crate::gc_content::{compute_gc_content, compute_gc_skew, GCParams};
@@ -461,30 +462,18 @@ fn run_autoblast(contigs: &[ContigInfo], threads: usize) -> Result<Vec<RepeatsDa
     Ok(total)
 }
 
-/// Compute median of clipping lengths for clean reads (exact-match + near-match) within an area.
-/// Clean reads are those with clipping < min_clipping_length. Exact-match reads (clipping = 0)
-/// are inferred from clean_reads count minus near-match count, and contribute zeros to the median.
+/// Compute median of event lengths (0 for exact match, clip/insertion length for near-match)
+/// across all positions in an area. The event_lengths array already contains the correct
+/// values collected during BAM processing.
 fn compute_area_median_clippings(
     area: &PeakArea,
-    clipping_lengths: &[Vec<u32>],
-    clean_reads: &[u64],
-    min_clipping_length: u32,
+    event_lengths: &[Vec<u32>],
 ) -> f64 {
     let mut lengths: Vec<u32> = Vec::new();
     for pos in area.start_pos..=area.end_pos {
         let idx = (pos - 1) as usize;
-        if idx < clipping_lengths.len() {
-            let near_match_clips: Vec<u32> = clipping_lengths[idx].iter()
-                .filter(|&&l| l > 0 && l < min_clipping_length)
-                .copied()
-                .collect();
-            let near_match_count = near_match_clips.len() as u64;
-            let total_clean = clean_reads.get(idx).copied().unwrap_or(0);
-            let exact_match_count = total_clean.saturating_sub(near_match_count);
-            // Add zeros for exact-match reads
-            lengths.extend(std::iter::repeat(0u32).take(exact_match_count as usize));
-            // Add actual clip lengths for near-match reads
-            lengths.extend(near_match_clips);
+        if idx < event_lengths.len() {
+            lengths.extend_from_slice(&event_lengths[idx]);
         }
     }
     if lengths.is_empty() {
@@ -740,39 +729,24 @@ fn add_features_from_arrays(
         let coverage_reduced_f64: Vec<f64> = arrays.coverage_reduced.iter().map(|&x| x as f64).collect();
         add_compressed_feature(&coverage_reduced_f64, "coverage_reduced", contig_name, config, output);
 
-        // reads_starts and reads_ends (bars) - save original data
+        // reads_starts and reads_ends (bars) with median event length only
         let reads_starts_original: Vec<f64> = arrays.reads_starts.iter().map(|&x| x as f64).collect();
-        let reads_starts_runs = compress_signal_with_reference(
-            &reads_starts_original, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio
+        let start_evt_medians: Vec<f64> = arrays.start_event_lengths.iter().map(|v| {
+            if v.is_empty() { 0.0 } else { let mut s = v.clone(); s.sort_unstable(); s[s.len()/2] as f64 }
+        }).collect();
+        let reads_starts_runs = add_compressed_feature_with_median(
+            &reads_starts_original, &start_evt_medians,
+            Some(&coverage_reduced_f64), "reads_starts", contig_name, config, output,
         );
 
         let reads_ends_original: Vec<f64> = arrays.reads_ends.iter().map(|&x| x as f64).collect();
-        let reads_ends_runs = compress_signal_with_reference(
-            &reads_ends_original, Some(&coverage_reduced_f64), PlotType::Bars, config.curve_ratio, config.bar_ratio
+        let end_evt_medians: Vec<f64> = arrays.end_event_lengths.iter().map(|v| {
+            if v.is_empty() { 0.0 } else { let mut s = v.clone(); s.sort_unstable(); s[s.len()/2] as f64 }
+        }).collect();
+        let reads_ends_runs = add_compressed_feature_with_median(
+            &reads_ends_original, &end_evt_medians,
+            Some(&coverage_reduced_f64), "reads_ends", contig_name, config, output,
         );
-
-        // Add reads_starts and reads_ends to output (original data)
-        output.extend(reads_starts_runs.iter().map(|run| FeaturePoint {
-            contig_name: contig_name.to_string(),
-            feature: "reads_starts".to_string(),
-            start_pos: run.start_pos,
-            end_pos: run.end_pos,
-            value: run.value,
-            mean: None,
-            median: None,
-            std: None,
-        }));
-
-        output.extend(reads_ends_runs.iter().map(|run| FeaturePoint {
-            contig_name: contig_name.to_string(),
-            feature: "reads_ends".to_string(),
-            start_pos: run.start_pos,
-            end_pos: run.end_pos,
-            value: run.value,
-            mean: None,
-            median: None,
-            std: None,
-        }));
 
         // Tau: calculate from merged (deduplicated) position ranges
         // Both starts and ends runs contribute positions, but tau uses both signals
@@ -877,12 +851,12 @@ fn add_features_from_arrays(
                 &dtr_regions,
             );
 
-            // Compute median clipping lengths per area
+            // Compute median clipping lengths per area using event lengths
             for area in &mut start_areas {
-                area.median_clippings = compute_area_median_clippings(area, &arrays.left_clipping_lengths, &arrays.reads_starts, min_clip_len);
+                area.median_clippings = compute_area_median_clippings(area, &arrays.start_event_lengths);
             }
             for area in &mut end_areas {
-                area.median_clippings = compute_area_median_clippings(area, &arrays.right_clipping_lengths, &arrays.reads_ends, min_clip_len);
+                area.median_clippings = compute_area_median_clippings(area, &arrays.end_event_lengths);
             }
 
             // === STEP 6: Classify packaging based on peak-areas ===

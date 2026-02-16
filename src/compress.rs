@@ -215,6 +215,50 @@ pub fn add_compressed_feature_with_reference(
     runs
 }
 
+/// Compress and add feature points with median only (for reads_starts/reads_ends).
+///
+/// Like `add_compressed_feature_with_stats` but only stores median per run.
+/// Mean and Std are set to None.
+#[inline]
+pub fn add_compressed_feature_with_median(
+    counts: &[f64],
+    medians: &[f64],
+    reference: Option<&[f64]>,
+    feature: &str,
+    contig_name: &str,
+    config: &ProcessConfig,
+    output: &mut Vec<FeaturePoint>,
+) -> Vec<Run> {
+    let plot_type = get_plot_type(feature);
+    let runs = compress_signal_with_reference(counts, reference, plot_type, config.curve_ratio, config.bar_ratio);
+
+    output.extend(runs.iter().map(|run| {
+        let start_idx = (run.start_pos - 1) as usize;
+        let end_idx = run.end_pos as usize;
+
+        let median_val = if start_idx < medians.len() {
+            let range_median: f64 = medians[start_idx..end_idx.min(medians.len())].iter().sum::<f64>()
+                / (end_idx - start_idx) as f64;
+            Some(range_median as f32)
+        } else {
+            None
+        };
+
+        FeaturePoint {
+            contig_name: contig_name.to_string(),
+            feature: feature.to_string(),
+            start_pos: run.start_pos,
+            end_pos: run.end_pos,
+            value: run.value,
+            mean: None,
+            median: median_val,
+            std: None,
+        }
+    }));
+
+    runs
+}
+
 /// Compress and add feature points with statistics (for clippings/insertions).
 ///
 /// Includes mean, median, and standard deviation from the length vectors.

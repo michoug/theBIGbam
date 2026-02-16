@@ -593,6 +593,72 @@ pub fn raw_has_near_match_at_position(
     }
 }
 
+/// Return the boundary event length for a read at its start or end.
+///
+/// Returns `Some(0)` for exact match, `Some(len)` for a small clip/insertion
+/// (shorter than `min_clipping_length`), or `None` if neither.
+/// This mirrors `raw_has_near_match_at_position` but returns the actual length
+/// instead of just a boolean, enabling per-position statistics.
+#[inline]
+pub fn raw_boundary_event_length(
+    cigar: &[(u32, u32)],
+    md: Option<&[u8]>,
+    at_start: bool,
+    min_clipping_length: u32,
+) -> Option<u32> {
+    // Exact match → event length 0
+    if raw_has_match_at_position(cigar, md, at_start) {
+        return Some(0);
+    }
+
+    if cigar.is_empty() {
+        return None;
+    }
+
+    // Check if the boundary operation is a small clip/insertion
+    if at_start {
+        let (op, len) = cigar[0];
+        let c = op as u8 as char;
+        if !matches!(c, 'S' | 'H' | 'I') || len >= min_clipping_length {
+            return None;
+        }
+        if cigar.len() < 2 {
+            return None;
+        }
+        let (next_op, _) = cigar[1];
+        let nc = next_op as u8 as char;
+        if matches!(nc, 'S' | 'H' | 'I') {
+            return None;
+        }
+        match md {
+            Some(bytes) if !bytes.is_empty() => {
+                if MdTag::new(bytes).has_match_at_start() { Some(len) } else { None }
+            }
+            _ => None,
+        }
+    } else {
+        let (op, len) = cigar[cigar.len() - 1];
+        let c = op as u8 as char;
+        if !matches!(c, 'S' | 'H' | 'I') || len >= min_clipping_length {
+            return None;
+        }
+        if cigar.len() < 2 {
+            return None;
+        }
+        let (prev_op, _) = cigar[cigar.len() - 2];
+        let pc = prev_op as u8 as char;
+        if matches!(pc, 'S' | 'H' | 'I') {
+            return None;
+        }
+        match md {
+            Some(bytes) if !bytes.is_empty() => {
+                if MdTag::new(bytes).has_match_at_end() { Some(len) } else { None }
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Check if a read starts/ends with match using raw CIGAR and MD tag (zero-allocation).
 ///
 /// This is the optimized version used in hot paths. Same logic as
