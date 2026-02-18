@@ -255,16 +255,34 @@ def download_feature_data_csv(db_path, contig_name, sample_names, xstart=None, x
         # Scaled features (stored as INTEGER ×100)
         scaled_tables = {"Feature_mapq", "Contig_GCSkew"}
 
+        # Relative-scaled features (stored as INTEGER ×1000)
+        RELATIVE_SCALED_FEATURES = {
+            "Feature_left_clippings", "Feature_right_clippings", "Feature_insertions", "Feature_deletions",
+            "Feature_mismatches", "Feature_reads_starts", "Feature_reads_ends", "Feature_non_inward_pairs",
+            "Feature_mate_not_mapped", "Feature_mate_on_another_contig"
+        }
+
+        # Tables with a different column schema (Position1/Position2 instead of First_position/Last_position)
+        non_standard_schema_tables = {"Contig_directRepeats", "Contig_invertedRepeats"}
+
         # Build UNION ALL query across all feature tables
         union_parts = []
         for table_name, var_name, subplot_name in variable_rows:
             is_contig_table = table_name.startswith("Contig_")
-            needs_scaling = table_name in scaled_tables
-            scale_expr = " / 100.0" if needs_scaling else ""
 
-            # Skip the primary_reads view (it's a union of plus+minus, we export those directly)
+            # Skip tables with non-standard column schema
             if table_name == "Feature_primary_reads":
                 continue
+            if table_name in non_standard_schema_tables:
+                continue
+
+            # Determine scaling factor
+            if table_name in RELATIVE_SCALED_FEATURES:
+                scale_expr = " / 1000.0"
+            elif table_name in scaled_tables:
+                scale_expr = " / 100.0"
+            else:
+                scale_expr = ""
 
             safe_var_name = var_name.replace("'", "''")
             has_stats = table_has_stats.get(table_name, False)

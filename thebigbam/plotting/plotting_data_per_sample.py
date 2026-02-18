@@ -911,16 +911,10 @@ def _rle_weighted_bin_sql(feature_table, is_contig_table, xstart, xend, sample_i
             x_coords.append(position)
             y_coords.append(value)
         else:
-            # Zero-filled bin: use bin center
-            bin_center = int(xstart + (bi + 0.5) * window_size / num_bins)
+            # Zero-filled bin: use bin center (bin_width matches SQL integer division)
+            bin_center = int(xstart + (bi + 0.5) * bin_width)
             x_coords.append(bin_center)
             y_coords.append(0.0)
-    
-    # Sort by x to ensure monotonically increasing coordinates (prevents zigzag rendering)
-    sorted_pairs = sorted(zip(x_coords, y_coords), key=lambda pair: pair[0])
-    x_coords = [x for x, y in sorted_pairs]
-    y_coords = [y for x, y in sorted_pairs]
-    
     return x_coords, y_coords
 
 
@@ -975,15 +969,10 @@ def _rle_weighted_bin_primary_reads(xstart, xend, sample_id, contig_id, cur, num
             x_coords.append(position)
             y_coords.append(value)
         else:
-            bin_center = int(xstart + (bi + 0.5) * window_size / num_bins)
+            # Zero-filled bin: use bin center (bin_width matches SQL integer division)
+            bin_center = int(xstart + (bi + 0.5) * bin_width)
             x_coords.append(bin_center)
             y_coords.append(0.0)
-    
-    # Sort by x to ensure monotonically increasing coordinates (prevents zigzag rendering)
-    sorted_pairs = sorted(zip(x_coords, y_coords), key=lambda pair: pair[0])
-    x_coords = [x for x, y in sorted_pairs]
-    y_coords = [y for x, y in sorted_pairs]
-    
     return x_coords, y_coords
 
 
@@ -1373,16 +1362,10 @@ def _rle_weighted_bin_batch_sql(feature_table, xstart, xend, sample_ids, contig_
                 x_coords.append(position)
                 y_coords.append(value)
             else:
-                # Zero-filled bin: use bin center
-                bin_center = int(xstart + (bi + 0.5) * window_size / num_bins)
+                # Zero-filled bin: use bin center (bin_width matches SQL integer division)
+                bin_center = int(xstart + (bi + 0.5) * bin_width)
                 x_coords.append(bin_center)
                 y_coords.append(0.0)
-        
-        # Sort by x to ensure monotonically increasing coordinates (prevents zigzag rendering)
-        sorted_pairs = sorted(zip(x_coords, y_coords), key=lambda pair: pair[0])
-        x_coords = [x for x, y in sorted_pairs]
-        y_coords = [y for x, y in sorted_pairs]
-        
         result[sid] = (x_coords, y_coords)
     return result
 
@@ -1487,11 +1470,6 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
                         x_coords.append(max_contributor[0])
                         y_coords.append(total_value)
                     if x_coords:
-                        # Sort by x to ensure monotonically increasing coordinates (prevents zigzag rendering)
-                        sorted_pairs = sorted(zip(x_coords, y_coords), key=lambda pair: pair[0])
-                        x_coords = [x for x, y in sorted_pairs]
-                        y_coords = [y for x, y in sorted_pairs]
-                        
                         feature_dict = {
                             "type": type_picked, "color": color, "alpha": alpha,
                             "fill_alpha": fill_alpha, "size": size, "title": title,

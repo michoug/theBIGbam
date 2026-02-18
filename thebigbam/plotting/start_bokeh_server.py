@@ -621,7 +621,15 @@ def create_layout(db_path):
         same_y_scale_row.visible = is_all
 
         # Refresh options while still locked (suppresses cascading callbacks)
-    # Don't invalidate cache - filtering is shared between views and hasn't changed
+        # Don't invalidate filtering cache - filtering is shared between views and hasn't changed
+        refresh_contig_options_unlocked()
+        if not is_all:
+            refresh_sample_options_unlocked()
+
+        # Unlock AFTER refreshes complete
+        global_toggle_lock['locked'] = False
+        update_section_titles()
+
     ## Apply button function
     def apply_clicked():
         import cProfile
@@ -742,8 +750,8 @@ def create_layout(db_path):
                     allowed_samples = {pair[1] for pair in filtering_pairs}
                     filtered_samples = [s for s in filtered_samples if s in allowed_samples]
 
-                # Get selected ordering column (map "Sample name" to None for default alphabetical)
-                order_by = sample_order_select.value if sample_order_select.value != "Sample name" else None
+                # Get selected ordering column (map UI label "Sample name" to DB column "Sample_name")
+                order_by = "Sample_name" if sample_order_select.value == "Sample name" else sample_order_select.value
 
                 print(f"[start_bokeh_server] Generating plot for all samples with variable={selected_var}, contig={contig}, genome_features={genome_features}, filtered_samples={len(filtered_samples)}")
                 if pr:

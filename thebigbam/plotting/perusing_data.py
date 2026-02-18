@@ -231,13 +231,13 @@ def build_summary_data(conn, contig_name, sample_names):
 
     phage_cols = {
         "Packaging_mechanism": "Mechanism", 
+        "Repeat_length": "Repeat length",
+        "Terminase_distance": "Terminase distance",
+        "Terminase_percentage": "Terminase percentage",
         "Left_termini": "Left termini", 
         "Median_right_termini_clippings": "Median right termini clippings",
         "Right_termini": "Right termini",
         "Median_left_termini_clippings": "Median left termini clippings",
-        "Repeat_length": "Repeat length",
-        "Terminase_distance": "Terminase distance",
-        "Terminase_percentage": "Terminase percentage",
     }
 
     topology_cols = {
