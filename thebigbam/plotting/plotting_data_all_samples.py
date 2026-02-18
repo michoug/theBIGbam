@@ -2,10 +2,10 @@ import duckdb
 from bokeh.models import Range1d
 from bokeh.layouts import gridplot
 
-from .plotting_data_per_sample import get_contig_info, get_feature_data, get_feature_data_batch, get_variable_metadata, get_repeats_aggregated_data, make_bokeh_subplot, make_bokeh_genemap, make_bokeh_sequence_subplot
+from .plotting_data_per_sample import get_contig_info, get_feature_data, get_feature_data_batch, get_variable_metadata, get_repeats_aggregated_data, make_bokeh_subplot, make_bokeh_genemap, make_bokeh_sequence_subplot, _DOWNSAMPLE_THRESHOLD
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130, genbank_path=None, genome_features=None, allowed_samples=None, feature_types=None, use_phage_colors=False, plot_sequence=False, same_y_scale=False, genemap_size=None):
+def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130, genbank_path=None, genome_features=None, allowed_samples=None, feature_types=None, use_phage_colors=False, plot_sequence=False, same_y_scale=False, genemap_size=None, order_by_column=None):
     """Generate a Bokeh plot showing all samples for a single variable.
 
     Args:
@@ -20,6 +20,7 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
         allowed_samples: Set of sample names to include (optional; if None, all samples are included)
         feature_types: Optional list of feature types to include in gene map (None = all)
         use_phage_colors: Whether to use phage color scheme for CDS features
+        order_by_column: Optional Sample table column name to order samples by (alphabetically)
     """
     cur = conn.cursor()
 
@@ -49,6 +50,29 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
 
     sample_ids, sample_names = [list(t) for t in zip(*rows)]
 
+    # Enable tooltips for all window sizes (binned data now shows actual positions of max values)
+    show_tips = True
+
+    # Order samples by the specified column if requested
+    if order_by_column:
+        try:
+            # Query Sample table for the ordering column values
+            sample_id_placeholders = ",".join(["?"] * len(sample_ids))
+            cur.execute(
+                f'SELECT Sample_id, "{order_by_column}" FROM Sample WHERE Sample_id IN ({sample_id_placeholders}) ORDER BY "{order_by_column}"',
+                sample_ids
+            )
+            ordered_rows = cur.fetchall()
+            # Rebuild sample_ids and sample_names in the sorted order
+            ordered_ids = [r[0] for r in ordered_rows]
+            # Map sample_id to sample_name
+            id_to_name = {sid: sname for sid, sname in zip(sample_ids, sample_names)}
+            sample_ids = ordered_ids
+            sample_names = [id_to_name[sid] for sid in ordered_ids]
+            print(f"Samples ordered by {order_by_column}", flush=True)
+        except Exception as e:
+            print(f"Warning: Could not order samples by '{order_by_column}': {e}", flush=True)
+
     # --- Add subplots for additional Genome features (contig-level, not per-sample) ---
     genome_subplots = []
     if genome_features:
@@ -60,38 +84,38 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
                 if feature_lower in ["repeat count"]:
                     count_dicts, _ = get_repeats_aggregated_data(cur, contig_id, xstart, xend)
                     if count_dicts:
-                        subplot = make_bokeh_subplot(count_dicts, subplot_size, shared_xrange)
+                        subplot = make_bokeh_subplot(count_dicts, subplot_size, shared_xrange, show_tooltips=show_tips)
                         if subplot is not None:
                             genome_subplots.append(subplot)
                 elif feature_lower in ["max repeat identity"]:
                     _, identity_dicts = get_repeats_aggregated_data(cur, contig_id, xstart, xend)
                     if identity_dicts:
-                        subplot = make_bokeh_subplot(identity_dicts, subplot_size, shared_xrange)
+                        subplot = make_bokeh_subplot(identity_dicts, subplot_size, shared_xrange, show_tooltips=show_tips)
                         if subplot is not None:
                             genome_subplots.append(subplot)
                 elif feature_lower in ["repeats", "repeat", "direct repeats", "inverted repeats"]:
                     count_dicts, identity_dicts = get_repeats_aggregated_data(cur, contig_id, xstart, xend)
                     # Track 1: Repeat count
                     if count_dicts:
-                        subplot = make_bokeh_subplot(count_dicts, subplot_size, shared_xrange)
+                        subplot = make_bokeh_subplot(count_dicts, subplot_size, shared_xrange, show_tooltips=show_tips)
                         if subplot is not None:
                             genome_subplots.append(subplot)
                     # Track 2: Repeat max identity
                     if identity_dicts:
-                        subplot = make_bokeh_subplot(identity_dicts, subplot_size, shared_xrange)
+                        subplot = make_bokeh_subplot(identity_dicts, subplot_size, shared_xrange, show_tooltips=show_tips)
                         if subplot is not None:
                             genome_subplots.append(subplot)
                 # Handle GC content and GC skew - contig-level tables, use get_feature_data
                 elif feature_lower in ["gc_content", "gc content", "gccontent", "gc"]:
                     list_feature_dict = get_feature_data(cur, "GC content", contig_id, sample_id=None, xstart=xstart, xend=xend)
                     if list_feature_dict:
-                        gc_subplot = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange)
+                        gc_subplot = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, show_tooltips=show_tips)
                         if gc_subplot is not None:
                             genome_subplots.append(gc_subplot)
                 elif feature_lower in ["gc_skew", "gc skew", "gcskew", "skew"]:
                     list_feature_dict = get_feature_data(cur, "GC skew", contig_id, sample_id=None, xstart=xstart, xend=xend)
                     if list_feature_dict:
-                        gc_skew_subplot = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange)
+                        gc_skew_subplot = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, show_tooltips=show_tips)
                         if gc_skew_subplot is not None:
                             genome_subplots.append(gc_skew_subplot)
                 else:
@@ -100,7 +124,7 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
                     if not list_feature_dict:
                         continue
 
-                    subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, sample_title=genome_feature)
+                    subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, sample_title=genome_feature, show_tooltips=show_tips)
                     if subplot_feature is not None:
                         genome_subplots.append(subplot_feature)
             except Exception as e:
@@ -131,7 +155,7 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
                     if d["y"]:
                         all_max_y = max(all_max_y, max(d["y"]))
                         all_min_y = min(all_min_y, min(d["y"]))
-            subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, sample_title=sample_name)
+            subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, sample_title=sample_name, show_tooltips=show_tips)
             if subplot_feature is not None:
                 subplots.append(subplot_feature)
     except Exception as e:

@@ -180,32 +180,32 @@ def download_metrics_summary_csv(db_path, contig_name, sample_names):
         return None
 
 
-def download_feature_data_csv(db_path, contig_name, sample_names, feature_names, is_all_samples=False):
-    """Generate CSV content with raw feature data (positions, values, stats).
-    
-    Uses DuckDB's native COPY TO for maximum performance.
-    
+def download_feature_data_csv(db_path, contig_name, sample_names, xstart=None, xend=None, is_all_samples=False):
+    """Generate CSV content with raw RLE feature data from DuckDB.
+
+    Queries all feature tables for the given contig/samples within the
+    specified position range and returns the data as CSV.
+
     Args:
         db_path: Path to DuckDB database file
         contig_name: Name of the contig
         sample_names: List of sample names to include
-        feature_names: List of feature/variable names to export
-        is_all_samples: If True, first column is sample_name
-                       If False, first column is feature_name
-                       
+        xstart: Optional start position for filtering (inclusive)
+        xend: Optional end position for filtering (inclusive)
+        is_all_samples: If True, include sample_name column for each row
+
     Returns:
         CSV content as string, or None if error
     """
     import duckdb
     import tempfile
     import os
-    
+
     try:
-        # Open connection (read_only=True works with COPY TO since it writes to external file)
         conn = duckdb.connect(db_path, read_only=True)
         cur = conn.cursor()
-        
-        # Get contig_id
+
+        # Resolve contig_id
         cur.execute("SELECT Contig_id FROM Contig WHERE Contig_name = ?", [contig_name])
         row = cur.fetchone()
         if not row:
@@ -213,8 +213,8 @@ def download_feature_data_csv(db_path, contig_name, sample_names, feature_names,
             conn.close()
             return None
         contig_id = row[0]
-        
-        # Get sample_ids
+
+        # Resolve sample_ids
         placeholders = ",".join(["?"] * len(sample_names))
         cur.execute(f"SELECT Sample_id, Sample_name FROM Sample WHERE Sample_name IN ({placeholders})", sample_names)
         sample_rows = cur.fetchall()
@@ -224,145 +224,133 @@ def download_feature_data_csv(db_path, contig_name, sample_names, feature_names,
             return None
         sample_id_to_name = {r[0]: r[1] for r in sample_rows}
         sample_ids = list(sample_id_to_name.keys())
-        
-        # Get feature table names from Variable table (query by Subplot)
-        # Also get Variable_name for each table to use in CSV output
-        feature_to_tables = {}
-        table_to_variable_name = {}  # Map table name to Variable_name for CSV output
-        for feat in feature_names:
-            cur.execute("SELECT DISTINCT Feature_table_name, Variable_name FROM Variable WHERE Subplot = ?", [feat])
-            rows = cur.fetchall()
-            tables = [r[0] for r in rows if r[0]]
-            if tables:
-                feature_to_tables[feat] = tables
-                for r in rows:
-                    if r[0]:
-                        table_to_variable_name[r[0]] = r[1]  # table_name -> Variable_name
-        
-        if not feature_to_tables:
-            print(f"[downloading_data] Download data: No feature tables found for {feature_names}", flush=True)
+        sample_ids_sql = ", ".join(str(sid) for sid in sample_ids)
+
+        # Get all feature tables and their metadata from Variable table
+        cur.execute("SELECT DISTINCT Feature_table_name, Variable_name, Subplot FROM Variable WHERE Feature_table_name IS NOT NULL")
+        variable_rows = cur.fetchall()
+        if not variable_rows:
+            print(f"[downloading_data] Download data: No feature tables found", flush=True)
             conn.close()
             return None
-        
-        # Check which tables have stats columns (do once per unique table)
-        all_tables = set()
-        for tables in feature_to_tables.values():
-            all_tables.update(tables)
-        
+
+        # Check which tables have stats columns
+        all_tables = set(r[0] for r in variable_rows)
         table_has_stats = {}
         for table_name in all_tables:
-            cur.execute(f"PRAGMA table_info({table_name})")
-            cols = {r[1] for r in cur.fetchall()}
-            table_has_stats[table_name] = all(c in cols for c in ['Mean', 'Median', 'Std'])
-        
-        # Build sample_ids list as SQL string for embedding in query
-        sample_ids_sql = ", ".join(str(sid) for sid in sample_ids)
-        
-        # Build UNION ALL query with all values embedded (no parameters)
-        union_parts = []
-        
-        # Determine if any table has stats
+            try:
+                cur.execute(f"PRAGMA table_info({table_name})")
+                cols = {r[1] for r in cur.fetchall()}
+                table_has_stats[table_name] = all(c in cols for c in ['Mean', 'Median', 'Std'])
+            except Exception:
+                table_has_stats[table_name] = False
+
         any_has_stats = any(table_has_stats.values())
-        
-        for feat, tables in feature_to_tables.items():
-            needs_scaling = feat.lower() in ('tau', 'mapq')
-            scale_factor = "/ 100.0" if needs_scaling else ""
-            
-            for table_name in tables:
-                has_stats = table_has_stats[table_name]
-                
+
+        # Position filter SQL fragment
+        pos_filter = ""
+        if xstart is not None and xend is not None:
+            pos_filter = f" AND Last_position >= {int(xstart)} AND First_position <= {int(xend)}"
+
+        # Scaled features (stored as INTEGER ×100)
+        scaled_tables = {"Feature_mapq", "Contig_GCSkew"}
+
+        # Build UNION ALL query across all feature tables
+        union_parts = []
+        for table_name, var_name, subplot_name in variable_rows:
+            is_contig_table = table_name.startswith("Contig_")
+            needs_scaling = table_name in scaled_tables
+            scale_expr = " / 100.0" if needs_scaling else ""
+
+            # Skip the primary_reads view (it's a union of plus+minus, we export those directly)
+            if table_name == "Feature_primary_reads":
+                continue
+
+            safe_var_name = var_name.replace("'", "''")
+            has_stats = table_has_stats.get(table_name, False)
+
+            if is_contig_table:
+                # Contig-level tables have no Sample_id — emit one row per sample with same data
                 if is_all_samples:
-                    # First column is sample_name
-                    name_col = "s.Sample_name"
+                    for sid in sample_ids:
+                        safe_sample = sample_id_to_name[sid].replace("'", "''")
+                        stats_cols = f", f.Mean{scale_expr} as mean, f.Median{scale_expr} as median, f.Std{scale_expr} as std" if has_stats else (", NULL as mean, NULL as median, NULL as std" if any_has_stats else "")
+                        union_parts.append(
+                            f"SELECT '{safe_sample}' as sample_name, '{safe_var_name}' as feature_name, "
+                            f"f.First_position as start_position, f.Last_position as last_position, "
+                            f"f.Value{scale_expr} as value{stats_cols} "
+                            f"FROM {table_name} f "
+                            f"WHERE f.Contig_id = {contig_id}{pos_filter}"
+                        )
                 else:
-                    # First column is feature_name (actual Variable_name, not Subplot)
-                    var_name = table_to_variable_name.get(table_name, feat)
-                    safe_var_name = var_name.replace("'", "''")
-                    name_col = f"'{safe_var_name}'"
-                
-                if has_stats:
-                    select = f"""
-                        SELECT {name_col} as name,
-                               f.First_position as start_position,
-                               f.Last_position as last_position,
-                               f.Value {scale_factor} as value,
-                               f.Mean {scale_factor} as mean,
-                               f.Median {scale_factor} as median,
-                               f.Std {scale_factor} as std
-                        FROM {table_name} f
-                        JOIN Sample s ON f.Sample_id = s.Sample_id
-                        WHERE f.Contig_id = {contig_id} AND f.Sample_id IN ({sample_ids_sql})
-                    """
+                    stats_cols = f", f.Mean{scale_expr} as mean, f.Median{scale_expr} as median, f.Std{scale_expr} as std" if has_stats else (", NULL as mean, NULL as median, NULL as std" if any_has_stats else "")
+                    union_parts.append(
+                        f"SELECT '{safe_var_name}' as feature_name, "
+                        f"f.First_position as start_position, f.Last_position as last_position, "
+                        f"f.Value{scale_expr} as value{stats_cols} "
+                        f"FROM {table_name} f "
+                        f"WHERE f.Contig_id = {contig_id}{pos_filter}"
+                    )
+            else:
+                # Sample-level tables
+                stats_cols = f", f.Mean{scale_expr} as mean, f.Median{scale_expr} as median, f.Std{scale_expr} as std" if has_stats else (", NULL as mean, NULL as median, NULL as std" if any_has_stats else "")
+                if is_all_samples:
+                    union_parts.append(
+                        f"SELECT s.Sample_name as sample_name, '{safe_var_name}' as feature_name, "
+                        f"f.First_position as start_position, f.Last_position as last_position, "
+                        f"f.Value{scale_expr} as value{stats_cols} "
+                        f"FROM {table_name} f "
+                        f"JOIN Sample s ON f.Sample_id = s.Sample_id "
+                        f"WHERE f.Contig_id = {contig_id} AND f.Sample_id IN ({sample_ids_sql}){pos_filter}"
+                    )
                 else:
-                    # Pad with NULLs for consistent columns
-                    if any_has_stats:
-                        select = f"""
-                            SELECT {name_col} as name,
-                                   f.First_position as start_position,
-                                   f.Last_position as last_position,
-                                   f.Value {scale_factor} as value,
-                                   NULL as mean,
-                                   NULL as median,
-                                   NULL as std
-                            FROM {table_name} f
-                            JOIN Sample s ON f.Sample_id = s.Sample_id
-                            WHERE f.Contig_id = {contig_id} AND f.Sample_id IN ({sample_ids_sql})
-                        """
-                    else:
-                        select = f"""
-                            SELECT {name_col} as name,
-                                   f.First_position as start_position,
-                                   f.Last_position as last_position,
-                                   f.Value {scale_factor} as value
-                            FROM {table_name} f
-                            JOIN Sample s ON f.Sample_id = s.Sample_id
-                            WHERE f.Contig_id = {contig_id} AND f.Sample_id IN ({sample_ids_sql})
-                        """
-                
-                union_parts.append(select)
-        
-        # Build combined query
+                    union_parts.append(
+                        f"SELECT '{safe_var_name}' as feature_name, "
+                        f"f.First_position as start_position, f.Last_position as last_position, "
+                        f"f.Value{scale_expr} as value{stats_cols} "
+                        f"FROM {table_name} f "
+                        f"WHERE f.Contig_id = {contig_id} AND f.Sample_id IN ({sample_ids_sql}){pos_filter}"
+                    )
+
+        if not union_parts:
+            print(f"[downloading_data] Download data: No exportable feature tables", flush=True)
+            conn.close()
+            return None
+
         full_query = " UNION ALL ".join(union_parts)
-        
-        # Rename first column in the query itself
-        first_col_name = 'sample_name' if is_all_samples else 'feature_name'
-        
-        # Wrap query to rename column and optionally drop stats columns
-        if any_has_stats:
-            wrapper_query = f"""
-                SELECT name AS {first_col_name}, start_position, last_position, value, mean, median, std
-                FROM ({full_query})
-            """
+
+        # Wrap with ORDER BY for deterministic output
+        if is_all_samples:
+            if any_has_stats:
+                wrapper = f"SELECT sample_name, feature_name, start_position, last_position, value, mean, median, std FROM ({full_query}) ORDER BY sample_name, feature_name, start_position"
+            else:
+                wrapper = f"SELECT sample_name, feature_name, start_position, last_position, value FROM ({full_query}) ORDER BY sample_name, feature_name, start_position"
         else:
-            wrapper_query = f"""
-                SELECT name AS {first_col_name}, start_position, last_position, value
-                FROM ({full_query})
-            """
-        
-        # Use DuckDB's native COPY TO directly (no temp table needed)
+            if any_has_stats:
+                wrapper = f"SELECT feature_name, start_position, last_position, value, mean, median, std FROM ({full_query}) ORDER BY feature_name, start_position"
+            else:
+                wrapper = f"SELECT feature_name, start_position, last_position, value FROM ({full_query}) ORDER BY feature_name, start_position"
+
+        # Use DuckDB's native COPY TO for fast CSV export
         with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
-            temp_path = f.name.replace('\\', '/')  # Use forward slashes for DuckDB on Windows
-        
+            temp_path = f.name.replace('\\', '/')
+
         try:
-            # COPY directly from the query - no temp table, all done in DuckDB
-            copy_query = f"COPY ({wrapper_query}) TO '{temp_path}' (HEADER, DELIMITER ',')"
+            copy_query = f"COPY ({wrapper}) TO '{temp_path}' (HEADER, DELIMITER ',')"
             conn.execute(copy_query)
             conn.close()
-            
-            # Read the CSV file
+
             with open(temp_path, 'r', encoding='utf-8') as f:
                 csv_content = f.read()
-            
-            # Count rows (excluding header)
+
             row_count = csv_content.count('\n') - 1
             print(f"[downloading_data] Data CSV generated ({row_count} rows)", flush=True)
             return csv_content
-            
+
         finally:
-            # Clean up temp file
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
-        
+
     except Exception as e:
         import traceback
         tb = traceback.format_exc()

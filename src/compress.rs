@@ -21,36 +21,73 @@ pub struct Run {
     pub end_pos: i32,
     /// The value for this run
     pub value: f32,
+    /// Optional relative value (value / coverage * 1000) for coverage-dependent features
+    pub value_relative: Option<f32>,
 }
 
 // ============================================================================
 // MAIN COMPRESSION FUNCTION
 // ============================================================================
 
+/// Filter positions by coverage threshold and compute relative values.
+///
+/// Returns Vec of (position, value, value_relative) tuples for positions where
+/// value > coverage * threshold.
+///
+/// # Arguments
+/// * `values` - The signal values (e.g., mismatches, non_inward_pairs)
+/// * `coverage` - The coverage reference signal
+/// * `threshold` - Fraction threshold (e.g., 0.1 for 10%)
+///
+/// # Returns
+/// Vector of (0-indexed position, absolute value, relative value * 1000)
+fn filter_by_coverage(values: &[f64], coverage: &[f64], threshold: f64) -> Vec<(usize, f32, f32)> {
+    let n = values.len().min(coverage.len());
+    let mut filtered = Vec::new();
+    
+    for i in 0..n {
+        let val = values[i];
+        let cov = coverage[i];
+        let thresh = cov * threshold;
+        
+        if val > thresh {
+            let value_relative = if cov > 0.0 {
+                ((val / cov) * 1000.0) as f32
+            } else {
+                0.0
+            };
+            filtered.push((i, val as f32, value_relative));
+        }
+    }
+    
+    filtered
+}
+
 /// Compress signal using adaptive RLE with optional coverage reference.
 ///
 /// # Parameters
 /// - `values`: The signal to compress (e.g., coverage at each position)
-/// - `reference`: Optional reference signal (e.g., coverage for bar plots). Use None for curves.
-/// - `plot_type`: Curve (self-referential RLE) or Bars (threshold filtering)
-/// - `curve_ratio`: Relative tolerance for curves (e.g., 10 for 10% range threshold)
-/// - `bar_ratio`: Relative tolerance for bars (e.g., 10 for 10% threshold)
+/// - `reference`: Optional reference signal (e.g., coverage for filtering). Use None for standard curves.
+/// - `plot_type`: Curve (with/without filtering) or Bars (threshold filtering)
+/// - `curve_ratio`: Relative tolerance for adaptive RLE curves (e.g., 10 for 10% range threshold)
+/// - `bar_ratio`: Threshold for coverage-dependent filtering (e.g., 10 for 10%)
 ///
 /// # Algorithm
-/// - **Curves** (reference=None): Range-based adaptive RLE. Tracks the min and max values
-///   within the current run. A run is extended as long as `(max - min) <= ratio * min(|min|, |max|)`.
-///   This is symmetric (order-independent) and prevents drift on gradual monotonic changes.
-///   The stored value for each run is the average of all values in the run.
-/// - **Bars** (reference=Some): Threshold filtering. Saves positions where `value > coverage * bar_ratio`.
+/// - **Bars with reference**: Coverage-filtered single-position spikes. Each position where
+///   `value > coverage * bar_ratio` is saved as a separate single-position run.
+/// - **Curves with reference**: Coverage-filtered then exact-value RLE. Filter positions where
+///   `value > coverage * bar_ratio`, then merge consecutive positions with identical values.
+/// - **Curves without reference**: Standard adaptive RLE. Range-based grouping with
+///   `(max - min) <= ratio * min(|min|, |max|)` threshold.
 ///
-/// # Example
+/// # Example (Bars)
 /// ```
 /// coverage =     [1000, 1000, 1000, 50,  50,  1000, 1000]
 /// mismatches =   [5,    5,    5,    5,   5,   5,    5]
-/// compress_ratio = 0.1
+/// bar_ratio = 0.1
 ///
 /// Position 1-3: 5 <= 0.1*1000 → filtered (insignificant)
-/// Position 4-5: 5 > 0.1*50 → saved as run (significant at low coverage)
+/// Position 4-5: 5 > 0.1*50 → saved as runs (significant at low coverage)
 /// Position 6-7: 5 <= 0.1*1000 → filtered (insignificant)
 /// ```
 pub fn compress_signal_with_reference(
@@ -69,27 +106,79 @@ pub fn compress_signal_with_reference(
     curve_ratio *= 0.01; // Convert percentage to fraction
     bar_ratio *= 0.01;   // Convert percentage to fraction
 
-    // For bars with reference: save positions where value > coverage * bar_ratio
-    // Each qualifying position is saved as a separate single-position bar
+    // Case 1: Bars with reference - coverage-filtered single-position spikes
     if matches!(plot_type, PlotType::Bars) && reference.is_some() {
         let coverage = reference.unwrap();
-        for i in 0..n {
-            let val = values[i];
-            let threshold = coverage[i] * bar_ratio;
-            
-            if val > threshold {
-                // Save each qualifying position as a separate single-position bar
-                runs.push(Run {
-                    start_pos: (i + 1) as i32,
-                    end_pos: (i + 1) as i32,
-                    value: val as f32,
-                });
-            }
+        let filtered = filter_by_coverage(values, coverage, bar_ratio);
+        
+        for (pos, val, val_rel) in filtered {
+            runs.push(Run {
+                start_pos: (pos + 1) as i32,
+                end_pos: (pos + 1) as i32,
+                value: val,
+                value_relative: Some(val_rel),
+            });
         }
         return runs;
     }
 
-    // For curves: use range-based adaptive RLE compression
+    // Case 2: Curves with reference - coverage-filtered then exact-value RLE
+    if matches!(plot_type, PlotType::Curve) && reference.is_some() {
+        let coverage = reference.unwrap();
+        let filtered = filter_by_coverage(values, coverage, bar_ratio);
+        
+        if filtered.is_empty() {
+            return runs;
+        }
+
+        // Start first run
+        let mut run_start_idx = 0;
+        let mut current_value = filtered[0].1;
+        let mut rel_sum = filtered[0].2 as f64;
+        let mut rel_count = 1;
+
+        for i in 1..filtered.len() {
+            let (pos, val, val_rel) = filtered[i];
+            let prev_pos = filtered[i - 1].0;
+
+            // Check if consecutive positions with same value
+            if pos == prev_pos + 1 && (val - current_value).abs() < 1e-6 {
+                // Extend run
+                rel_sum += val_rel as f64;
+                rel_count += 1;
+            } else {
+                // Close current run
+                let run_start_pos = filtered[run_start_idx].0;
+                let run_end_pos = filtered[i - 1].0;
+                runs.push(Run {
+                    start_pos: (run_start_pos + 1) as i32,
+                    end_pos: (run_end_pos + 1) as i32,
+                    value: current_value,
+                    value_relative: Some((rel_sum / rel_count as f64) as f32),
+                });
+
+                // Start new run
+                run_start_idx = i;
+                current_value = val;
+                rel_sum = val_rel as f64;
+                rel_count = 1;
+            }
+        }
+
+        // Save last run
+        let run_start_pos = filtered[run_start_idx].0;
+        let run_end_pos = filtered[filtered.len() - 1].0;
+        runs.push(Run {
+            start_pos: (run_start_pos + 1) as i32,
+            end_pos: (run_end_pos + 1) as i32,
+            value: current_value,
+            value_relative: Some((rel_sum / rel_count as f64) as f32),
+        });
+
+        return runs;
+    }
+
+    // Case 3: Curves without reference - standard adaptive RLE
     // Track min/max within each run to prevent drift on gradual changes
     let mut run_start = 0;
     let mut run_sum = values[0];
@@ -123,6 +212,7 @@ pub fn compress_signal_with_reference(
                 start_pos: (run_start + 1) as i32,
                 end_pos: (run_start + run_count) as i32,
                 value: (run_sum / run_count as f64) as f32,
+                value_relative: None,
             });
 
             // Start new run
@@ -139,6 +229,7 @@ pub fn compress_signal_with_reference(
         start_pos: (run_start + 1) as i32,
         end_pos: (run_start + run_count) as i32,
         value: (run_sum / run_count as f64) as f32,
+        value_relative: None,
     });
 
     runs
@@ -206,7 +297,7 @@ pub fn add_compressed_feature_with_reference(
         feature: feature.to_string(),
         start_pos: run.start_pos,
         end_pos: run.end_pos,
-        value: run.value,
+        value: run.value_relative.unwrap_or(run.value),
         mean: None,
         median: None,
         std: None,
@@ -249,7 +340,7 @@ pub fn add_compressed_feature_with_median(
             feature: feature.to_string(),
             start_pos: run.start_pos,
             end_pos: run.end_pos,
-            value: run.value,
+            value: run.value_relative.unwrap_or(run.value),
             mean: None,
             median: median_val,
             std: None,
@@ -299,7 +390,7 @@ pub fn add_compressed_feature_with_stats(
             feature: feature.to_string(),
             start_pos: run.start_pos,
             end_pos: run.end_pos,
-            value: run.value,
+            value: run.value_relative.unwrap_or(run.value),
             mean: mean_val,
             median: median_val,
             std: std_val,

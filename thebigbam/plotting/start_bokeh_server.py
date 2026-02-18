@@ -617,19 +617,17 @@ def create_layout(db_path):
         # Each section maintains its own state independently
         variables_section_one.visible = not is_all
         variables_section_all.visible = is_all
+        sample_order_row.visible = is_all
+        same_y_scale_row.visible = is_all
 
         # Refresh options while still locked (suppresses cascading callbacks)
-        _filtering_cache['valid'] = False
-        refresh_contig_options_unlocked()
-        if not is_all:
-            refresh_sample_options_unlocked()
-
-        # Unlock AFTER refreshes complete
-        global_toggle_lock['locked'] = False
-        update_section_titles()
-
+    # Don't invalidate cache - filtering is shared between views and hasn't changed
     ## Apply button function
     def apply_clicked():
+        import cProfile
+        import pstats
+        import io as _io
+        import os as _os
         try:
             contig = widgets['contig_select'].value
             has_samples = widgets['has_samples']
@@ -676,11 +674,20 @@ def create_layout(db_path):
                 main_placeholder.objects = [pn.pane.HTML(f"<pre>Error: Invalid position range - start must be less than end.</pre>")]
                 return
 
-            # Check whether to plot sequence (checkbox checked)
-            plot_sequence = (
-                sequence_cbg is not None
-                and 0 in sequence_cbg.active
-            )
+
+            # Only plot sequence if window is <= 1000bp
+            plot_sequence = False
+            if sequence_cbg is not None and 0 in sequence_cbg.active:
+                if (xend - xstart) <= 1000:
+                    plot_sequence = True
+                else:
+                    print("Warning: Sequence will not be plotted for regions larger than 1000 bp.", flush=True)
+
+            # Only plot genome map if window is <= 100kb
+            plot_genemap = True
+            if (xend - xstart) > 100_000:
+                plot_genemap = False
+                print("Warning: Genome map will not be plotted for regions larger than 100,000 bp.", flush=True)
 
             # Check whether to use same y scale for all subplots
             same_y_scale = (0 in same_y_scale_cbg.active)
@@ -702,6 +709,9 @@ def create_layout(db_path):
                 prev_xstart = current_plot_state['shared_xrange'].start
                 prev_xend = current_plot_state['shared_xrange'].end
 
+            profile_enabled = bool(_os.environ.get("BIGBAMB_PROFILE", ""))
+            pr = cProfile.Profile() if profile_enabled else None
+            grid = None
             if is_all:
                 # All-samples view: require exactly one variable selected from non-Genome modules
                 # Genome module is shared (in Contigs section):
@@ -732,8 +742,25 @@ def create_layout(db_path):
                     allowed_samples = {pair[1] for pair in filtering_pairs}
                     filtered_samples = [s for s in filtered_samples if s in allowed_samples]
 
+                # Get selected ordering column (map "Sample name" to None for default alphabetical)
+                order_by = sample_order_select.value if sample_order_select.value != "Sample name" else None
+
                 print(f"[start_bokeh_server] Generating plot for all samples with variable={selected_var}, contig={contig}, genome_features={genome_features}, filtered_samples={len(filtered_samples)}")
-                grid = generate_bokeh_plot_all_samples(conn, selected_var, contig, xstart=xstart, xend=xend, genbank_path=genbank_path, genome_features=genome_features if genome_features else None, allowed_samples=set(filtered_samples), feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_sequence=plot_sequence, same_y_scale=same_y_scale, subplot_size=subplot_size, genemap_size=genemap_size)
+                if pr:
+                    pr.enable()
+                # Pass plot_genemap to plotting function if supported, else filter genome_features
+                if not plot_genemap and genome_features:
+                    # Remove "Gene map" from genome_features if present
+                    genome_features = [f for f in genome_features if f != "Gene map"]
+                grid = generate_bokeh_plot_all_samples(
+                    conn, selected_var, contig, xstart=xstart, xend=xend, genbank_path=genbank_path,
+                    genome_features=genome_features if genome_features else None, allowed_samples=set(filtered_samples),
+                    feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_sequence=plot_sequence,
+                    same_y_scale=same_y_scale, subplot_size=subplot_size, genemap_size=genemap_size,
+                    order_by_column=order_by
+                )
+                if pr:
+                    pr.disable()
             else:
                 # One-sample view: collect possibly-many requested features and call per-sample plot
                 requested_features = []
@@ -749,24 +776,27 @@ def create_layout(db_path):
                         requested_features.append(cbg.labels[idx])
 
                 print(f"[start_bokeh_server] Generating plot for sample={sample}, contig={contig}, features={requested_features}")
-                grid = generate_bokeh_plot_per_sample(conn, requested_features, contig, sample, xstart=xstart, xend=xend, genbank_path=genbank_path, feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_isoforms=plot_isoforms, plot_sequence=plot_sequence, same_y_scale=same_y_scale, subplot_size=subplot_size, genemap_size=genemap_size)
-
-            # Extract and cache plot data for instant downloads (no database round-trip)
-            try:
-                plot_data_cache['data'] = extract_plot_data_from_grid(grid)
-                plot_data_cache['is_all_samples'] = is_all
-                # Set filename based on context
-                safe_contig = "".join(c if c.isalnum() or c in "-_" else "_" for c in contig)
-                if is_all:
-                    safe_var = "".join(c if c.isalnum() or c in "-_" else "_" for c in (selected_var or 'data'))
-                    plot_data_cache['filename'] = f"{safe_contig}_all_samples_{safe_var}.csv"
-                else:
-                    safe_sample = "".join(c if c.isalnum() or c in "-_" else "_" for c in sample)
-                    plot_data_cache['filename'] = f"{safe_contig}_{safe_sample}_data.csv"
-                print(f"[start_bokeh_server] Cached {len(plot_data_cache['data'])} data sources for download", flush=True)
-            except Exception as cache_err:
-                print(f"[start_bokeh_server] Warning: Could not cache plot data: {cache_err}", flush=True)
-                plot_data_cache['data'] = None
+                if pr:
+                    pr.enable()
+                # Remove "Gene map" from requested_features if window too large
+                if not plot_genemap and requested_features:
+                    requested_features = [f for f in requested_features if f != "Gene map"]
+                grid = generate_bokeh_plot_per_sample(
+                    conn, requested_features, contig, sample, xstart=xstart, xend=xend, genbank_path=genbank_path,
+                    feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_isoforms=plot_isoforms,
+                    plot_sequence=plot_sequence, same_y_scale=False, subplot_size=subplot_size, genemap_size=genemap_size
+                )
+                if pr:
+                    pr.disable()
+            # Save profiling stats if enabled
+            if pr:
+                stats_stream = _io.StringIO()
+                ps = pstats.Stats(pr, stream=stats_stream).sort_stats('cumulative')
+                ps.print_stats(40)  # Top 40 lines
+                stats_file = f"profile_stats_{_os.getpid()}.txt"
+                with open(stats_file, "w") as f:
+                    f.write(stats_stream.getvalue())
+                print(f"[start_bokeh_server] Profiling complete. Stats written to {stats_file}", flush=True)
 
             # Restore preserved x-range and update state
             new_xrange = _get_shared_xrange(grid)
@@ -814,7 +844,7 @@ def create_layout(db_path):
                 download_metrics_button.visible = False
                 download_data_button.visible = False
             
-            # Stack toolbar row above grid
+            # Display the plot
             main_placeholder.objects = [pn.Column(toolbar_row, grid, sizing_mode="stretch_both")]
 
         except Exception as e:
@@ -877,10 +907,6 @@ def create_layout(db_path):
     # Store references to download widgets (created later, after widgets dict exists)
     download_widgets = {'contig': None, 'metrics': None, 'data': None}
     
-    # Cache for plot data - extracted from ColumnDataSources after plotting
-    # This avoids re-querying the database for downloads (instant downloads)
-    plot_data_cache = {'data': None, 'is_all_samples': False, 'filename': 'data.csv'}
-
     # Track current plot state for x-range preservation across APPLY clicks
     current_plot_state = {
         'contig': None,
@@ -899,137 +925,6 @@ def create_layout(db_path):
                 if hasattr(child, 'x_range'):
                     return child.x_range
         return None
-
-    def extract_plot_data_from_grid(grid):
-        """Extract all data from ColumnDataSources in a GridPlot.
-        
-        Returns a list of dicts, each containing data from one renderer's source.
-        """
-        from bokeh.models import GlyphRenderer
-        
-        all_data = []
-        figures = []
-        
-        # Get all figures from the grid
-        if hasattr(grid, 'children'):
-            for item in grid.children:
-                if hasattr(item, '__iter__'):
-                    for subitem in item:
-                        if hasattr(subitem, 'renderers'):
-                            figures.append(subitem)
-                elif hasattr(item, 'renderers'):
-                    figures.append(item)
-        
-        for fig in figures:
-            if not hasattr(fig, 'renderers'):
-                continue
-            
-            # Get legend label from figure's legend if available
-            legend_map = {}
-            if hasattr(fig, 'legend') and fig.legend:
-                for legend in fig.legend:
-                    if hasattr(legend, 'items'):
-                        for item in legend.items:
-                            if hasattr(item, 'label') and hasattr(item, 'renderers'):
-                                # Extract string from Bokeh Value object
-                                label_obj = item.label
-                                if hasattr(label_obj, 'value'):
-                                    label_val = label_obj.value  # Bokeh Value object
-                                elif isinstance(label_obj, dict):
-                                    label_val = label_obj.get('value', '')
-                                else:
-                                    label_val = str(label_obj)
-                                for r in item.renderers:
-                                    legend_map[id(r)] = label_val
-            
-            for renderer in fig.renderers:
-                if isinstance(renderer, GlyphRenderer) and hasattr(renderer, 'data_source'):
-                    source = renderer.data_source
-                    if hasattr(source, 'data') and source.data:
-                        data = {k: list(v) for k, v in source.data.items()}  # Copy data
-                        # Skip empty sources or sources without x/y
-                        if 'x' not in data or 'y' not in data:
-                            continue
-                        if not data['x'] or not data['y']:
-                            continue
-                        # Get feature name from legend
-                        feature_name = legend_map.get(id(renderer), 'unknown')
-                        data['_feature_name'] = feature_name
-                        all_data.append(data)
-        
-        return all_data
-    
-    def convert_plot_data_to_csv(plot_data, is_all_samples):
-        """Convert extracted plot data to CSV string."""
-        if not plot_data:
-            return None
-        
-        import csv as csv_module
-        output = io.StringIO()
-        writer = csv_module.writer(output)
-        
-        first_col = 'sample_name' if is_all_samples else 'feature_name'
-        
-        # Check what columns exist across all data
-        has_first_last = any('first_pos' in d for d in plot_data)
-        has_stats = any('mean' in d for d in plot_data)
-        
-        # Build header
-        if has_first_last:
-            if has_stats:
-                header = [first_col, 'start_position', 'last_position', 'value', 'mean', 'median', 'std']
-            else:
-                header = [first_col, 'start_position', 'last_position', 'value']
-        else:
-            if has_stats:
-                header = [first_col, 'position', 'value', 'mean', 'median', 'std']
-            else:
-                header = [first_col, 'position', 'value']
-        
-        writer.writerow(header)
-        
-        for data in plot_data:
-            name = data.get('_feature_name', 'unknown')
-            x_vals = data.get('x', [])
-            y_vals = data.get('y', [])
-            first_pos = data.get('first_pos', None)
-            last_pos = data.get('last_pos', None)
-            means = data.get('mean', None)
-            medians = data.get('median', None)
-            stds = data.get('std', None)
-            
-            # Step-plot data has pairs of points (start, end) with same y value
-            # Consolidate pairs into single rows: start_pos, end_pos, value
-            # This is faster (half the rows) and produces cleaner output
-            n = len(x_vals)
-            i = 0
-            while i < n:
-                # Check if this is a step-plot pair (consecutive points with same y)
-                if i + 1 < n and y_vals[i] == y_vals[i + 1]:
-                    # Step-plot pair: use x[i] as start, x[i+1] as end
-                    start_x = x_vals[i]
-                    end_x = x_vals[i + 1]
-                    row = [name, start_x, end_x, y_vals[i]]
-                    if has_stats:
-                        row.append(means[i] if means and i < len(means) else '')
-                        row.append(medians[i] if medians and i < len(medians) else '')
-                        row.append(stds[i] if stds and i < len(stds) else '')
-                    writer.writerow(row)
-                    i += 2  # Skip both points of the pair
-                else:
-                    # Single point (not a pair)
-                    if has_first_last and first_pos and last_pos:
-                        row = [name, first_pos[i], last_pos[i], y_vals[i]]
-                    else:
-                        row = [name, x_vals[i], x_vals[i], y_vals[i]]
-                    if has_stats:
-                        row.append(means[i] if means and i < len(means) else '')
-                        row.append(medians[i] if medians and i < len(medians) else '')
-                        row.append(stds[i] if stds and i < len(stds) else '')
-                    writer.writerow(row)
-                    i += 1
-        
-        return output.getvalue()
 
     def make_contig_download_callback():
         """Create callback for contig summary download."""
@@ -1092,23 +987,60 @@ def create_layout(db_path):
 
     def make_data_download_callback():
         """Create callback for feature data download.
-        
-        Uses cached plot data for instant downloads (no database round-trip).
+
+        Queries DuckDB directly for raw RLE feature data within the
+        current contig/sample/position range.
         """
-        # Use cached plot data (extracted from ColumnDataSources after plotting)
-        if plot_data_cache['data']:
-            csv_content = convert_plot_data_to_csv(
-                plot_data_cache['data'], 
-                plot_data_cache['is_all_samples']
-            )
-            if csv_content:
-                if download_widgets['data']:
-                    download_widgets['data'].filename = plot_data_cache['filename']
-                print(f"[start_bokeh_server] Data download from cache ({len(plot_data_cache['data'])} sources)", flush=True)
-                return io.StringIO(csv_content)
-        
-        # No cache available - return empty (user needs to click Apply first)
-        print("[start_bokeh_server] Download data: No cached data (click Apply first)", flush=True)
+        from .downloading_data import download_feature_data_csv, make_safe_filename
+
+        contig = widgets['contig_select'].value
+        if not contig:
+            print("[start_bokeh_server] Download data: No contig selected", flush=True)
+            return io.StringIO("")
+
+        is_all = (views.active == 1) if widgets['has_samples'] else False
+
+        # Parse current position range
+        contig_length = widgets['contig_lengths'].get(contig, 0)
+        try:
+            xstart = int(from_position_input.value) if from_position_input.value.strip() else 0
+            xend = int(to_position_input.value) if to_position_input.value.strip() else contig_length
+        except ValueError:
+            xstart = 0
+            xend = contig_length
+
+        if is_all:
+            filtered_samples = [s for s in orig_samples if s in widgets['contig_to_samples'].get(contig, set())]
+            filtering_pairs = get_filtering_filtered_pairs()
+            if filtering_pairs is not None:
+                allowed_samples = {pair[1] for pair in filtering_pairs}
+                filtered_samples = [s for s in filtered_samples if s in allowed_samples]
+            if not filtered_samples:
+                print("[start_bokeh_server] Download data: No samples match filters", flush=True)
+                return io.StringIO("")
+            sample_names = filtered_samples
+        else:
+            sample = widgets['sample_select'].value if widgets['has_samples'] else None
+            if not sample:
+                print("[start_bokeh_server] Download data: No sample selected", flush=True)
+                return io.StringIO("")
+            sample_names = [sample]
+
+        csv_content = download_feature_data_csv(
+            db_path, contig, sample_names,
+            xstart=xstart, xend=xend,
+            is_all_samples=is_all
+        )
+        if csv_content:
+            safe_contig = make_safe_filename(contig)
+            if is_all:
+                filename = f"{safe_contig}_all_samples_data.csv"
+            else:
+                safe_sample = make_safe_filename(sample_names[0])
+                filename = f"{safe_contig}_{safe_sample}_data.csv"
+            if download_widgets['data']:
+                download_widgets['data'].filename = filename
+            return io.StringIO(csv_content)
         return io.StringIO("")
 
     ### Creating all DOM elements
@@ -1163,6 +1095,12 @@ def create_layout(db_path):
 
     # Cache filtering metadata once when document loads
     filtering_metadata = get_filtering_metadata(db_path)
+
+    # Get Sample table columns for ordering dropdown (exclude ID and name columns)
+    sample_order_columns = ["Sample name"]  # Default option
+    if 'Sample' in filtering_metadata:
+        sample_columns = list(filtering_metadata['Sample']['columns'].keys())
+        sample_order_columns.extend(sample_columns)
 
     # Store all OR sections in a list for dynamic management
     or_sections = []
@@ -1713,14 +1651,27 @@ def create_layout(db_path):
     
     # Create position range inputs
     from_position_input = TextInput(value="0", placeholder="Start position", sizing_mode="stretch_width", margin=(0, 0, 0, 0))
-    to_position_input = TextInput(value="", placeholder="End position", sizing_mode="stretch_width", margin=(0, 5, 0, 0))
+    to_position_input = TextInput(value="", placeholder="End position", sizing_mode="stretch_width", margin=(0, 0, 0, 0))
     
     position_label_from = Div(text="From", width=40, margin=(5, 0, 5, 5))
     position_label_to = Div(text="to", width=25, margin=(5, 0, 5, 5))
     
+    # Create Reset button to reset position inputs
+    position_reset_button = Button(label="Reset", stylesheets=[stylesheet], margin=(0, 5, 0, 0))
+    
+    def reset_position_inputs():
+        from_position_input.value = "0"
+        if widgets['contig_select'].value and widgets['contig_select'].value in widgets['contig_lengths']:
+            to_position_input.value = str(widgets['contig_lengths'][widgets['contig_select'].value])
+        else:
+            to_position_input.value = ""
+    
+    position_reset_button.on_click(lambda event: reset_position_inputs())
+    
     position_row = row(
         position_label_from, from_position_input, 
         position_label_to, to_position_input,
+        position_reset_button,
         sizing_mode="stretch_width",
         margin=(10, 0, 5, 0)
     )
@@ -1740,12 +1691,8 @@ def create_layout(db_path):
     sequence_row = None
     if has_sequence_data:
         sequence_cbg = CheckboxGroup(labels=["Plot sequence"], active=[])
-        sequence_help_tooltip = Tooltip(content="Not recommended for regions larger than 1000 bp as it may slow down rendering", position="right")
-        sequence_help_btn = HelpButton(
-            tooltip=sequence_help_tooltip, width=20, height=20,
-            align="center", button_type="light", stylesheets=[toggle_stylesheet]
-        )
-        sequence_row = row(sequence_cbg, sequence_help_btn, sizing_mode="stretch_width")
+        sequence_row = row(sequence_cbg, sizing_mode="stretch_width")
+
 
     if feature_type_multichoice is not None or combined_features_cbg is not None:
         # Build simple Genome section header (no collapse needed - Contigs section handles that)
@@ -1779,7 +1726,7 @@ def create_layout(db_path):
         below_contig_children = list(below_contig_children) + [genome_section]
 
     # Fallback: if no genome section exists, append sequence_row directly
-    if sequence_row is not None and genome_section is None:
+    if genome_section is None and sequence_row is not None:
         below_contig_children.append(sequence_row)
 
     below_contig_content = column(
@@ -1839,14 +1786,9 @@ def create_layout(db_path):
     plotting_params_title = Div(text="<b>Plotting parameters</b>", align="center")
     plotting_params_header = row(plotting_params_toggle_btn, plotting_params_title, sizing_mode="stretch_width", align="center")
 
-    same_y_scale_cbg = CheckboxGroup(labels=["Use same scale for all y axis"], active=[])
-    same_y_scale_tooltip = Tooltip(content=(
-        "All Samples view: all y axis share the global maximum y value. "
-        "One Sample view: all coverage-related y axis share the coverage maximum y value."
-    ), position="right")
-    same_y_scale_help = HelpButton(tooltip=same_y_scale_tooltip, width=20, height=20,
-        align="center", button_type="light", stylesheets=[toggle_stylesheet])
-    same_y_scale_row = row(same_y_scale_cbg, same_y_scale_help, sizing_mode="stretch_width")
+    same_y_scale_cbg = CheckboxGroup(labels=["Use same y scale for all samples"], active=[])
+    same_y_scale_row = row(same_y_scale_cbg, sizing_mode="stretch_width")
+    same_y_scale_row.visible = False  # Only shown in All Samples mode
     
     genemap_height_input = Spinner(value=100, low=10, high=1000, step=10, width=80, margin=(0, 2, 0, 0))
     genemap_height_label = Div(text="Height of gene map (px)", width=160, margin=(5, 0, 5, 5))
@@ -1856,8 +1798,15 @@ def create_layout(db_path):
     subplot_height_label = Div(text="Height per subplot (px)", width=160, margin=(5, 0, 5, 5))
     subplot_height_row = row(subplot_height_input, subplot_height_label, sizing_mode="stretch_width")
 
+    # Sample ordering (only useful in All Samples view)
+    sample_order_label = Div(text="Order samples by:", width=120, margin=(5, 0, 5, 5))
+    sample_order_select = Select(value="Sample name", options=sample_order_columns, sizing_mode="stretch_width", margin=(0, 5, 5, 0))
+    sample_order_row = row(sample_order_label, sample_order_select, sizing_mode="stretch_width", margin=(5, 0, 5, 0))
+    sample_order_row.visible = False  # Only shown in All Samples mode
+
     plotting_params_content = pn.Column(
-        same_y_scale_row, genemap_height_row, subplot_height_row, 
+        sample_order_row, same_y_scale_row,
+        genemap_height_row, subplot_height_row, 
         sizing_mode="stretch_width"
     )
     plotting_params_toggle_btn.on_click(make_toggle_callback(plotting_params_toggle_btn, plotting_params_content))

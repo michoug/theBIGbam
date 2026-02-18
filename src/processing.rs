@@ -650,7 +650,7 @@ fn add_features_from_arrays(
             feature: "deletions".to_string(),
             start_pos: run.start_pos,
             end_pos: run.end_pos,
-            value: run.value,
+            value: run.value_relative.unwrap_or(run.value),
             mean: None,
             median: None,
             std: None,
@@ -669,7 +669,7 @@ fn add_features_from_arrays(
             feature: "non_inward_pairs".to_string(),
             start_pos: run.start_pos,
             end_pos: run.end_pos,
-            value: run.value,
+            value: run.value_relative.unwrap_or(run.value),
             mean: None,
             median: None,
             std: None,
@@ -682,7 +682,7 @@ fn add_features_from_arrays(
             feature: "mate_not_mapped".to_string(),
             start_pos: run.start_pos,
             end_pos: run.end_pos,
-            value: run.value,
+            value: run.value_relative.unwrap_or(run.value),
             mean: None,
             median: None,
             std: None,
@@ -695,7 +695,7 @@ fn add_features_from_arrays(
             feature: "mate_on_another_contig".to_string(),
             start_pos: run.start_pos,
             end_pos: run.end_pos,
-            value: run.value,
+            value: run.value_relative.unwrap_or(run.value),
             mean: None,
             median: None,
             std: None,
@@ -734,7 +734,7 @@ fn add_features_from_arrays(
         let start_evt_medians: Vec<f64> = arrays.start_event_lengths.iter().map(|v| {
             if v.is_empty() { 0.0 } else { let mut s = v.clone(); s.sort_unstable(); s[s.len()/2] as f64 }
         }).collect();
-        let reads_starts_runs = add_compressed_feature_with_median(
+        add_compressed_feature_with_median(
             &reads_starts_original, &start_evt_medians,
             Some(&coverage_reduced_f64), "reads_starts", contig_name, config, output,
         );
@@ -743,63 +743,10 @@ fn add_features_from_arrays(
         let end_evt_medians: Vec<f64> = arrays.end_event_lengths.iter().map(|v| {
             if v.is_empty() { 0.0 } else { let mut s = v.clone(); s.sort_unstable(); s[s.len()/2] as f64 }
         }).collect();
-        let reads_ends_runs = add_compressed_feature_with_median(
+        add_compressed_feature_with_median(
             &reads_ends_original, &end_evt_medians,
             Some(&coverage_reduced_f64), "reads_ends", contig_name, config, output,
         );
-
-        // Tau: calculate from merged (deduplicated) position ranges
-        // Both starts and ends runs contribute positions, but tau uses both signals
-        // at each position, so we must avoid duplicates from overlapping ranges.
-        let mut tau_positions: Vec<(i32, i32)> = reads_starts_runs.iter()
-            .chain(reads_ends_runs.iter())
-            .map(|run| (run.start_pos, run.end_pos))
-            .collect();
-        tau_positions.sort_by_key(|&(s, _)| s);
-
-        // Merge overlapping intervals
-        let mut merged_ranges: Vec<(i32, i32)> = Vec::new();
-        for (s, e) in tau_positions {
-            if let Some(last) = merged_ranges.last_mut() {
-                if s <= last.1 + 1 {
-                    last.1 = last.1.max(e);
-                    continue;
-                }
-            }
-            merged_ranges.push((s, e));
-        }
-
-        for (start_pos, end_pos) in &merged_ranges {
-            let mut tau_sum = 0.0;
-            let mut count = 0;
-
-            for pos in *start_pos..=*end_pos {
-                let idx = (pos - 1) as usize;
-                if idx < arrays.coverage_reduced.len() {
-                    let c = arrays.coverage_reduced[idx];
-                    let s = arrays.reads_starts[idx];
-                    let e = arrays.reads_ends[idx];
-                    if c > 0 {
-                        tau_sum += (s + e) as f64 / c as f64;
-                        count += 1;
-                    }
-                }
-            }
-
-            if count > 0 {
-                let tau_value = tau_sum / count as f64;
-                output.push(FeaturePoint {
-                    contig_name: contig_name.to_string(),
-                    feature: "tau".to_string(),
-                    start_pos: *start_pos,
-                    end_pos: *end_pos,
-                    value: tau_value as f32,
-                    mean: None,
-                    median: None,
-                    std: None,
-                });
-            }
-        }
 
         // === STEP 2: Calculate aligned fraction and global metrics ===
         let aligned_count = arrays.coverage_reduced.iter().filter(|&&x| x > 0).count();

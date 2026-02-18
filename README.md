@@ -204,6 +204,31 @@ All plots leverage the full capabilities of Bokeh: you can pan, zoom, and hover 
 
 Buttons in the top-right section allow you to disable pan, zoom, or hover interactions, reset the plots to their original state, and **export the current view as a PNG image**.
 
+#### Adaptive resolution rendering
+
+theBIGbam adapts the level of detail based on the viewing window size to ensure smooth, responsive plotting:
+
+- **Full resolution (≤ 10 kb windows)**: All compressed RLE data points are expanded and plotted. Tooltips are enabled, showing exact position and value when hovering over data points. This provides maximum detail for focused exploration of specific genomic regions.
+
+- **Downsampled view (> 10 kb windows)**: SQL-side binning reduces the number of points sent to the browser:
+  - The visible window is divided into **1000 fixed-width bins**
+  - Each RLE segment is assigned to a bin based on its **midpoint position**
+  - Values within each bin are **averaged** to produce a single representative point per bin
+  - Tooltips are disabled to improve performance
+  - The x-coordinate for each bin is its **center position**
+
+This two-tier approach balances detail and performance: small windows provide single-base resolution for detailed inspection, while large windows show trends across megabase-scale regions without overwhelming the browser.
+
+#### Coverage normalization
+
+For features that depend on local coverage depth (clippings, indels, mismatches, reads starts/ends, paired-read anomalies), an optional **"Plot relative to local coverage"** checkbox normalizes values to facilitate comparison across regions with varying coverage:
+
+- **Enabled**: Y-axis shows the **ratio** of events to local coverage (value ÷ coverage), scaled between 0 and 1. For example, a value of 0.10 means 10% of reads at that position have the feature (e.g., 10 clippings per 100× coverage, or 50 clippings per 500× coverage).
+
+- **Disabled** (default): Y-axis shows **absolute counts** (e.g., number of clippings, insertions, mismatches).
+
+This normalization reveals whether anomalies are proportional to coverage (expected sequencing noise) or represent true biological signal or assembly errors that persist regardless of depth.
+
 TODO: add image with zoom on the tools, explain the download possibilities as well
 
 ---

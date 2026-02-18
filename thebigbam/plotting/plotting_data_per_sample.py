@@ -178,7 +178,7 @@ def make_bokeh_genemap(conn, contig_id, locus_name, locus_size, subplot_size, sh
 
     return annotation_fig
 
-def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None):
+def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None, show_tooltips=True):
     # Create the figure first (even if empty)
     p = figure(
         height=height,
@@ -199,11 +199,7 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None):
         for data_feature in feature_dict:
             xx = data_feature["x"]
             yy = data_feature["y"]
-            
-            # Warn if dataset is very large (can cause browser issues)
-            if len(xx) > 100000:
-                print(f"Warning: Large dataset ({len(xx)} points) may cause browser rendering issues. Consider using a smaller region or higher compression ratio.", flush=True)
-            
+
             type_picked = data_feature["type"]
             color = data_feature["color"]
             alpha = data_feature["alpha"]
@@ -280,62 +276,62 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None):
                     legend_label = title
                 )
 
-    # Add hover with conditional tooltips based on whether statistics are available
-    # Check if any feature in feature_dict has statistics, variable width, or is duplication
-    has_any_stats = any(d.get("has_stats", False) for d in feature_dict)
-    has_variable_width = any("width" in d and any(w != 1 for w in d["width"]) for d in feature_dict)
-    is_duplication = any(d.get("is_duplication", False) for d in feature_dict)
-    has_repeat_positions = any("repeat_positions" in d for d in feature_dict)
+    # Add hover tooltips only in full-resolution mode (window <= 10kb)
+    if show_tooltips:
+        has_any_stats = any(d.get("has_stats", False) for d in feature_dict)
+        has_variable_width = any("width" in d and any(w != 1 for w in d["width"]) for d in feature_dict)
+        is_duplication = any(d.get("is_duplication", False) for d in feature_dict)
+        has_repeat_positions = any("repeat_positions" in d for d in feature_dict)
 
-    if is_duplication:
-        # Duplication-specific tooltips
-        tooltips = [
-            ("First position", "@first_pos{0,0}"),
-            ("Last position", "@last_pos{0,0}"),
-            ("Linked start", "@linked_start{0,0}"),
-            ("Linked end", "@linked_end{0,0}"),
-            ("Length", "@length{0,0}"),
-            ("Identity", "@y{0.01}%")
-        ]
-    elif has_repeat_positions:
-        tooltips = [
-            ("Position", "@x{0,0}"),
-            ("Value", "@y{0.00}"),
-            ("Repeat positions", "@repeat_positions"),
-        ]
-    elif has_variable_width:
-        # For bars with spans, show first and last position
-        tooltips = [
-            ("First position", "@first_pos{0,0}"),
-            ("Last position", "@last_pos{0,0}"),
-            ("Value", "@y{0.00}")
-        ]
-    elif has_any_stats:
-        # Check if mean/std are all None (median-only features like reads_starts/reads_ends)
-        has_mean = any(
-            any(m is not None for m in d.get("mean", []))
-            for d in feature_dict if d.get("has_stats", False)
-        )
-        tooltips = [
-            ("Position", "@x{0,00}"),
-            ("Value", "@y{0.00}"),
-        ]
-        if has_mean:
-            tooltips.append(("Mean", "@mean{0.00}"))
-        tooltips.append(("Median clipping", "@median{0.00}") if not has_mean else ("Median", "@median{0.00}"))
-        if has_mean:
-            tooltips.append(("Std", "@std{0.00}"))
-    else:
-        tooltips = [("Position", "@x{0,0}"), ("Value", "@y{0.00}")]
-    
-    hover = HoverTool(tooltips=tooltips, mode='vline')
-    p.add_tools(hover)
+        if is_duplication:
+            tooltips = [
+                ("First position", "@first_pos{0,0}"),
+                ("Last position", "@last_pos{0,0}"),
+                ("Linked start", "@linked_start{0,0}"),
+                ("Linked end", "@linked_end{0,0}"),
+                ("Length", "@length{0,0}"),
+                ("Identity", "@y{0.01}%")
+            ]
+        elif has_repeat_positions:
+            tooltips = [
+                ("Position", "@x{0,0}"),
+                ("Value", "@y{0.00}"),
+                ("Repeat positions", "@repeat_positions"),
+            ]
+        elif has_variable_width:
+            tooltips = [
+                ("First position", "@first_pos{0,0}"),
+                ("Last position", "@last_pos{0,0}"),
+                ("Value", "@y{0.00}")
+            ]
+        elif has_any_stats:
+            has_mean = any(
+                any(m is not None for m in d.get("mean", []))
+                for d in feature_dict if d.get("has_stats", False)
+            )
+            tooltips = [
+                ("Position", "@x{0,00}"),
+                ("Value", "@y{0.00}"),
+            ]
+            if has_mean:
+                tooltips.append(("Mean", "@mean{0.00}"))
+            tooltips.append(("Median clipping", "@median{0.00}") if not has_mean else ("Median", "@median{0.00}"))
+            if has_mean:
+                tooltips.append(("Std", "@std{0.00}"))
+        else:
+            tooltips = [("Position", "@x{0,0}"), ("Value", "@y{0.00}")]
+
+        hover = HoverTool(tooltips=tooltips, mode='vline')
+        p.add_tools(hover)
 
     # A clean style like your matplotlib setup
     p.toolbar.logo = None
     p.xgrid.visible = False
 
     p.y_range.start = min(0, *(y for d in feature_dict for y in d["y"]))
+    # Cap y-axis at 1 for relative-to-coverage features (values are ratios between 0 and 1)
+    if all(d.get("is_relative_scaled", False) for d in feature_dict):
+        p.y_range = Range1d(p.y_range.start, 1)
     p.yaxis.axis_label = title
     p.yaxis.axis_label_text_font_size = "10pt"
     p.yaxis.axis_label_standoff = 0
@@ -832,9 +828,172 @@ def get_variable_metadata_batch(cur, subplot_list):
     return result
 
 
+### Downsampling threshold: windows larger than this use SQL-side binning
+_DOWNSAMPLE_THRESHOLD = 100_000  # 100 kb
+_NUM_BINS = 1000
+
+
+def _rle_weighted_bin_sql(feature_table, is_contig_table, xstart, xend, sample_id, contig_id, cur, num_bins=_NUM_BINS, value_col="Value"):
+    """Run RLE-weighted SQL binning: maximum Value per bin to preserve spikes.
+
+    For each RLE segment that overlaps a bin, the contribution is:
+        Value * (min(Last_position, bin_end) - max(First_position, bin_start) + 1) / bin_width
+
+    Args:
+        value_col: Column name to bin (default: "Value")
+
+    Returns list of (position_of_max, max_y) tuples where position_of_max is the actual
+    position (midpoint of RLE segment) where the maximum value occurred within the bin.
+    """
+    import os
+    window_size = xend - xstart + 1
+    bin_width = max(1, window_size // num_bins)
+
+    # SQL computes: for each row, which bins it overlaps, then maximum per bin
+    # We use arg_max to also track the position where the max occurred
+    # This allows tooltips to show the actual position of spikes in binned data
+
+    if is_contig_table:
+        sql = (
+            f"SELECT LEAST(CAST(((First_position + Last_position) / 2 - ?) / ? AS INTEGER), ? - 1) AS bin, "
+            f"MAX(CAST({value_col} AS DOUBLE)) AS max_value, "
+            f"arg_max(CAST((First_position + Last_position) / 2 AS INTEGER), CAST({value_col} AS DOUBLE)) AS max_position "
+            f"FROM {feature_table} "
+            f"WHERE Contig_id = ? AND Last_position >= ? AND First_position <= ? "
+            f"GROUP BY bin ORDER BY bin"
+        )
+        params = (xstart, bin_width, num_bins, contig_id, xstart, xend)
+    else:
+        sql = (
+            f"SELECT LEAST(CAST(((First_position + Last_position) / 2 - ?) / ? AS INTEGER), ? - 1) AS bin, "
+            f"MAX(CAST({value_col} AS DOUBLE)) AS max_value, "
+            f"arg_max(CAST((First_position + Last_position) / 2 AS INTEGER), CAST({value_col} AS DOUBLE)) AS max_position "
+            f"FROM {feature_table} "
+            f"WHERE Sample_id = ? AND Contig_id = ? AND Last_position >= ? AND First_position <= ? "
+            f"GROUP BY bin ORDER BY bin"
+        )
+        params = (xstart, bin_width, num_bins, sample_id, contig_id, xstart, xend)
+
+    # Optionally save EXPLAIN plan
+    if os.environ.get("BIGBAMB_PROFILE"):
+        try:
+            cur.execute(f"EXPLAIN {sql}", params)
+            explain_rows = cur.fetchall()
+            explain_file = f"explain_{feature_table}_{xstart}_{xend}.txt"
+            with open(explain_file, "w") as f:
+                for erow in explain_rows:
+                    f.write(str(erow[0]) + "\n")
+        except Exception as e:
+            print(f"[get_feature_data] Could not save EXPLAIN for {feature_table}: {e}", flush=True)
+
+    cur.execute(sql, params)
+    binned_rows = cur.fetchall()
+
+    # Build lookup of bin_idx -> (max_position, max_value)
+    bin_data = {}
+    for bin_idx, max_value, max_position in binned_rows:
+        if max_value is not None and bin_idx is not None:
+            bin_data[int(bin_idx)] = (int(max_position), float(max_value))
+
+    if not bin_data:
+        return [], []
+
+    # Zero-fill all bins between min and max occupied bins
+    # This prevents linear interpolation artifacts (triangles) in varea/line rendering
+    # For zero-filled bins, use the bin center as position
+    min_bin = min(bin_data)
+    max_bin = max(bin_data)
+    x_coords = []
+    y_coords = []
+    for bi in range(min_bin, max_bin + 1):
+        if bi in bin_data:
+            position, value = bin_data[bi]
+            x_coords.append(position)
+            y_coords.append(value)
+        else:
+            # Zero-filled bin: use bin center
+            bin_center = int(xstart + (bi + 0.5) * window_size / num_bins)
+            x_coords.append(bin_center)
+            y_coords.append(0.0)
+    
+    # Sort by x to ensure monotonically increasing coordinates (prevents zigzag rendering)
+    sorted_pairs = sorted(zip(x_coords, y_coords), key=lambda pair: pair[0])
+    x_coords = [x for x, y in sorted_pairs]
+    y_coords = [y for x, y in sorted_pairs]
+    
+    return x_coords, y_coords
+
+
+def _rle_weighted_bin_primary_reads(xstart, xend, sample_id, contig_id, cur, num_bins=_NUM_BINS):
+    """Bin primary_reads by binning plus and minus strands separately, then summing per bin.
+    
+    Returns (x_coords, y_coords) where x is the position of the max contributor within each bin.
+    """
+    window_size = xend - xstart + 1
+    bin_width = max(1, window_size // num_bins)
+
+    # Store per-bin: {bin_idx: [(position, value), ...]} for each strand
+    bin_contributions = {}
+
+    for table_name in ["Feature_primary_reads_plus_only", "Feature_primary_reads_minus_only"]:
+        sql = (
+            f"SELECT LEAST(CAST(((First_position + Last_position) / 2 - ?) / ? AS INTEGER), ? - 1) AS bin, "
+            f"MAX(CAST(Value AS DOUBLE)) AS max_value, "
+            f"arg_max(CAST((First_position + Last_position) / 2 AS INTEGER), CAST(Value AS DOUBLE)) AS max_position "
+            f"FROM {table_name} "
+            f"WHERE Sample_id = ? AND Contig_id = ? AND Last_position >= ? AND First_position <= ? "
+            f"GROUP BY bin ORDER BY bin"
+        )
+        params = (xstart, bin_width, num_bins, sample_id, contig_id, xstart, xend)
+        cur.execute(sql, params)
+        for bin_idx, max_value, max_position in cur.fetchall():
+            if max_value is not None and bin_idx is not None:
+                bi = int(bin_idx)
+                if bi not in bin_contributions:
+                    bin_contributions[bi] = []
+                bin_contributions[bi].append((int(max_position), float(max_value)))
+
+    if not bin_contributions:
+        return [], []
+
+    # Sum contributions per bin and track position of max contributor
+    results = {}  # bin_idx -> (sum_value, position_of_max_contributor)
+    for bi, contributions in bin_contributions.items():
+        total_value = sum(val for pos, val in contributions)
+        # Use position from the strand that contributed more
+        max_contributor = max(contributions, key=lambda x: x[1])
+        results[bi] = (total_value, max_contributor[0])
+
+    # Zero-fill all bins between min and max occupied bins
+    min_bin = min(results)
+    max_bin = max(results)
+    x_coords = []
+    y_coords = []
+    for bi in range(min_bin, max_bin + 1):
+        if bi in results:
+            value, position = results[bi]
+            x_coords.append(position)
+            y_coords.append(value)
+        else:
+            bin_center = int(xstart + (bi + 0.5) * window_size / num_bins)
+            x_coords.append(bin_center)
+            y_coords.append(0.0)
+    
+    # Sort by x to ensure monotonically increasing coordinates (prevents zigzag rendering)
+    sorted_pairs = sorted(zip(x_coords, y_coords), key=lambda pair: pair[0])
+    x_coords = [x for x, y in sorted_pairs]
+    y_coords = [y for x, y in sorted_pairs]
+    
+    return x_coords, y_coords
+
+
 ### Function to get features of one variable
 def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None, variable_metadata=None):
     """Get feature data for plotting.
+
+    Uses SQL-side binning (midpoint assignment, 1000 bins) for windows > 10kb
+    to limit the number of points sent to the browser. For small windows or
+    undefined ranges, full-resolution RLE expansion is used.
 
     Args:
         cur: DuckDB cursor
@@ -845,6 +1004,13 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
         xend: Optional end position for filtering (only fetch data intersecting this range)
         variable_metadata: Optional cached result from get_variable_metadata(); avoids re-querying Variable table
     """
+    # Features stored as relative values (value / coverage * 1000) — need ÷1000 scaling
+    RELATIVE_SCALED_FEATURES = {
+        "Feature_left_clippings", "Feature_right_clippings", "Feature_insertions", "Feature_deletions", 
+        "Feature_mismatches", "Feature_reads_starts", "Feature_reads_ends", "Feature_non_inward_pairs", 
+        "Feature_mate_not_mapped", "Feature_mate_on_another_contig"
+    }
+
     # Get rendering info from Variable table (Type and Size are quoted - reserved words in DuckDB)
     if variable_metadata is not None:
         rows = variable_metadata
@@ -854,8 +1020,10 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
     # list_feature_dict has several elements if multiple variables share the same subplot
     # example the clippings (right vs left)
     list_feature_dict = []
+
     for row in rows:
         type_picked, color, alpha, fill_alpha, size, title, feature_table = row
+        
         feature_dict = {
             "type": type_picked,
             "color": color,
@@ -864,179 +1032,201 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
             "size": size,
             "title": title,
             "x": [],
-            "y": []
+            "y": [],
+            "is_relative_scaled": False,  # Will be set to True for relative-scaled features
         }
 
-        # Check if this feature has statistics columns
-        features_with_stats = ["left_clippings", "right_clippings", "insertions", "reads_starts", "reads_ends"]
-        has_stats = feature_table in [f"Feature_{f}" for f in features_with_stats]
-
         # Check if this feature stores scaled values (stored as INTEGER ×100)
-        # - tau and mapq are stored as value × 100
-        # - gc_skew is stored as value × 100 (range: -100 to +100 representing -1.0 to +1.0)
-        scaled_features = ["Feature_tau", "Feature_mapq", "Contig_GCSkew"]
+        scaled_features = ["Feature_mapq", "Contig_GCSkew"]
         is_scaled = feature_table in scaled_features
+
+        # Check if this feature stores relative values (stored as INTEGER ×1000)
+        is_relative_scaled = feature_table in RELATIVE_SCALED_FEATURES
 
         # Detect contig-level table (no Sample_id column)
         is_contig_table = feature_table.startswith("Contig_")
 
-        # Special handling for primary_reads: combine strand tables in Python
-        # This avoids the OOM issues from the complex VIEW that computes on-the-fly
-        if feature_table == "Feature_primary_reads":
-            # Build position filter clause
-            position_filter = ""
-            params = [sample_id, contig_id]
-            if xstart is not None and xend is not None:
-                position_filter = " AND Last_position >= ? AND First_position <= ?"
-                params.extend([xstart, xend])
+        # --- DOWNSAMPLING PATH: large windows (> 100kb) ---
+        use_binning = (
+            xstart is not None and xend is not None
+            and (xend - xstart) > _DOWNSAMPLE_THRESHOLD
+        )
 
-            cur.execute(
-                f"SELECT First_position, Last_position, Value FROM Feature_primary_reads_plus_only "
-                f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
-                tuple(params)
-            )
-            plus_rows = cur.fetchall()
-
-            cur.execute(
-                f"SELECT First_position, Last_position, Value FROM Feature_primary_reads_minus_only "
-                f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
-                tuple(params)
-            )
-            minus_rows = cur.fetchall()
-
-            data_rows = merge_rle_segments(plus_rows, minus_rows)
-        # Query Feature_* table (RLE format: First_position, Last_position, Value, and optionally Mean, Median, Std)
-        elif has_stats:
-            # Build position filter clause
-            position_filter = ""
-            params = [sample_id, contig_id]
-            if xstart is not None and xend is not None:
-                position_filter = " AND Last_position >= ? AND First_position <= ?"
-                params.extend([xstart, xend])
-
-            cur.execute(
-                f"SELECT First_position, Last_position, Value, Mean, Median, Std FROM {feature_table} "
-                f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
-                tuple(params)
-            )
-            data_rows = cur.fetchall()
-        else:
-            # Build position filter clause
-            position_filter = ""
-            if is_contig_table:
-                params = [contig_id]
-            else:
-                params = [sample_id, contig_id]
-            if xstart is not None and xend is not None:
-                position_filter = " AND Last_position >= ? AND First_position <= ?"
-                params.extend([xstart, xend])
-
-            if is_contig_table:
-                cur.execute(
-                    f"SELECT First_position, Last_position, Value FROM {feature_table} "
-                    f"WHERE Contig_id=?{position_filter} ORDER BY First_position",
-                    tuple(params)
+        if use_binning:
+            # Special case: primary_reads combines two strand tables
+            if feature_table == "Feature_primary_reads":
+                x_coords, y_coords = _rle_weighted_bin_primary_reads(
+                    xstart, xend, sample_id, contig_id, cur
                 )
             else:
+                x_coords, y_coords = _rle_weighted_bin_sql(
+                    feature_table, is_contig_table, xstart, xend,
+                    sample_id, contig_id, cur
+                )
+
+            # Apply scaling after binning (MAX was on raw INTEGER values)
+            if is_relative_scaled and y_coords:
+                # Relative features stored as INTEGER × 1000
+                y_coords = [v / 1000.0 for v in y_coords]
+            elif is_scaled and y_coords:
+                # Scaled features stored as INTEGER × 100
+                y_coords = [v / 100.0 for v in y_coords]
+
+            feature_dict["x"] = x_coords
+            feature_dict["y"] = y_coords
+            feature_dict["has_stats"] = False  # stats don't aggregate meaningfully
+            feature_dict["is_relative_scaled"] = is_relative_scaled
+            if x_coords:
+                list_feature_dict.append(feature_dict)
+
+        else:
+            # --- FULL RESOLUTION PATH: small windows or undefined range ---
+            # Check if this feature has statistics columns
+            features_with_stats = ["left_clippings", "right_clippings", "insertions", "reads_starts", "reads_ends"]
+            has_stats = feature_table in [f"Feature_{f}" for f in features_with_stats]
+
+            # Special handling for primary_reads: combine strand tables in Python
+            if feature_table == "Feature_primary_reads":
+                position_filter = ""
+                params = [sample_id, contig_id]
+                if xstart is not None and xend is not None:
+                    position_filter = " AND Last_position >= ? AND First_position <= ?"
+                    params.extend([xstart, xend])
                 cur.execute(
-                    f"SELECT First_position, Last_position, Value FROM {feature_table} "
+                    f"SELECT First_position, Last_position, Value FROM Feature_primary_reads_plus_only "
                     f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
                     tuple(params)
                 )
-            data_rows = cur.fetchall()
+                plus_rows = cur.fetchall()
+                cur.execute(
+                    f"SELECT First_position, Last_position, Value FROM Feature_primary_reads_minus_only "
+                    f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
+                    tuple(params)
+                )
+                minus_rows = cur.fetchall()
+                data_rows = merge_rle_segments(plus_rows, minus_rows)
+            elif has_stats:
+                position_filter = ""
+                params = [sample_id, contig_id]
+                if xstart is not None and xend is not None:
+                    position_filter = " AND Last_position >= ? AND First_position <= ?"
+                    params.extend([xstart, xend])
+                cur.execute(
+                    f"SELECT First_position, Last_position, Value, Mean, Median, Std FROM {feature_table} "
+                    f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
+                    tuple(params)
+                )
+                data_rows = cur.fetchall()
+            else:
+                position_filter = ""
+                if is_contig_table:
+                    params = [contig_id]
+                else:
+                    params = [sample_id, contig_id]
+                if xstart is not None and xend is not None:
+                    position_filter = " AND Last_position >= ? AND First_position <= ?"
+                    params.extend([xstart, xend])
+                if is_contig_table:
+                    cur.execute(
+                        f"SELECT First_position, Last_position, Value FROM {feature_table} "
+                        f"WHERE Contig_id=?{position_filter} ORDER BY First_position",
+                        tuple(params)
+                    )
+                else:
+                    cur.execute(
+                        f"SELECT First_position, Last_position, Value FROM {feature_table} "
+                        f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
+                        tuple(params)
+                    )
+                data_rows = cur.fetchall()
 
-        # Clip feature positions to requested range
-        if xstart is not None and xend is not None:
-            clipped_rows = []
+            # Clip feature positions to requested range
+            if xstart is not None and xend is not None:
+                clipped_rows = []
+                for row in data_rows:
+                    if has_stats:
+                        first_pos, last_pos, value, mean, median, std = row
+                        clipped_first = max(first_pos, xstart)
+                        clipped_last = min(last_pos, xend)
+                        if clipped_first <= clipped_last:
+                            clipped_rows.append((clipped_first, clipped_last, value, mean, median, std))
+                    else:
+                        first_pos, last_pos, value = row
+                        clipped_first = max(first_pos, xstart)
+                        clipped_last = min(last_pos, xend)
+                        if clipped_first <= clipped_last:
+                            clipped_rows.append((clipped_first, clipped_last, value))
+                data_rows = clipped_rows
+
+            # Expand RLE runs into individual points for plotting
+            x_coords = []
+            y_coords = []
+            mean_coords = []
+            median_coords = []
+            std_coords = []
+            width_coords = []
+            first_pos_coords = []
+            last_pos_coords = []
             for row in data_rows:
                 if has_stats:
                     first_pos, last_pos, value, mean, median, std = row
-                    clipped_first = max(first_pos, xstart)
-                    clipped_last = min(last_pos, xend)
-                    if clipped_first <= clipped_last:
-                        clipped_rows.append((clipped_first, clipped_last, value, mean, median, std))
                 else:
                     first_pos, last_pos, value = row
-                    clipped_first = max(first_pos, xstart)
-                    clipped_last = min(last_pos, xend)
-                    if clipped_first <= clipped_last:
-                        clipped_rows.append((clipped_first, clipped_last, value))
-            data_rows = clipped_rows
-
-        # Expand RLE runs into individual points for plotting
-        x_coords = []
-        y_coords = []
-        mean_coords = []
-        median_coords = []
-        std_coords = []
-
-        # Store widths for bars (needed for plotting spans)
-        width_coords = []
-        first_pos_coords = []
-        last_pos_coords = []
-
-        for row in data_rows:
-            if has_stats:
-                first_pos, last_pos, value, mean, median, std = row
-            else:
-                first_pos, last_pos, value = row
-                mean = median = std = None
-
-            # Scale back if this is a scaled feature (tau, mapq stored as ×100)
-            if is_scaled:
-                value = value / 100.0 if value is not None else None
-
-            if type_picked == "bars":
-                # For bars: use midpoint as x position and calculate width
-                midpoint = (first_pos + last_pos) / 2.0
-                width = last_pos - first_pos + 1
-                x_coords.append(midpoint)
-                y_coords.append(value)
-                width_coords.append(width)
-                first_pos_coords.append(first_pos)
-                last_pos_coords.append(last_pos)
-                if has_stats:
-                    mean_coords.append(mean)
-                    median_coords.append(median)
-                    std_coords.append(std)
-            else:
-                # For curves: only need start and end points
-                if first_pos == last_pos:
-                    x_coords.append(first_pos)
+                    mean = median = std = None
+                # Scale values based on storage format
+                if is_relative_scaled:
+                    # Relative-to-coverage features stored as INTEGER × 1000
+                    value = value / 1000.0 if value is not None else None
+                elif is_scaled:
+                    # Scaled features (mapq, gc_skew) stored as INTEGER × 100
+                    value = value / 100.0 if value is not None else None
+                if type_picked == "bars":
+                    midpoint = (first_pos + last_pos) / 2.0
+                    width = last_pos - first_pos + 1
+                    x_coords.append(midpoint)
                     y_coords.append(value)
+                    width_coords.append(width)
+                    first_pos_coords.append(first_pos)
+                    last_pos_coords.append(last_pos)
                     if has_stats:
                         mean_coords.append(mean)
                         median_coords.append(median)
                         std_coords.append(std)
                 else:
-                    x_coords.extend([first_pos, last_pos])
-                    y_coords.extend([value, value])
-                    if has_stats:
-                        mean_coords.extend([mean, mean])
-                        median_coords.extend([median, median])
-                        std_coords.extend([std, std])
-
-        feature_dict["x"] = x_coords
-        feature_dict["y"] = y_coords
-        feature_dict["has_stats"] = has_stats
-        if type_picked == "bars":
-            feature_dict["width"] = width_coords
-            feature_dict["first_pos"] = first_pos_coords
-            feature_dict["last_pos"] = last_pos_coords
-        if has_stats:
-            feature_dict["mean"] = mean_coords
-            feature_dict["median"] = median_coords
-            feature_dict["std"] = std_coords
-
-        # Only append if we have actual data points
-        if x_coords:
-            list_feature_dict.append(feature_dict)
+                    if first_pos == last_pos:
+                        x_coords.append(first_pos)
+                        y_coords.append(value)
+                        if has_stats:
+                            mean_coords.append(mean)
+                            median_coords.append(median)
+                            std_coords.append(std)
+                    else:
+                        x_coords.extend([first_pos, last_pos])
+                        y_coords.extend([value, value])
+                        if has_stats:
+                            mean_coords.extend([mean, mean])
+                            median_coords.extend([median, median])
+                            std_coords.extend([std, std])
+            feature_dict["x"] = x_coords
+            feature_dict["y"] = y_coords
+            feature_dict["has_stats"] = has_stats
+            feature_dict["is_relative_scaled"] = is_relative_scaled
+            if type_picked == "bars":
+                feature_dict["width"] = width_coords
+                feature_dict["first_pos"] = first_pos_coords
+                feature_dict["last_pos"] = last_pos_coords
+            if has_stats:
+                feature_dict["mean"] = mean_coords
+                feature_dict["median"] = median_coords
+                feature_dict["std"] = std_coords
+            if x_coords:
+                list_feature_dict.append(feature_dict)
 
     return list_feature_dict
 
 
 ### Function to get features for multiple samples in a single batch
-def _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend):
+def _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled=False):
     """Expand RLE rows into plot coordinates (shared logic for single and batch).
 
     Args:
@@ -1046,6 +1236,7 @@ def _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend)
         is_scaled: Whether values need to be divided by 100
         xstart: Optional start position for clipping
         xend: Optional end position for clipping
+        is_relative_scaled: Whether values are relative-to-coverage (need to be divided by 1000)
 
     Returns:
         Dict with x, y, and optional width/stats coordinate lists, or None if no data
@@ -1084,7 +1275,12 @@ def _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend)
             first_pos, last_pos, value = row
             mean = median = std = None
 
-        if is_scaled:
+        # Scale values based on storage format
+        if is_relative_scaled:
+            # Relative-to-coverage features stored as INTEGER × 1000
+            value = value / 1000.0 if value is not None else None
+        elif is_scaled:
+            # Scaled features (mapq, gc_skew) stored as INTEGER × 100
             value = value / 100.0 if value is not None else None
 
         if type_picked == "bars":
@@ -1130,11 +1326,72 @@ def _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend)
     return result
 
 
+def _rle_weighted_bin_batch_sql(feature_table, xstart, xend, sample_ids, contig_id, cur, num_bins=_NUM_BINS, value_col="Value"):
+    """Run SQL-side binning for multiple samples at once using MAX aggregation to preserve spikes.
+    
+    Args:
+        value_col: Column name to bin (default: "Value")
+    
+    Returns dict {sample_id: (x_coords, y_coords)} where x_coords are actual positions of max values.
+    """
+    window_size = xend - xstart + 1
+    bin_width = max(1, window_size // num_bins)
+    placeholders = ", ".join(["?"] * len(sample_ids))
+
+    sql = (
+        f"SELECT Sample_id, "
+        f"LEAST(CAST(((First_position + Last_position) / 2 - ?) / ? AS INTEGER), ? - 1) AS bin, "
+        f"MAX(CAST({value_col} AS DOUBLE)) AS max_value, "
+        f"arg_max(CAST((First_position + Last_position) / 2 AS INTEGER), CAST({value_col} AS DOUBLE)) AS max_position "
+        f"FROM {feature_table} "
+        f"WHERE Sample_id IN ({placeholders}) AND Contig_id = ? AND Last_position >= ? AND First_position <= ? "
+        f"GROUP BY Sample_id, bin ORDER BY Sample_id, bin"
+    )
+    params = (xstart, bin_width, num_bins) + tuple(sample_ids) + (contig_id, xstart, xend)
+    cur.execute(sql, params)
+
+    # Group results by sample_id: sid -> {bin_idx: (position, value)}
+    by_sample = {sid: {} for sid in sample_ids}
+    for sid, bin_idx, max_value, max_position in cur.fetchall():
+        if sid in by_sample and max_value is not None and bin_idx is not None:
+            by_sample[sid][int(bin_idx)] = (int(max_position), float(max_value))
+
+    result = {}
+    for sid in sample_ids:
+        bin_data = by_sample[sid]
+        if not bin_data:
+            result[sid] = ([], [])
+            continue
+        # Zero-fill all bins between min and max occupied bins
+        min_bin = min(bin_data)
+        max_bin = max(bin_data)
+        x_coords = []
+        y_coords = []
+        for bi in range(min_bin, max_bin + 1):
+            if bi in bin_data:
+                position, value = bin_data[bi]
+                x_coords.append(position)
+                y_coords.append(value)
+            else:
+                # Zero-filled bin: use bin center
+                bin_center = int(xstart + (bi + 0.5) * window_size / num_bins)
+                x_coords.append(bin_center)
+                y_coords.append(0.0)
+        
+        # Sort by x to ensure monotonically increasing coordinates (prevents zigzag rendering)
+        sorted_pairs = sorted(zip(x_coords, y_coords), key=lambda pair: pair[0])
+        x_coords = [x for x, y in sorted_pairs]
+        y_coords = [y for x, y in sorted_pairs]
+        
+        result[sid] = (x_coords, y_coords)
+    return result
+
+
 def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xend=None, variable_metadata=None):
     """Get feature data for multiple samples in a single batch query.
 
-    Instead of running N separate queries (one per sample), runs one query with
-    WHERE Sample_id IN (...) and partitions results in Python.
+    Uses SQL-side binning for windows > 10kb (same as get_feature_data).
+    For small windows, uses full-resolution RLE expansion.
 
     Args:
         cur: DuckDB cursor
@@ -1148,6 +1405,13 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
     Returns:
         Dict mapping sample_id to list_feature_dict (same format as get_feature_data returns)
     """
+    # Features stored as relative values (value / coverage * 1000) — need ÷1000 scaling
+    RELATIVE_SCALED_FEATURES = {
+        "Feature_left_clippings", "Feature_right_clippings", "Feature_insertions", "Feature_deletions", 
+        "Feature_mismatches", "Feature_reads_starts", "Feature_reads_ends", "Feature_non_inward_pairs", 
+        "Feature_mate_not_mapped", "Feature_mate_on_another_contig"
+    }
+
     if variable_metadata is not None:
         rows = variable_metadata
     else:
@@ -1162,119 +1426,180 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
     # Build the IN clause placeholders
     placeholders = ", ".join(["?"] * len(sample_ids))
 
+    # Determine if we should use binning
+    use_binning = (
+        xstart is not None and xend is not None
+        and (xend - xstart) > _DOWNSAMPLE_THRESHOLD
+    )
+
     for row in rows:
         type_picked, color, alpha, fill_alpha, size, title, feature_table = row
 
+        is_relative_scaled = feature_table in RELATIVE_SCALED_FEATURES
+
         features_with_stats = ["left_clippings", "right_clippings", "insertions", "reads_starts", "reads_ends"]
         has_stats = feature_table in [f"Feature_{f}" for f in features_with_stats]
-        scaled_features = ["Feature_tau", "Feature_mapq"]
+        scaled_features = ["Feature_mapq", "Contig_GCSkew"]
         is_scaled = feature_table in scaled_features
 
         # Detect contig-level table (no Sample_id column)
         is_contig_table = feature_table.startswith("Contig_")
 
-        # Build position filter
-        position_filter = ""
-        extra_params = []
-        if xstart is not None and xend is not None:
-            position_filter = " AND Last_position >= ? AND First_position <= ?"
-            extra_params = [xstart, xend]
+        if use_binning:
+            # --- DOWNSAMPLING PATH ---
+            if feature_table == "Feature_primary_reads":
+                # Bin each strand table separately, then sum per bin per sample
+                # Track position of max contributor per bin
+                window_size = xend - xstart + 1
+                bin_width = max(1, window_size // _NUM_BINS)
 
-        if feature_table == "Feature_primary_reads":
-            # Batch query for plus strand
-            params = list(sample_ids) + [contig_id] + extra_params
-            cur.execute(
-                f"SELECT Sample_id, First_position, Last_position, Value "
-                f"FROM Feature_primary_reads_plus_only "
-                f"WHERE Sample_id IN ({placeholders}) AND Contig_id=?{position_filter} "
-                f"ORDER BY Sample_id, First_position",
-                tuple(params)
-            )
-            all_plus = cur.fetchall()
+                # Store {sid: {bin: [(position, value), ...]}} for each strand
+                bins_by_sample = {sid: {} for sid in sample_ids}
+                for table_name in ["Feature_primary_reads_plus_only", "Feature_primary_reads_minus_only"]:
+                    sql = (
+                        f"SELECT Sample_id, "
+                        f"LEAST(CAST(((First_position + Last_position) / 2 - ?) / ? AS INTEGER), ? - 1) AS bin, "
+                        f"MAX(CAST(Value AS DOUBLE)) AS max_value, "
+                        f"arg_max(CAST((First_position + Last_position) / 2 AS INTEGER), CAST(Value AS DOUBLE)) AS max_position "
+                        f"FROM {table_name} "
+                        f"WHERE Sample_id IN ({placeholders}) AND Contig_id = ? "
+                        f"AND Last_position >= ? AND First_position <= ? "
+                        f"GROUP BY Sample_id, bin ORDER BY Sample_id, bin"
+                    )
+                    params = (xstart, bin_width, _NUM_BINS) + tuple(sample_ids) + (contig_id, xstart, xend)
+                    cur.execute(sql, params)
+                    for sid, bin_idx, max_value, max_position in cur.fetchall():
+                        if sid in bins_by_sample and max_value is not None and bin_idx is not None:
+                            bi = int(bin_idx)
+                            if bi not in bins_by_sample[sid]:
+                                bins_by_sample[sid][bi] = []
+                            bins_by_sample[sid][bi].append((int(max_position), float(max_value)))
 
-            # Batch query for minus strand
-            cur.execute(
-                f"SELECT Sample_id, First_position, Last_position, Value "
-                f"FROM Feature_primary_reads_minus_only "
-                f"WHERE Sample_id IN ({placeholders}) AND Contig_id=?{position_filter} "
-                f"ORDER BY Sample_id, First_position",
-                tuple(params)
-            )
-            all_minus = cur.fetchall()
+                # Aggregate per sample: sum values and use position of max contributor
+                for sid in sample_ids:
+                    x_coords = []
+                    y_coords = []
+                    for bi in sorted(bins_by_sample[sid].keys()):
+                        contributions = bins_by_sample[sid][bi]
+                        total_value = sum(val for pos, val in contributions)
+                        # Use position from the strand that contributed more
+                        max_contributor = max(contributions, key=lambda x: x[1])
+                        x_coords.append(max_contributor[0])
+                        y_coords.append(total_value)
+                    if x_coords:
+                        # Sort by x to ensure monotonically increasing coordinates (prevents zigzag rendering)
+                        sorted_pairs = sorted(zip(x_coords, y_coords), key=lambda pair: pair[0])
+                        x_coords = [x for x, y in sorted_pairs]
+                        y_coords = [y for x, y in sorted_pairs]
+                        
+                        feature_dict = {
+                            "type": type_picked, "color": color, "alpha": alpha,
+                            "fill_alpha": fill_alpha, "size": size, "title": title,
+                            "x": x_coords, "y": y_coords, "has_stats": False,
+                            "is_relative_scaled": is_relative_scaled,
+                        }
+                        result[sid].append(feature_dict)
 
-            # Group by sample_id
-            plus_by_sample = {sid: [] for sid in sample_ids}
-            for sid, first, last, val in all_plus:
-                if sid in plus_by_sample:
-                    plus_by_sample[sid].append((first, last, val))
+            elif is_contig_table:
+                # Contig-level: bin once, share across all samples
+                x_coords, y_coords = _rle_weighted_bin_sql(
+                    feature_table, True, xstart, xend, None, contig_id, cur
+                )
+                # Apply scaling
+                if is_relative_scaled and y_coords:
+                    y_coords = [v / 1000.0 for v in y_coords]
+                elif is_scaled and y_coords:
+                    y_coords = [v / 100.0 for v in y_coords]
+                if x_coords:
+                    for sid in sample_ids:
+                        feature_dict = {
+                            "type": type_picked, "color": color, "alpha": alpha,
+                            "fill_alpha": fill_alpha, "size": size, "title": title,
+                            "x": list(x_coords), "y": list(y_coords), "has_stats": False,
+                            "is_relative_scaled": is_relative_scaled,
+                        }
+                        result[sid].append(feature_dict)
 
-            minus_by_sample = {sid: [] for sid in sample_ids}
-            for sid, first, last, val in all_minus:
-                if sid in minus_by_sample:
-                    minus_by_sample[sid].append((first, last, val))
-
-            # Merge and expand per sample
-            for sid in sample_ids:
-                data_rows = merge_rle_segments(plus_by_sample[sid], minus_by_sample[sid])
-                expanded = _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend)
-                if expanded is not None:
-                    feature_dict = {
-                        "type": type_picked, "color": color, "alpha": alpha,
-                        "fill_alpha": fill_alpha, "size": size, "title": title,
-                    }
-                    feature_dict.update(expanded)
-                    result[sid].append(feature_dict)
-
-        elif has_stats:
-            params = list(sample_ids) + [contig_id] + extra_params
-            cur.execute(
-                f"SELECT Sample_id, First_position, Last_position, Value, Mean, Median, Std "
-                f"FROM {feature_table} "
-                f"WHERE Sample_id IN ({placeholders}) AND Contig_id=?{position_filter} "
-                f"ORDER BY Sample_id, First_position",
-                tuple(params)
-            )
-            all_rows = cur.fetchall()
-
-            # Group by sample_id
-            rows_by_sample = {sid: [] for sid in sample_ids}
-            for sid, first, last, val, mean, median, std in all_rows:
-                if sid in rows_by_sample:
-                    rows_by_sample[sid].append((first, last, val, mean, median, std))
-
-            for sid in sample_ids:
-                expanded = _expand_rle_rows(rows_by_sample[sid], type_picked, has_stats, is_scaled, xstart, xend)
-                if expanded is not None:
-                    feature_dict = {
-                        "type": type_picked, "color": color, "alpha": alpha,
-                        "fill_alpha": fill_alpha, "size": size, "title": title,
-                    }
-                    feature_dict.update(expanded)
-                    result[sid].append(feature_dict)
+            else:
+                # Sample-level table: batch bin all samples at once
+                binned = _rle_weighted_bin_batch_sql(
+                    feature_table, xstart, xend, sample_ids, contig_id, cur
+                )
+                for sid in sample_ids:
+                    x_coords, y_coords = binned[sid]
+                    # Apply scaling
+                    if is_relative_scaled and y_coords:
+                        y_coords = [v / 1000.0 for v in y_coords]
+                    elif is_scaled and y_coords:
+                        y_coords = [v / 100.0 for v in y_coords]
+                    if x_coords:
+                        feature_dict = {
+                            "type": type_picked, "color": color, "alpha": alpha,
+                            "fill_alpha": fill_alpha, "size": size, "title": title,
+                            "x": x_coords, "y": y_coords, "has_stats": False,
+                            "is_relative_scaled": is_relative_scaled,
+                        }
+                        result[sid].append(feature_dict)
 
         else:
-            if is_contig_table:
-                # Contig-level table: query once (no Sample_id), duplicate for all samples
-                params = [contig_id] + extra_params
+            # --- FULL RESOLUTION PATH ---
+            # Build position filter
+            position_filter = ""
+            extra_params = []
+            if xstart is not None and xend is not None:
+                position_filter = " AND Last_position >= ? AND First_position <= ?"
+                extra_params = [xstart, xend]
+
+            if feature_table == "Feature_primary_reads":
+                # Batch query for plus strand
+                params = list(sample_ids) + [contig_id] + extra_params
                 cur.execute(
-                    f"SELECT First_position, Last_position, Value FROM {feature_table} "
-                    f"WHERE Contig_id=?{position_filter} ORDER BY First_position",
+                    f"SELECT Sample_id, First_position, Last_position, Value "
+                    f"FROM Feature_primary_reads_plus_only "
+                    f"WHERE Sample_id IN ({placeholders}) AND Contig_id=?{position_filter} "
+                    f"ORDER BY Sample_id, First_position",
                     tuple(params)
                 )
-                contig_rows = cur.fetchall()
-                expanded = _expand_rle_rows(contig_rows, type_picked, has_stats, is_scaled, xstart, xend)
-                if expanded is not None:
-                    for sid in sample_ids:
+                all_plus = cur.fetchall()
+
+                # Batch query for minus strand
+                cur.execute(
+                    f"SELECT Sample_id, First_position, Last_position, Value "
+                    f"FROM Feature_primary_reads_minus_only "
+                    f"WHERE Sample_id IN ({placeholders}) AND Contig_id=?{position_filter} "
+                    f"ORDER BY Sample_id, First_position",
+                    tuple(params)
+                )
+                all_minus = cur.fetchall()
+
+                # Group by sample_id
+                plus_by_sample = {sid: [] for sid in sample_ids}
+                for sid, first, last, val in all_plus:
+                    if sid in plus_by_sample:
+                        plus_by_sample[sid].append((first, last, val))
+
+                minus_by_sample = {sid: [] for sid in sample_ids}
+                for sid, first, last, val in all_minus:
+                    if sid in minus_by_sample:
+                        minus_by_sample[sid].append((first, last, val))
+
+                # Merge and expand per sample
+                for sid in sample_ids:
+                    data_rows = merge_rle_segments(plus_by_sample[sid], minus_by_sample[sid])
+                    expanded = _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend, False)
+                    if expanded is not None:
                         feature_dict = {
                             "type": type_picked, "color": color, "alpha": alpha,
                             "fill_alpha": fill_alpha, "size": size, "title": title,
                         }
                         feature_dict.update(expanded)
+                        feature_dict["is_relative_scaled"] = False  # primary_reads not relative
                         result[sid].append(feature_dict)
-            else:
+
+            elif has_stats:
                 params = list(sample_ids) + [contig_id] + extra_params
                 cur.execute(
-                    f"SELECT Sample_id, First_position, Last_position, Value "
+                    f"SELECT Sample_id, First_position, Last_position, Value, Mean, Median, Std "
                     f"FROM {feature_table} "
                     f"WHERE Sample_id IN ({placeholders}) AND Contig_id=?{position_filter} "
                     f"ORDER BY Sample_id, First_position",
@@ -1284,53 +1609,160 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
 
                 # Group by sample_id
                 rows_by_sample = {sid: [] for sid in sample_ids}
-                for sid, first, last, val in all_rows:
+                for sid, first, last, val, mean, median, std in all_rows:
                     if sid in rows_by_sample:
-                        rows_by_sample[sid].append((first, last, val))
+                        rows_by_sample[sid].append((first, last, val, mean, median, std))
 
                 for sid in sample_ids:
-                    expanded = _expand_rle_rows(rows_by_sample[sid], type_picked, has_stats, is_scaled, xstart, xend)
+                    expanded = _expand_rle_rows(rows_by_sample[sid], type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled)
                     if expanded is not None:
                         feature_dict = {
                             "type": type_picked, "color": color, "alpha": alpha,
                             "fill_alpha": fill_alpha, "size": size, "title": title,
                         }
                         feature_dict.update(expanded)
+                        feature_dict["is_relative_scaled"] = is_relative_scaled
                         result[sid].append(feature_dict)
+
+            else:
+                if is_contig_table:
+                    # Contig-level table: query once (no Sample_id), duplicate for all samples
+                    params = [contig_id] + extra_params
+                    cur.execute(
+                        f"SELECT First_position, Last_position, Value FROM {feature_table} "
+                        f"WHERE Contig_id=?{position_filter} ORDER BY First_position",
+                        tuple(params)
+                    )
+                    contig_rows = cur.fetchall()
+                    expanded = _expand_rle_rows(contig_rows, type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled)
+                    if expanded is not None:
+                        for sid in sample_ids:
+                            feature_dict = {
+                                "type": type_picked, "color": color, "alpha": alpha,
+                                "fill_alpha": fill_alpha, "size": size, "title": title,
+                            }
+                            feature_dict.update(expanded)
+                            feature_dict["is_relative_scaled"] = is_relative_scaled
+                            result[sid].append(feature_dict)
+                else:
+                    # Sample-level table: batch query
+                    params = list(sample_ids) + [contig_id] + extra_params
+                    cur.execute(
+                        f"SELECT Sample_id, First_position, Last_position, Value "
+                        f"FROM {feature_table} "
+                        f"WHERE Sample_id IN ({placeholders}) AND Contig_id=?{position_filter} "
+                        f"ORDER BY Sample_id, First_position",
+                        tuple(params)
+                    )
+                    all_rows = cur.fetchall()
+
+                    # Group by sample_id
+                    rows_by_sample = {sid: [] for sid in sample_ids}
+                    for sid, first, last, val in all_rows:
+                        if sid in rows_by_sample:
+                            rows_by_sample[sid].append((first, last, val))
+
+                    for sid in sample_ids:
+                        expanded = _expand_rle_rows(rows_by_sample[sid], type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled)
+                        if expanded is not None:
+                            feature_dict = {
+                                "type": type_picked, "color": color, "alpha": alpha,
+                                "fill_alpha": fill_alpha, "size": size, "title": title,
+                            }
+                            feature_dict.update(expanded)
+                            feature_dict["is_relative_scaled"] = is_relative_scaled
+                            result[sid].append(feature_dict)
 
     return result
 
 
+### Parsing features
+def parse_requested_features(list_features):
+    """Parse requested features, expanding modules to individual features.
+
+    Accepts a mix of module names and individual feature names.
+    Module names are case-insensitive and can include:
+    - "coverage" or "Coverage" -> primary_reads, secondary_reads, supplementary_reads
+    - "phagetermini" or "Phage termini" -> coverage_reduced, reads_starts, reads_ends, tau + Repeats
+    - "assemblycheck" or "Assembly check" -> all assembly check features
+    - "genome" or "Genome" -> Repeat count + Max repeat identity + GC content + GC skew
+
+    Returns tuple of (deduplicated list of individual feature names, include_repeat_count, include_repeat_identity).
+    Note: GC content and GC skew are returned as regular features in the list.
+    """
+    features = []
+    include_repeat_count = False
+    include_repeat_identity = False
+
+    for item in list_features:
+        item_lower = item.lower().strip()
+
+        # Module: Genome
+        if item_lower in ["genome"]:
+            include_repeat_count = True
+            include_repeat_identity = True
+            features.extend(["GC content", "GC skew"])
+        # Module: Coverage
+        elif item_lower in ["coverage"]:
+            features.extend(["Primary alignments", "Other alignments", "Other alignments"])
+        # Module: Phage termini / phagetermini
+        elif item_lower in ["phage termini", "phagetermini", "phage_termini"]:
+            features.extend(["Coverage reduced", "Reads termini", "Read termini transformation"])
+            include_repeat_count = True
+            include_repeat_identity = True
+        # Module: Assembly check / assemblycheck
+        elif item_lower in ["assembly check", "assemblycheck", "assembly_check"]:
+            features.extend(["Clippings", "Indels", "Mismatches", "Read lengths", "Insert sizes", "Bad orientations"])
+        # Handle individual repeat subplot buttons
+        elif item_lower in ["repeat count"]:
+            include_repeat_count = True
+        elif item_lower in ["max repeat identity"]:
+            include_repeat_identity = True
+        # Handle legacy "Repeats" (also accept "duplications")
+        elif item_lower in ["repeats", "repeat", "duplications", "duplication"]:
+            include_repeat_count = True
+            include_repeat_identity = True
+        # Handle "GC content" specifically - add as regular feature
+        elif item_lower in ["gc_content", "gc content", "gccontent", "gc"]:
+            features.append("GC content")
+        # Handle "GC skew" specifically - add as regular feature
+        elif item_lower in ["gc_skew", "gc skew", "gcskew", "skew"]:
+            features.append("GC skew")
+        # Individual feature
+        else:
+            features.append(item)
+
+    # Deduplicate while preserving order
+    seen = set()
+    deduped_features = [f for f in features if not (f in seen or seen.add(f))]
+    return deduped_features, include_repeat_count, include_repeat_identity
+
+
 ### Function to generate the bokeh plot
 def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=100, genbank_path=None, feature_types=None, use_phage_colors=False, plot_isoforms=True, plot_sequence=False, same_y_scale=False, genemap_size=None):
-    """Generate a Bokeh plot for a single sample.
-
-    Args:
-        conn: DuckDB connection
-        list_features: List of features/modules to plot (can be mix of modules and individual features)
-        contig_name: Name of the contig to plot
-        sample_name: Name of the sample to plot
-        xstart: Optional x-axis start position
-        xend: Optional x-axis end position
-        subplot_size: Height of each subplot in pixels
-        genbank_path: Optional genbank file path (if provided, gene map will be shown)
-        feature_types: Optional list of feature types to include in gene map (None = all)
-        use_phage_colors: Whether to use phage color scheme for CDS features
-        plot_isoforms: Whether to show all isoforms (True) or only longest per locus_tag (False)
-    """
+    """Generate a Bokeh plot for a single sample."""
     cur = conn.cursor()
 
     # Get contig characteristics
     contig_id, locus_name, locus_size = get_contig_info(cur, contig_name)
     print(f"Locus {locus_name} validated ({locus_size} bp)", flush=True)
 
-    # --- Main gene annotation plot (only if genbank provided) ---
+    # --- Main gene annotation plot (only if genbank provided and window <= 100kb) ---
     shared_xrange = Range1d(0, locus_size)
     if xstart is not None and xend is not None:
         shared_xrange.start = xstart
         shared_xrange.end = xend
 
-    annotation_fig = make_bokeh_genemap(conn, contig_id, locus_name, locus_size, genemap_size if genemap_size is not None else subplot_size, shared_xrange, xstart, xend, feature_types=feature_types, use_phage_colors=use_phage_colors, plot_isoforms=plot_isoforms) if genbank_path else None
+    annotation_fig = None
+    if genbank_path and xstart is not None and xend is not None and (xend - xstart) <= 100_000:
+        annotation_fig = make_bokeh_genemap(
+            conn, contig_id, locus_name, locus_size,
+            genemap_size if genemap_size is not None else subplot_size,
+            shared_xrange, xstart, xend,
+            feature_types=feature_types, use_phage_colors=use_phage_colors, plot_isoforms=plot_isoforms
+        )
+    elif genbank_path and xstart is not None and xend is not None and (xend - xstart) > 100_000:
+        print("Gene map not plotted: window > 100kbp", flush=True)
 
     # Get sample characteristics (optional – contig-level features work without a sample)
     sample_id = None
@@ -1347,12 +1779,17 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
     subplots = []
 
     # --- Add sequence subplot right after annotation (top of data tracks) ---
-    if plot_sequence:
+    if plot_sequence and xstart is not None and xend is not None and (xend - xstart) <= 1_000:
         seq_subplot = make_bokeh_sequence_subplot(conn, contig_name, xstart, xend, subplot_size // 2, shared_xrange)
         if seq_subplot:
             subplots.append(seq_subplot)
+    elif plot_sequence and xstart is not None and xend is not None and (xend - xstart) > 1_000:
+        print("Sequence not plotted: window > 1kbp", flush=True)
 
     requested_features, include_repeat_count, include_repeat_identity = parse_requested_features(list_features)
+
+    # Enable tooltips for all window sizes (binned data now shows actual positions of max values)
+    show_tips = True
 
     # Add Repeats subplots if requested (contig-level, sample-independent)
     if include_repeat_count or include_repeat_identity:
@@ -1360,12 +1797,12 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
             count_dicts, identity_dicts = get_repeats_aggregated_data(cur, contig_id, xstart, xend)
             # Track 1: Repeat count (direct + inverted as separate legend entries)
             if include_repeat_count and count_dicts:
-                subplot = make_bokeh_subplot(count_dicts, subplot_size, shared_xrange)
+                subplot = make_bokeh_subplot(count_dicts, subplot_size, shared_xrange, show_tooltips=show_tips)
                 if subplot is not None:
                     subplots.append(subplot)
             # Track 2: Repeat max identity (direct + inverted as separate legend entries)
             if include_repeat_identity and identity_dicts:
-                subplot = make_bokeh_subplot(identity_dicts, subplot_size, shared_xrange)
+                subplot = make_bokeh_subplot(identity_dicts, subplot_size, shared_xrange, show_tooltips=show_tips)
                 if subplot is not None:
                     subplots.append(subplot)
         except Exception as e:
@@ -1385,7 +1822,7 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
                     cur, feature, contig_id, None, xstart, xend,
                     variable_metadata=metadata_cache.get(feature)
                 )
-                subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange)
+                subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, show_tooltips=show_tips)
                 if subplot_feature is not None:
                     subplots.append(subplot_feature)
             except Exception as e:
@@ -1411,7 +1848,7 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
                     cur, feature, contig_id, sample_id, xstart, xend,
                     variable_metadata=metadata_cache.get(feature)
                 )
-                subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange)
+                subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, show_tooltips=show_tips)
                 if subplot_feature is not None:
                     if same_y_scale:
                         max_y = max((y for d in list_feature_dict for y in d["y"]), default=0)
@@ -1458,64 +1895,3 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
         grid = gridplot([[p] for p in subplots], merge_tools=True, sizing_mode='stretch_width')
 
     return grid
-
-### Parsing features
-def parse_requested_features(list_features):
-    """Parse requested features, expanding modules to individual features.
-
-    Accepts a mix of module names and individual feature names.
-    Module names are case-insensitive and can include:
-    - "coverage" or "Coverage" -> primary_reads, secondary_reads, supplementary_reads
-    - "phagetermini" or "Phage termini" -> coverage_reduced, reads_starts, reads_ends, tau + Repeats
-    - "assemblycheck" or "Assembly check" -> all assembly check features
-    - "genome" or "Genome" -> Repeat count + Max repeat identity + GC content + GC skew
-
-    Returns tuple of (deduplicated list of individual feature names, include_repeat_count, include_repeat_identity).
-    Note: GC content and GC skew are returned as regular features in the list.
-    """
-    features = []
-    include_repeat_count = False
-    include_repeat_identity = False
-
-    for item in list_features:
-        item_lower = item.lower().strip()
-
-        # Module: Genome
-        if item_lower in ["genome"]:
-            include_repeat_count = True
-            include_repeat_identity = True
-            features.extend(["GC content", "GC skew"])
-        # Module: Coverage
-        elif item_lower in ["coverage"]:
-            features.extend(["Primary alignments", "Other alignments", "Other alignments"])
-        # Module: Phage termini / phagetermini
-        elif item_lower in ["phage termini", "phagetermini", "phage_termini"]:
-            features.extend(["Coverage reduced", "Reads termini", "Tau", "Read termini transformation"])
-            include_repeat_count = True
-            include_repeat_identity = True
-        # Module: Assembly check / assemblycheck
-        elif item_lower in ["assembly check", "assemblycheck", "assembly_check"]:
-            features.extend(["Clippings", "Indels", "Mismatches", "Read lengths", "Insert sizes", "Bad orientations"])
-        # Handle individual repeat subplot buttons
-        elif item_lower in ["repeat count"]:
-            include_repeat_count = True
-        elif item_lower in ["max repeat identity"]:
-            include_repeat_identity = True
-        # Handle legacy "Repeats" (also accept "duplications")
-        elif item_lower in ["repeats", "repeat", "duplications", "duplication"]:
-            include_repeat_count = True
-            include_repeat_identity = True
-        # Handle "GC content" specifically - add as regular feature
-        elif item_lower in ["gc_content", "gc content", "gccontent", "gc"]:
-            features.append("GC content")
-        # Handle "GC skew" specifically - add as regular feature
-        elif item_lower in ["gc_skew", "gc skew", "gcskew", "skew"]:
-            features.append("GC skew")
-        # Individual feature
-        else:
-            features.append(item)
-
-    # Deduplicate while preserving order
-    seen = set()
-    deduped_features = [f for f in features if not (f in seen or seen.add(f))]
-    return deduped_features, include_repeat_count, include_repeat_identity

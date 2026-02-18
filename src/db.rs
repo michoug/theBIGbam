@@ -424,8 +424,8 @@ impl DbWriter {
             // Create table lazily if it doesn't exist yet
             create_feature_table_if_needed(conn, &table_name, has_stats, &mut created_tables)?;
 
-            // Determine if this variable stores scaled integers
-            let is_scaled = v.name == "tau" || v.name == "mapq";
+            // Determine if this variable stores scaled integers (now only mapq, since tau is removed)
+            let is_scaled = v.name == "mapq";
 
             // Count rows per contig
             let mut contig_row_counts: HashMap<i64, i64> = HashMap::new();

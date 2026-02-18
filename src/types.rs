@@ -228,7 +228,6 @@ pub const VARIABLES: &[VariableConfig] = &[
     VariableConfig { name: "reads_starts", subplot: "Reads termini", module: "Phage termini", module_order: 2, plot_type: PlotType::Bars, color: "#215732", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Read starts", help: None },
     VariableConfig { name: "reads_ends", subplot: "Reads termini", module: "Phage termini", module_order: 3, plot_type: PlotType::Bars, color: "#572146", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Read ends", help: None },
     VariableConfig { name: "coverage_reduced", subplot: "Coverage reduced", module: "Phage termini", module_order: 4, plot_type: PlotType::Curve, color: "#00c53b", alpha: 0.8, fill_alpha: 0.4, size: 1.0, title: "Coverage reduced", help: Some("Retains primary mappings starting with an exact match (and ending with an exact match for long reads)") },
-    VariableConfig { name: "tau", subplot: "Tau", module: "Phage termini", module_order: 5, plot_type: PlotType::Bars, color: "#44883e", alpha: 0.6, fill_alpha: 0.4, size: 1.0, title: "Tau", help: None },
 ];
 
 // ============================================================================
@@ -411,7 +410,7 @@ pub struct FeaturePoint {
     pub start_pos: i32,
     /// Last position in the run (1-indexed, inclusive)
     pub end_pos: i32,
-    /// The value for this run
+    /// The value for this run (relative to coverage for coverage-dependent features)
     pub value: f32,
     /// Optional mean (for clipping/insertion statistics)
     pub mean: Option<f32>,
