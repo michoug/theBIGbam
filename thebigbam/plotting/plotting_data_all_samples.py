@@ -4,7 +4,7 @@ from bokeh.layouts import gridplot
 from .plotting_data_per_sample import get_contig_info, get_feature_data, get_feature_data_batch, get_variable_metadata, get_repeats_aggregated_data, make_bokeh_subplot, make_bokeh_genemap, make_bokeh_sequence_subplot
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130, genbank_path=None, genome_features=None, allowed_samples=None, feature_types=None, use_phage_colors=False, plot_sequence=False, same_y_scale=False, genemap_size=None, order_by_column=None, downsample_threshold=None):
+def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130, genbank_path=None, genome_features=None, allowed_samples=None, feature_types=None, use_phage_colors=False, plot_sequence=False, same_y_scale=False, genemap_size=None, order_by_column=None, downsample_threshold=None, max_genemap_window=None, min_relative_value=0.0):
     """Generate a Bokeh plot showing all samples for a single variable.
 
     Args:
@@ -34,7 +34,12 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
         shared_xrange.start = xstart
         shared_xrange.end = xend
 
-    annotation_fig = make_bokeh_genemap(conn, contig_id, locus_name, locus_size, genemap_size if genemap_size is not None else subplot_size, shared_xrange, xstart, xend, feature_types=feature_types, use_phage_colors=use_phage_colors) if genbank_path else None
+    _genemap_threshold = max_genemap_window if max_genemap_window is not None else 100_000
+    annotation_fig = None
+    if genbank_path and xstart is not None and xend is not None and (xend - xstart) <= _genemap_threshold:
+        annotation_fig = make_bokeh_genemap(conn, contig_id, locus_name, locus_size, genemap_size if genemap_size is not None else subplot_size, shared_xrange, xstart, xend, feature_types=feature_types, use_phage_colors=use_phage_colors)
+    elif genbank_path and xstart is not None and xend is not None and (xend - xstart) > _genemap_threshold:
+        print(f"Gene map not plotted: window > {_genemap_threshold} bp", flush=True)
 
     # Get list of samples
     cur.execute("SELECT Coverage.Sample_id, Sample_name FROM Coverage JOIN Sample ON Coverage.Sample_id = Sample.Sample_id WHERE Contig_id=?", (contig_id,))
@@ -142,7 +147,7 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
     all_min_y = 0
     try:
         var_metadata = get_variable_metadata(cur, variable)
-        batch_results = get_feature_data_batch(cur, variable, contig_id, sample_ids, xstart, xend, variable_metadata=var_metadata, downsample_threshold=downsample_threshold)
+        batch_results = get_feature_data_batch(cur, variable, contig_id, sample_ids, xstart, xend, variable_metadata=var_metadata, downsample_threshold=downsample_threshold, min_relative_value=min_relative_value)
         for sample_id, sample_name in zip(sample_ids, sample_names):
             list_feature_dict = batch_results.get(sample_id, [])
             if not list_feature_dict:

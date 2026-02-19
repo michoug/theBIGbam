@@ -244,6 +244,14 @@ def create_layout(db_path):
             if not source:
                 return set()
 
+            # Translate "has"/"has not" to SQL LIKE/NOT LIKE
+            if operator == "has":
+                operator = "LIKE"
+                value = f"%{value}%"
+            elif operator == "has not":
+                operator = "NOT LIKE"
+                value = f"%{value}%"
+
             # Check if this column is from Contig_annotation table
             col_info = filtering_metadata.get(category, {}).get('columns', {}).get(column_name, {})
             col_source = col_info.get('source')
@@ -580,6 +588,7 @@ def create_layout(db_path):
             subplot_size = int(subplot_height_input.value)
             genemap_size = int(genemap_height_input.value)
             max_binning = int(max_binning_window_input.value)
+            min_coverage_freq = float(min_coverage_freq_input.value)
 
             # Check whether to preserve x-range from previous plot
             preserve_xrange = (
@@ -638,7 +647,8 @@ def create_layout(db_path):
                     genome_features=genome_features if genome_features else None, allowed_samples=set(filtered_samples),
                     feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_sequence=plot_sequence,
                     same_y_scale=same_y_scale, subplot_size=subplot_size, genemap_size=genemap_size,
-                    order_by_column=order_by, downsample_threshold=max_binning
+                    order_by_column=order_by, downsample_threshold=max_binning,
+                    max_genemap_window=max_genemap_window, min_relative_value=min_coverage_freq
                 )
             else:
                 # One-sample view: collect possibly-many requested features and call per-sample plot
@@ -664,7 +674,8 @@ def create_layout(db_path):
                     plot_sequence=plot_sequence, same_y_scale=False, subplot_size=subplot_size, genemap_size=genemap_size,
                     downsample_threshold=max_binning,
                     max_genemap_window=int(max_genemap_window_input.value),
-                    max_sequence_window=int(max_sequence_window_input.value)
+                    max_sequence_window=int(max_sequence_window_input.value),
+                    min_relative_value=min_coverage_freq
                 )
 
             # Restore preserved x-range and update state
@@ -1028,7 +1039,7 @@ def create_layout(db_path):
 
         # Comparison operator select - "=" and "!=" for text, all operators for numeric
         comparison_select = Select(
-            options=["=", "!="] if initial_is_text else ["=", ">", "<", "!="],
+            options=["=", "!=", "has", "has not"] if initial_is_text else ["=", ">", "<", "!="],
             value="=" if initial_is_text else ">",
             width=50,
             margin=(0, 2, 0, 0)
@@ -1068,7 +1079,7 @@ def create_layout(db_path):
 
             # Update comparison options based on type
             if is_text:
-                comparison_select.options = ["=", "!="]
+                comparison_select.options = ["=", "!=", "has", "has not"]
                 if comparison_select.value not in comparison_select.options:
                     comparison_select.value = "="
             else:
@@ -1078,15 +1089,23 @@ def create_layout(db_path):
 
             # Create new input widget
             if is_text:
-                distinct_values = col_info.get('distinct_values', [])
-                new_input = SearchableSelect(
-                    value="", options=distinct_values,
-                    placeholder="Search...", width=90
-                )
-                input_container.objects = [new_input]
-                current_input_ref['widget'] = new_input
-                current_input_ref['is_panel'] = True
-                new_input.param.watch(lambda event: refresh_on_filter_change(), 'value')
+                current_op = comparison_select.value
+                if current_op in ("has", "has not"):
+                    new_input = TextInput(value="", placeholder="Search...", width=90, margin=(0, 2, 0, 0))
+                    input_container.objects = [new_input]
+                    current_input_ref['widget'] = new_input
+                    current_input_ref['is_panel'] = False
+                    new_input.on_change('value', lambda attr, old, new: refresh_on_filter_change())
+                else:
+                    distinct_values = col_info.get('distinct_values', [])
+                    new_input = SearchableSelect(
+                        value="", options=distinct_values,
+                        placeholder="Search...", width=90
+                    )
+                    input_container.objects = [new_input]
+                    current_input_ref['widget'] = new_input
+                    current_input_ref['is_panel'] = True
+                    new_input.param.watch(lambda event: refresh_on_filter_change(), 'value')
             else:
                 new_input = Spinner(value=0, placeholder="Value...", width=90, margin=(0, 2, 0, 0))
                 input_container.objects = [new_input]
@@ -1112,10 +1131,36 @@ def create_layout(db_path):
             """Update input widget when column changes."""
             update_input_widget(new)
 
+        def update_input_on_operator_change(attr, old, new):
+            """Swap input widget between TextInput and SearchableSelect based on operator."""
+            category = category_select.value
+            col_name = subcategory_select.value
+            col_info = filtering_metadata.get(category, {}).get('columns', {}).get(col_name, {})
+            is_text = col_info.get('type') == 'text'
+
+            if is_text:
+                if new in ("has", "has not"):
+                    new_input = TextInput(value="", placeholder="Search...", width=90, margin=(0, 2, 0, 0))
+                    input_container.objects = [new_input]
+                    current_input_ref['widget'] = new_input
+                    current_input_ref['is_panel'] = False
+                    new_input.on_change('value', lambda attr, old, new: refresh_on_filter_change())
+                else:
+                    distinct_values = col_info.get('distinct_values', [])
+                    new_input = SearchableSelect(
+                        value="", options=distinct_values,
+                        placeholder="Search...", width=90
+                    )
+                    input_container.objects = [new_input]
+                    current_input_ref['widget'] = new_input
+                    current_input_ref['is_panel'] = True
+                    new_input.param.watch(lambda event: refresh_on_filter_change(), 'value')
+
+            refresh_on_filter_change()
+
         category_select.on_change('value', update_subcategories)
         subcategory_select.on_change('value', update_input_on_column_change)
-        # Add callback to comparison_select to refresh when operator changes
-        comparison_select.on_change('value', lambda attr, old, new: refresh_on_filter_change())
+        comparison_select.on_change('value', update_input_on_operator_change)
 
         query_row = pn.Row(category_select, subcategory_select, comparison_select, input_container, minus_btn,
                        sizing_mode="stretch_width", margin=(5, 0, 5, 0))
@@ -1679,6 +1724,10 @@ def create_layout(db_path):
     max_binning_window_label = Div(text="Max window size without binning (bp)", margin=(5, 0, 5, 5))
     max_binning_window_row = row(max_binning_window_input, max_binning_window_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
 
+    min_coverage_freq_input = Spinner(value=0.0, low=0.0, high=1.0, step=0.01, width=100, margin=(0, 2, 0, 0))
+    min_coverage_freq_label = Div(text="Minimum frequency for coverage-related features", margin=(5, 0, 5, 5))
+    min_coverage_freq_row = row(min_coverage_freq_input, min_coverage_freq_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
+
     genemap_height_input = Spinner(value=100, low=10, high=1000, step=10, width=80, margin=(0, 2, 0, 0))
     genemap_height_label = Div(text="Height of gene map (px)", width=160, margin=(5, 0, 5, 5))
     genemap_height_row = row(genemap_height_input, genemap_height_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
@@ -1690,6 +1739,7 @@ def create_layout(db_path):
     plotting_params_content = pn.Column(
         sample_order_row, same_y_scale_row,
         max_genemap_window_row, max_sequence_window_row, max_binning_window_row,
+        min_coverage_freq_row,
         genemap_height_row, subplot_height_row,
         sizing_mode="stretch_width"
     )

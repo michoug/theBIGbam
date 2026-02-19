@@ -989,7 +989,7 @@ def _rle_weighted_bin_primary_reads(xstart, xend, sample_id, contig_id, cur, num
 
 
 ### Function to get features of one variable
-def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None, variable_metadata=None, downsample_threshold=None):
+def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None, variable_metadata=None, downsample_threshold=None, min_relative_value=0.0):
     """Get feature data for plotting.
 
     Uses SQL-side binning (midpoint assignment, 1000 bins) for windows larger than the
@@ -1066,6 +1066,11 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
             elif is_scaled and y_coords:
                 # Scaled features stored as INTEGER × 100
                 y_coords = [v / 100.0 for v in y_coords]
+
+            if is_relative_scaled and min_relative_value > 0.0 and x_coords:
+                pairs = [(x, y) for x, y in zip(x_coords, y_coords) if y is None or y >= min_relative_value]
+                x_coords = [p[0] for p in pairs]
+                y_coords = [p[1] for p in pairs]
 
             feature_dict["x"] = x_coords
             feature_dict["y"] = y_coords
@@ -1174,6 +1179,8 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
                 elif is_scaled:
                     # Scaled features (mapq, gc_skew) stored as INTEGER × 100
                     value = value / 100.0 if value is not None else None
+                if is_relative_scaled and min_relative_value > 0.0 and value is not None and value < min_relative_value:
+                    continue
                 if type_picked == "bars":
                     midpoint = (first_pos + last_pos) / 2.0
                     width = last_pos - first_pos + 1
@@ -1220,7 +1227,7 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
 
 
 ### Function to get features for multiple samples in a single batch
-def _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled=False):
+def _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled=False, min_relative_value=0.0):
     """Expand RLE rows into plot coordinates (shared logic for single and batch).
 
     Args:
@@ -1276,6 +1283,9 @@ def _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend,
         elif is_scaled:
             # Scaled features (mapq, gc_skew) stored as INTEGER × 100
             value = value / 100.0 if value is not None else None
+
+        if is_relative_scaled and min_relative_value > 0.0 and value is not None and value < min_relative_value:
+            continue
 
         if type_picked == "bars":
             midpoint = (first_pos + last_pos) / 2.0
@@ -1375,7 +1385,7 @@ def _rle_weighted_bin_batch_sql(feature_table, xstart, xend, sample_ids, contig_
     return result
 
 
-def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xend=None, variable_metadata=None, downsample_threshold=None):
+def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xend=None, variable_metadata=None, downsample_threshold=None, min_relative_value=0.0):
     """Get feature data for multiple samples in a single batch query.
 
     Uses SQL-side MAX binning for windows larger than the downsampling threshold
@@ -1486,6 +1496,10 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
                     y_coords = [v / 1000.0 for v in y_coords]
                 elif is_scaled and y_coords:
                     y_coords = [v / 100.0 for v in y_coords]
+                if is_relative_scaled and min_relative_value > 0.0 and x_coords:
+                    pairs = [(x, y) for x, y in zip(x_coords, y_coords) if y is None or y >= min_relative_value]
+                    x_coords = [p[0] for p in pairs]
+                    y_coords = [p[1] for p in pairs]
                 if x_coords:
                     for sid in sample_ids:
                         feature_dict = {
@@ -1508,6 +1522,10 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
                         y_coords = [v / 1000.0 for v in y_coords]
                     elif is_scaled and y_coords:
                         y_coords = [v / 100.0 for v in y_coords]
+                    if is_relative_scaled and min_relative_value > 0.0 and x_coords:
+                        pairs = [(x, y) for x, y in zip(x_coords, y_coords) if y is None or y >= min_relative_value]
+                        x_coords = [p[0] for p in pairs]
+                        y_coords = [p[1] for p in pairs]
                     if x_coords:
                         feature_dict = {
                             "type": type_picked, "color": color, "alpha": alpha,
@@ -1562,7 +1580,7 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
                 # Merge and expand per sample
                 for sid in sample_ids:
                     data_rows = merge_rle_segments(plus_by_sample[sid], minus_by_sample[sid])
-                    expanded = _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend, False)
+                    expanded = _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend, False, min_relative_value)
                     if expanded is not None:
                         feature_dict = {
                             "type": type_picked, "color": color, "alpha": alpha,
@@ -1590,7 +1608,7 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
                         rows_by_sample[sid].append((first, last, val, mean, median, std))
 
                 for sid in sample_ids:
-                    expanded = _expand_rle_rows(rows_by_sample[sid], type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled)
+                    expanded = _expand_rle_rows(rows_by_sample[sid], type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled, min_relative_value)
                     if expanded is not None:
                         feature_dict = {
                             "type": type_picked, "color": color, "alpha": alpha,
@@ -1610,7 +1628,7 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
                         tuple(params)
                     )
                     contig_rows = cur.fetchall()
-                    expanded = _expand_rle_rows(contig_rows, type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled)
+                    expanded = _expand_rle_rows(contig_rows, type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled, min_relative_value)
                     if expanded is not None:
                         for sid in sample_ids:
                             feature_dict = {
@@ -1639,7 +1657,7 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
                             rows_by_sample[sid].append((first, last, val))
 
                     for sid in sample_ids:
-                        expanded = _expand_rle_rows(rows_by_sample[sid], type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled)
+                        expanded = _expand_rle_rows(rows_by_sample[sid], type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled, min_relative_value)
                         if expanded is not None:
                             feature_dict = {
                                 "type": type_picked, "color": color, "alpha": alpha,
@@ -1715,7 +1733,7 @@ def parse_requested_features(list_features):
 
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=100, genbank_path=None, feature_types=None, use_phage_colors=False, plot_isoforms=True, plot_sequence=False, same_y_scale=False, genemap_size=None, downsample_threshold=None, max_genemap_window=None, max_sequence_window=None):
+def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=100, genbank_path=None, feature_types=None, use_phage_colors=False, plot_isoforms=True, plot_sequence=False, same_y_scale=False, genemap_size=None, downsample_threshold=None, max_genemap_window=None, max_sequence_window=None, min_relative_value=0.0):
     """Generate a Bokeh plot for a single sample."""
     cur = conn.cursor()
 
@@ -1796,7 +1814,8 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
                 list_feature_dict = get_feature_data(
                     cur, feature, contig_id, None, xstart, xend,
                     variable_metadata=metadata_cache.get(feature),
-                    downsample_threshold=downsample_threshold
+                    downsample_threshold=downsample_threshold,
+                    min_relative_value=min_relative_value
                 )
                 subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, show_tooltips=True)
                 if subplot_feature is not None:
@@ -1823,7 +1842,8 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
                 list_feature_dict = get_feature_data(
                     cur, feature, contig_id, sample_id, xstart, xend,
                     variable_metadata=metadata_cache.get(feature),
-                    downsample_threshold=downsample_threshold
+                    downsample_threshold=downsample_threshold,
+                    min_relative_value=min_relative_value
                 )
                 subplot_feature = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, show_tooltips=True)
                 if subplot_feature is not None:
