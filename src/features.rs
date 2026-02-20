@@ -7,7 +7,7 @@
 
 use crate::cigar::{raw_cigar_consumes_ref, raw_cigar_is_clipping, raw_boundary_event_length};
 use crate::circular::{increment_circular, increment_circular_long, increment_range};
-use crate::types::{FeatureMap, SequencingType};
+use crate::types::{FeatureAnnotation, FeatureMap, SequencingType};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -123,6 +123,10 @@ pub struct FeatureArrays {
     /// Only clips < min_clipping_length (used by reads_ends). Truncated to 20bp.
     pub end_clip_sequences: HashMap<usize, HashMap<Vec<u8>, u32>>,
 
+    /// Sparse map: position → {(codon_category, codon_change, aa_change) → count}.
+    /// Only positions with CDS mismatches get entries.
+    pub codon_changes: HashMap<usize, HashMap<(String, String, String), u32>>,
+
     /// Sum of read lengths at each position (for computing average).
     /// Only used for long-read data.
     pub sum_read_lengths: Vec<u64>,
@@ -223,6 +227,7 @@ impl FeatureArrays {
             right_clip_sequences: HashMap::new(),
             start_clip_sequences: HashMap::new(),
             end_clip_sequences: HashMap::new(),
+            codon_changes: HashMap::new(),
             sum_read_lengths: vec![0u64; ref_length],
             count_read_lengths: vec![0u64; ref_length],
             sum_insert_sizes: vec![0u64; ref_length],
@@ -516,6 +521,246 @@ impl FeatureArrays {
 }
 
 // ============================================================================
+// CDS Index for Codon Tracking
+// ============================================================================
+
+/// A single CDS interval for binary search lookup.
+#[derive(Clone, Debug)]
+pub struct CdsInterval {
+    /// 1-based start position on contig
+    pub start: i64,
+    /// 1-based end position on contig (inclusive)
+    pub end: i64,
+    /// Strand: 1 or -1
+    pub strand: i64,
+    /// Nucleotide sequence of the CDS (already strand-corrected)
+    pub nucleotide_sequence: String,
+}
+
+/// Sorted CDS index for fast position-to-CDS lookup via binary search.
+pub struct CdsIndex {
+    /// CDS intervals sorted by start position
+    intervals: Vec<CdsInterval>,
+}
+
+impl CdsIndex {
+    /// Build a CDS index from annotations for a specific contig.
+    pub fn from_annotations(annotations: &[FeatureAnnotation], contig_id: i64) -> Self {
+        let mut intervals: Vec<CdsInterval> = annotations
+            .iter()
+            .filter(|a| {
+                a.contig_id == contig_id
+                    && a.feature_type == "CDS"
+                    && a.nucleotide_sequence.is_some()
+            })
+            .map(|a| CdsInterval {
+                start: a.start,
+                end: a.end,
+                strand: a.strand,
+                nucleotide_sequence: a.nucleotide_sequence.clone().unwrap(),
+            })
+            .collect();
+        intervals.sort_by_key(|c| c.start);
+        Self { intervals }
+    }
+
+    /// Find the CDS covering a given 1-based position, if any.
+    /// Uses binary search on start positions, then scans backwards for overlapping CDS.
+    pub fn find_cds(&self, pos: i64) -> Option<&CdsInterval> {
+        if self.intervals.is_empty() {
+            return None;
+        }
+        // Find rightmost CDS with start <= pos
+        let idx = self.intervals.partition_point(|c| c.start <= pos);
+        if idx == 0 {
+            return None;
+        }
+        // Scan backwards to find a CDS that covers pos
+        for i in (0..idx).rev() {
+            if self.intervals[i].end >= pos {
+                return Some(&self.intervals[i]);
+            }
+        }
+        None
+    }
+
+    /// Check if this index has any CDS intervals.
+    pub fn is_empty(&self) -> bool {
+        self.intervals.is_empty()
+    }
+}
+
+/// Codon change info: (codon_category, codon_change, aa_change)
+type CodonInfo = (String, String, String);
+
+/// Standard genetic code lookup for codon translation.
+fn translate_codon(codon: &[u8; 3]) -> Option<(char, &'static str)> {
+    let c = [codon[0].to_ascii_uppercase(), codon[1].to_ascii_uppercase(), codon[2].to_ascii_uppercase()];
+    Some(match &c {
+        b"TTT" | b"TTC" => ('F', "Phenylalanine"),
+        b"TTA" | b"TTG" | b"CTT" | b"CTC" | b"CTA" | b"CTG" => ('L', "Leucine"),
+        b"ATT" | b"ATC" | b"ATA" => ('I', "Isoleucine"),
+        b"ATG" => ('M', "Methionine"),
+        b"GTT" | b"GTC" | b"GTA" | b"GTG" => ('V', "Valine"),
+        b"TCT" | b"TCC" | b"TCA" | b"TCG" | b"AGT" | b"AGC" => ('S', "Serine"),
+        b"CCT" | b"CCC" | b"CCA" | b"CCG" => ('P', "Proline"),
+        b"ACT" | b"ACC" | b"ACA" | b"ACG" => ('T', "Threonine"),
+        b"GCT" | b"GCC" | b"GCA" | b"GCG" => ('A', "Alanine"),
+        b"TAT" | b"TAC" => ('Y', "Tyrosine"),
+        b"TAA" | b"TAG" | b"TGA" => ('*', "Stop"),
+        b"CAT" | b"CAC" => ('H', "Histidine"),
+        b"CAA" | b"CAG" => ('Q', "Glutamine"),
+        b"AAT" | b"AAC" => ('N', "Asparagine"),
+        b"AAA" | b"AAG" => ('K', "Lysine"),
+        b"GAT" | b"GAC" => ('D', "Aspartate"),
+        b"GAA" | b"GAG" => ('E', "Glutamate"),
+        b"TGT" | b"TGC" => ('C', "Cysteine"),
+        b"TGG" => ('W', "Tryptophan"),
+        b"CGT" | b"CGC" | b"CGA" | b"CGG" | b"AGA" | b"AGG" => ('R', "Arginine"),
+        b"GGT" | b"GGC" | b"GGA" | b"GGG" => ('G', "Glycine"),
+        _ => return None,
+    })
+}
+
+/// Analyze mismatches from a single read against CDS annotations.
+///
+/// For each mismatch position, finds the covering CDS, computes the codon change
+/// considering ALL mismatches from this read in the same codon, classifies as
+/// synonymous/non-synonymous, and increments codon_changes counts.
+///
+/// # Arguments
+/// * `mismatches` - Vec of (0-based ref position, read base as u8) from this read's MD tag walk
+/// * `cds_index` - CDS lookup index for this contig
+/// * `codon_changes` - Sparse map: position -> {(category, codon_change, aa_change) -> count}
+/// * `ref_length` - Reference length for circular modulo
+pub fn analyze_read_codon_changes(
+    mismatches: &[(usize, u8)],
+    cds_index: &CdsIndex,
+    codon_changes: &mut HashMap<usize, HashMap<CodonInfo, u32>>,
+    ref_length: usize,
+) {
+    if mismatches.is_empty() || cds_index.is_empty() {
+        return;
+    }
+
+    let complement = |b: u8| -> u8 {
+        match b {
+            b'A' | b'a' => b'T',
+            b'T' | b't' => b'A',
+            b'C' | b'c' => b'G',
+            b'G' | b'g' => b'C',
+            _ => b'N',
+        }
+    };
+
+    // Group mismatches by (CDS pointer identity, codon_index) for multi-mismatch codon handling
+    // Key: (CDS start, codon_index) -> Vec<(ref_pos_0based, read_base, pos_in_codon)>
+    let mut codon_groups: HashMap<(i64, usize), Vec<(usize, u8, usize)>> = HashMap::new();
+
+    for &(ref_pos_0based, read_base) in mismatches {
+        let pos_1based = (ref_pos_0based % ref_length) as i64 + 1;
+
+        if let Some(cds) = cds_index.find_cds(pos_1based) {
+            let nuc_bytes = cds.nucleotide_sequence.as_bytes();
+
+            // Compute offset within the CDS nucleotide sequence
+            let offset = if cds.strand == -1 {
+                (cds.end - pos_1based) as usize
+            } else {
+                (pos_1based - cds.start) as usize
+            };
+
+            if offset >= nuc_bytes.len() {
+                continue;
+            }
+
+            let codon_idx = offset / 3;
+            let pos_in_codon = offset % 3;
+
+            // Convert read base for reverse strand
+            let alt_base = if cds.strand == -1 {
+                complement(read_base)
+            } else {
+                read_base.to_ascii_uppercase()
+            };
+
+            codon_groups
+                .entry((cds.start, codon_idx))
+                .or_default()
+                .push((ref_pos_0based, alt_base, pos_in_codon));
+        } else {
+            // Position is not inside any CDS — record as Intergenic
+            let info = ("Intergenic".to_string(), String::new(), String::new());
+            codon_changes
+                .entry(ref_pos_0based)
+                .or_default()
+                .entry(info)
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
+        }
+    }
+
+    // Process each codon group: build mutant codon with ALL mismatches from this read
+    for ((_cds_start, codon_idx), group) in &codon_groups {
+        // Find the CDS again (cheap)
+        let first_pos = group[0].0;
+        let pos_1based = (first_pos % ref_length) as i64 + 1;
+        let Some(cds) = cds_index.find_cds(pos_1based) else { continue };
+        let nuc_bytes = cds.nucleotide_sequence.as_bytes();
+
+        let codon_start = codon_idx * 3;
+        let codon_end = codon_start + 3;
+        if codon_end > nuc_bytes.len() {
+            continue;
+        }
+
+        let ref_codon = &nuc_bytes[codon_start..codon_end];
+
+        // Build mutant codon with all mismatches from this read
+        let mut mut_codon = [ref_codon[0].to_ascii_uppercase(), ref_codon[1].to_ascii_uppercase(), ref_codon[2].to_ascii_uppercase()];
+        for &(_, alt_base, pos_in_codon) in group {
+            mut_codon[pos_in_codon] = alt_base;
+        }
+
+        // Translate both codons
+        let ref_codon_upper = [ref_codon[0].to_ascii_uppercase(), ref_codon[1].to_ascii_uppercase(), ref_codon[2].to_ascii_uppercase()];
+        let Some((ref_aa, _)) = translate_codon(&ref_codon_upper) else { continue };
+        let Some((mut_aa, mut_name)) = translate_codon(&mut_codon) else { continue };
+
+        let category = if ref_aa == mut_aa { "Synonymous" } else { "Non-synonymous" };
+        let codon_change_str = String::from_utf8_lossy(&mut_codon).into_owned();
+        let aa_change_str = format!("{} ({})", mut_aa, mut_name);
+
+        // Record for ALL mismatch positions in this group
+        for &(ref_pos, _, _) in group {
+            let info = (category.to_string(), codon_change_str.clone(), aa_change_str.clone());
+            codon_changes
+                .entry(ref_pos)
+                .or_default()
+                .entry(info)
+                .and_modify(|c| *c += 1)
+                .or_insert(1);
+        }
+    }
+}
+
+/// Compute dominant codon change per position from accumulated counts.
+/// Returns a HashMap of position -> (category, codon_change, aa_change) for the most common change.
+pub fn compute_dominant_codon_changes(
+    codon_changes: &HashMap<usize, HashMap<CodonInfo, u32>>,
+) -> HashMap<usize, CodonInfo> {
+    codon_changes
+        .iter()
+        .filter_map(|(&pos, changes)| {
+            changes
+                .iter()
+                .max_by_key(|(_, &count)| count)
+                .map(|(info, _)| (pos, info.clone()))
+        })
+        .collect()
+}
+
+// ============================================================================
 // Module Flags - Configuration
 // ============================================================================
 
@@ -647,6 +892,7 @@ pub fn process_read(
     flags: ModuleFlags,
     circular: bool,
     min_clipping_length: u32,
+    cds_index: Option<&CdsIndex>,
 ) {
     // -------------------------------------------------------------------------
     // Calculate positions
@@ -871,6 +1117,10 @@ pub fn process_read(
         let has_md = !md_bytes.is_empty();
         let has_seq = !seq.is_empty();
 
+        // Collect per-read mismatches for codon analysis
+        let track_codons = cds_index.is_some();
+        let mut read_mismatches: Vec<(usize, u8)> = if track_codons { Vec::new() } else { Vec::new() };
+
         for &(op, len) in cigar_raw {
             let c = op as u8 as char;
             let len_usize = len as usize;
@@ -904,7 +1154,8 @@ pub fn process_read(
                                     arrays.mismatches[normalized_pos] += 1;
 
                                     if has_seq && query_pos < seq.len() {
-                                        let base_idx = match seq[query_pos] {
+                                        let read_base = seq[query_pos];
+                                        let base_idx = match read_base {
                                             b'A' | b'a' => 0usize,
                                             b'C' | b'c' => 1,
                                             b'G' | b'g' => 2,
@@ -913,6 +1164,10 @@ pub fn process_read(
                                         };
                                         if base_idx < 4 {
                                             arrays.mismatch_base_counts[normalized_pos][base_idx] += 1;
+                                        }
+                                        // Collect for per-read codon analysis
+                                        if track_codons && base_idx < 4 {
+                                            read_mismatches.push((ref_pos, read_base));
                                         }
                                     }
 
@@ -992,6 +1247,18 @@ pub fn process_read(
                         ref_pos += len_usize;
                     }
                 }
+            }
+        }
+
+        // Per-read codon analysis: group mismatches by codon and classify
+        if track_codons && !read_mismatches.is_empty() {
+            if let Some(cds_idx) = cds_index {
+                analyze_read_codon_changes(
+                    &read_mismatches,
+                    cds_idx,
+                    &mut arrays.codon_changes,
+                    ref_length,
+                );
             }
         }
     }

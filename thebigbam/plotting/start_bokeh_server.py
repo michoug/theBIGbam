@@ -504,8 +504,7 @@ def create_layout(db_path):
         # Each section maintains its own state independently
         variables_section_one.visible = not is_all
         variables_section_all.visible = is_all
-        sample_order_row.visible = is_all
-        same_y_scale_row.visible = is_all
+        sample_params_header.visible = is_all
 
         # Refresh options while still locked (suppresses cascading callbacks)
         # Don't invalidate filtering cache - filtering is shared between views and hasn't changed
@@ -597,6 +596,7 @@ def create_layout(db_path):
             subplot_size = int(subplot_height_input.value)
             genemap_size = int(genemap_height_input.value)
             sequence_size = int(sequence_height_input.value)
+            translated_sequence_size = int(translated_sequence_height_input.value)
             max_binning = int(max_binning_window_input.value)
             min_coverage_freq = float(min_coverage_freq_input.value)
 
@@ -657,7 +657,7 @@ def create_layout(db_path):
                     genome_features=genome_features if genome_features else None, allowed_samples=set(filtered_samples),
                     feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_sequence=plot_sequence,
                     plot_translated_sequence=plot_translated_sequence, same_y_scale=same_y_scale, subplot_size=subplot_size, genemap_size=genemap_size,
-                    sequence_size=sequence_size, order_by_column=order_by, downsample_threshold=max_binning,
+                    sequence_size=sequence_size, translated_sequence_size=translated_sequence_size, order_by_column=order_by, downsample_threshold=max_binning,
                     max_genemap_window=max_genemap_window, min_relative_value=min_coverage_freq
                 )
             else:
@@ -683,7 +683,7 @@ def create_layout(db_path):
                     feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_isoforms=plot_isoforms,
                     plot_sequence=plot_sequence, plot_translated_sequence=plot_translated_sequence,
                     same_y_scale=False, subplot_size=subplot_size, genemap_size=genemap_size,
-                    sequence_size=sequence_size, downsample_threshold=max_binning,
+                    sequence_size=sequence_size, translated_sequence_size=translated_sequence_size, downsample_threshold=max_binning,
                     max_genemap_window=int(max_genemap_window_input.value),
                     max_sequence_window=int(max_sequence_window_input.value),
                     min_relative_value=min_coverage_freq
@@ -1583,7 +1583,7 @@ def create_layout(db_path):
     position_label_to = Div(text="to", width=25, margin=(5, 0, 5, 5))
     
     # Create Reset button to reset position inputs
-    position_reset_button = Button(label="Reset", stylesheets=[stylesheet], margin=(0, 5, 0, 0))
+    position_reset_button = Button(label="Reset", stylesheets=[stylesheet], margin=(0, 5, 0, 5))
     
     def reset_position_inputs():
         from_position_input.value = "0"
@@ -1623,7 +1623,7 @@ def create_layout(db_path):
     has_translated_data = False
     try:
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Contig_annotation_translated'")
+        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name = 'Contig_annotation' AND column_name = 'Protein_sequence'")
         has_translated_data = cur.fetchone() is not None
     except Exception:
         pass
@@ -1726,57 +1726,96 @@ def create_layout(db_path):
     ## Plotting parameters section
     separator_plotting_params = Div(text="", height=2, sizing_mode="stretch_width",
         styles={'background-color': '#333', 'margin-top': '10px', 'margin-bottom': '10px'})
-    plotting_params_toggle_btn = Button(label="▼", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
     plotting_params_title = Div(text="<b>Plotting parameters</b>", align="center")
-    plotting_params_header = row(plotting_params_toggle_btn, plotting_params_title, sizing_mode="stretch_width", align="center")
+    plotting_params_header = row(plotting_params_title, sizing_mode="stretch_width", align="center")
 
     # Sample paramaters (only useful in All Samples view)
     sample_order_label = Div(text="Order samples by:", margin=(5, 5, 5, 0))
     sample_order_select = Select(value="Sample name", options=sample_order_columns, sizing_mode="stretch_width", margin=(0, 5, 0, 5))
     sample_order_row = row(sample_order_label, sample_order_select, sizing_mode="stretch_width", margin=(5, 0, 5, 0))
-    sample_order_row.visible = False  # Only shown in All Samples mode
 
     same_y_scale_cbg = CheckboxGroup(labels=["Use same y scale for all samples"], active=[], margin=(5, 0, 5, 0))
     same_y_scale_row = row(same_y_scale_cbg, sizing_mode="stretch_width")
-    same_y_scale_row.visible = False  # Only shown in All Samples mode
     
-    # Plotting parameters useful in both views
-    max_genemap_window_input = Spinner(value=100000, low=10, high=1000000, step=1000, width=100, margin=(0, 2, 0, 0))
-    max_genemap_window_label = Div(text="Max window size for gene map (bp)", margin=(5, 0, 5, 5))
-    max_genemap_window_row = row(max_genemap_window_input, max_genemap_window_label, sizing_mode="stretch_width", margin=(5, 0, 5, 0))
-
-    max_sequence_window_input = Spinner(value=1000, low=10, high=1000000, step=100, width=100, margin=(0, 2, 0, 0))
-    max_sequence_window_label = Div(text="Max window size for sequence plots (bp)", margin=(5, 0, 5, 5))
-    max_sequence_window_row = row(max_sequence_window_input, max_sequence_window_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
-
-    max_binning_window_input = Spinner(value=100000, low=10, high=1000000, step=1000, width=100, margin=(0, 2, 0, 0))
-    max_binning_window_label = Div(text="Max window size without binning (bp)", margin=(5, 0, 5, 5))
-    max_binning_window_row = row(max_binning_window_input, max_binning_window_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
-
+    ## Plotting parameters useful in both views
     min_coverage_freq_input = Spinner(value=0.0, low=0.0, high=1.0, step=0.01, width=100, margin=(0, 2, 0, 0))
     min_coverage_freq_label = Div(text="Minimum frequency for coverage-related features", margin=(5, 0, 5, 5))
     min_coverage_freq_row = row(min_coverage_freq_input, min_coverage_freq_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
 
+    # Subsection: Max window sizes for plotting
+    max_genemap_window_input = Spinner(value=100000, low=10, high=1000000, step=1000, width=100, margin=(0, 2, 0, 0))
+    max_genemap_window_label = Div(text="Gene map (bp)", margin=(5, 0, 5, 5))
+    max_genemap_window_row = row(max_genemap_window_input, max_genemap_window_label, sizing_mode="stretch_width", margin=(5, 0, 5, 0))
+
+    max_sequence_window_input = Spinner(value=1000, low=10, high=1000000, step=100, width=100, margin=(0, 2, 0, 0))
+    max_sequence_window_label = Div(text="Sequence plots (bp)", margin=(5, 0, 5, 5))
+    max_sequence_window_row = row(max_sequence_window_input, max_sequence_window_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
+
+    max_binning_window_input = Spinner(value=100000, low=10, high=1000000, step=1000, width=100, margin=(0, 2, 0, 0))
+    max_binning_window_label = Div(text="Feature plots without binning (bp)", margin=(5, 0, 5, 5))
+    max_binning_window_row = row(max_binning_window_input, max_binning_window_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
+
+    max_window_toggle_btn = Button(label="▶", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
+    max_window_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
+    max_window_title = Div(text="Max window size for plotting", align="center")
+    max_window_header = row(max_window_toggle_btn, max_window_title, sizing_mode="stretch_width", align="center", margin=(5, 0, 0, 0))
+    max_window_content = pn.Column(
+        max_genemap_window_row, max_sequence_window_row, max_binning_window_row,
+        sizing_mode="stretch_width", visible=False
+    )
+    max_window_toggle_btn.on_click(make_toggle_callback(max_window_toggle_btn, max_window_content))
+
+    # Subsection: Plot heights
     genemap_height_input = Spinner(value=100, low=10, high=1000, step=10, width=80, margin=(0, 2, 0, 0))
-    genemap_height_label = Div(text="Height of gene map (px)", width=160, margin=(5, 0, 5, 5))
+    genemap_height_label = Div(text="Of gene map (px)", margin=(5, 0, 5, 5))
     genemap_height_row = row(genemap_height_input, genemap_height_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
 
     sequence_height_input = Spinner(value=50, low=10, high=1000, step=10, width=80, margin=(0, 2, 0, 0))
-    sequence_height_label = Div(text="Height of sequence plots (px)", width=160, margin=(5, 0, 5, 5))
+    sequence_height_label = Div(text="Of nucleotide sequence (px)", margin=(5, 0, 5, 5))
     sequence_height_row = row(sequence_height_input, sequence_height_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
 
+    translated_sequence_height_input = Spinner(value=50, low=10, high=1000, step=10, width=80, margin=(0, 2, 0, 0))
+    translated_sequence_height_label = Div(text="Of translated sequence (px)", margin=(5, 0, 5, 5))
+    translated_sequence_height_row = row(translated_sequence_height_input, translated_sequence_height_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
+
     subplot_height_input = Spinner(value=100, low=10, high=1000, step=10, width=80, margin=(0, 2, 0, 0))
-    subplot_height_label = Div(text="Height per subplot (px)", width=160, margin=(5, 0, 5, 5))
+    subplot_height_label = Div(text="Per feature plot (px)", margin=(5, 0, 5, 5))
     subplot_height_row = row(subplot_height_input, subplot_height_label, sizing_mode="stretch_width")
 
-    plotting_params_content = pn.Column(
+    plot_heights_toggle_btn = Button(label="▶", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
+    plot_heights_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
+    plot_heights_title = Div(text="Plot heights", align="center")
+    plot_heights_header = row(plot_heights_toggle_btn, plot_heights_title, sizing_mode="stretch_width", align="center", margin=(5, 0, 0, 0))
+    plot_heights_content = pn.Column(
+        genemap_height_row, sequence_height_row, translated_sequence_height_row, subplot_height_row,
+        sizing_mode="stretch_width", visible=False
+    )
+    plot_heights_toggle_btn.on_click(make_toggle_callback(plot_heights_toggle_btn, plot_heights_content))
+
+    # Subsection: Sample parameters (All Samples view only)
+    sample_params_toggle_btn = Button(label="▶", width=20, height=20, button_type="primary", align="center", margin=0, stylesheets=[toggle_stylesheet])
+    sample_params_toggle_btn.styles = {'padding': '0px', 'line-height': '20px'}
+    sample_params_title = Div(text="Sample parameters", align="center")
+    sample_params_header = row(sample_params_toggle_btn, sample_params_title, sizing_mode="stretch_width", align="center", margin=(5, 0, 0, 0))
+    sample_params_header.visible = False  # Only shown in All Samples mode
+    sample_params_content = pn.Column(
         sample_order_row, same_y_scale_row,
-        max_genemap_window_row, max_sequence_window_row, max_binning_window_row,
+        sizing_mode="stretch_width", visible=False
+    )
+    sample_params_toggle_btn.on_click(make_toggle_callback(sample_params_toggle_btn, sample_params_content))
+
+    plotting_params_content = pn.Column(
         min_coverage_freq_row,
-        genemap_height_row, sequence_height_row, subplot_height_row,
+        max_window_header, max_window_content,
+        plot_heights_header, plot_heights_content,
+        sample_params_header, sample_params_content,
         sizing_mode="stretch_width"
     )
-    plotting_params_toggle_btn.on_click(make_toggle_callback(plotting_params_toggle_btn, plotting_params_content))
+
+    # Hide samples-only parameters when no BAM files were provided
+    if not widgets['has_samples']:
+        min_coverage_freq_row.visible = False
+        # sample_params_header is already visible=False by default (All Samples mode only)
 
     ## Create final Apply and Peruse data buttons
     apply_button = Button(label="APPLY", align="center", stylesheets=[stylesheet], css_classes=["apply-btn"], margin=(5, 0, 0, 0))
@@ -1853,9 +1892,10 @@ def create_layout(db_path):
                              buttons_row]
         placeholder_text = "<i>No plot yet. Select one sample, one contig and at least one variable in \"One sample\" mode or one contig and one variable in \"All samples\" mode and click Apply.</i>"
     else:
-        # No samples: simplified UI with only Filtering, Contigs, and Apply button
+        # No samples: simplified UI with Filtering, Contigs, Plotting parameters, and Apply button
         controls_children = [logo, filtering_header, filtering_content,
                              separator_contigs, contig_header, above_contig_content, widgets['contig_select'], below_contig_content,
+                             separator_plotting_params, plotting_params_header, plotting_params_content,
                              buttons_row]
         placeholder_text = "<i>No plot yet. Select one contig and click Apply to view the genome annotation.</i>"
 

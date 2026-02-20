@@ -1,10 +1,10 @@
 from bokeh.models import Range1d
 from bokeh.layouts import gridplot
 
-from .plotting_data_per_sample import get_contig_info, get_feature_data, get_feature_data_batch, get_variable_metadata, get_repeats_aggregated_data, make_bokeh_subplot, make_bokeh_genemap, make_bokeh_sequence_subplot, make_bokeh_translated_sequence_subplot
+from .plotting_data_per_sample import get_contig_info, get_feature_data, get_feature_data_batch, get_variable_metadata, make_bokeh_subplot, make_bokeh_genemap, make_bokeh_sequence_subplot, make_bokeh_translated_sequence_subplot
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130, genbank_path=None, genome_features=None, allowed_samples=None, feature_types=None, use_phage_colors=False, plot_sequence=False, plot_translated_sequence=False, same_y_scale=False, genemap_size=None, sequence_size=None, order_by_column=None, downsample_threshold=None, max_genemap_window=None, min_relative_value=0.0):
+def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130, genbank_path=None, genome_features=None, allowed_samples=None, feature_types=None, use_phage_colors=False, plot_sequence=False, plot_translated_sequence=False, same_y_scale=False, genemap_size=None, sequence_size=None, translated_sequence_size=None, order_by_column=None, downsample_threshold=None, max_genemap_window=None, min_relative_value=0.0):
     """Generate a Bokeh plot showing all samples for a single variable.
 
     Args:
@@ -82,27 +82,30 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
             try:
                 feature_lower = genome_feature.lower().strip()
 
-                # Handle Repeats specially - they use contig-only tables with linked positions
+                # Handle Repeat count - now uses SQL views with standard binning
                 if feature_lower in ["repeat count"]:
-                    count_dicts, _ = get_repeats_aggregated_data(cur, contig_id, xstart, xend)
-                    if count_dicts:
-                        subplot = make_bokeh_subplot(count_dicts, subplot_size, shared_xrange, show_tooltips=True)
+                    list_feature_dict = get_feature_data(cur, "Repeat count", contig_id, sample_id=None, xstart=xstart, xend=xend, downsample_threshold=downsample_threshold)
+                    if list_feature_dict:
+                        subplot = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, show_tooltips=True)
                         if subplot is not None:
                             genome_subplots.append(subplot)
+                # Handle Max repeat identity - now uses SQL views with standard binning
                 elif feature_lower in ["max repeat identity"]:
-                    _, identity_dicts = get_repeats_aggregated_data(cur, contig_id, xstart, xend)
-                    if identity_dicts:
-                        subplot = make_bokeh_subplot(identity_dicts, subplot_size, shared_xrange, show_tooltips=True)
+                    list_feature_dict = get_feature_data(cur, "Max repeat identity", contig_id, sample_id=None, xstart=xstart, xend=xend, downsample_threshold=downsample_threshold)
+                    if list_feature_dict:
+                        subplot = make_bokeh_subplot(list_feature_dict, subplot_size, shared_xrange, show_tooltips=True)
                         if subplot is not None:
                             genome_subplots.append(subplot)
+                # Handle legacy "Repeats" - add both subplots
                 elif feature_lower in ["repeats", "repeat", "direct repeats", "inverted repeats"]:
-                    count_dicts, identity_dicts = get_repeats_aggregated_data(cur, contig_id, xstart, xend)
                     # Track 1: Repeat count
+                    count_dicts = get_feature_data(cur, "Repeat count", contig_id, sample_id=None, xstart=xstart, xend=xend, downsample_threshold=downsample_threshold)
                     if count_dicts:
                         subplot = make_bokeh_subplot(count_dicts, subplot_size, shared_xrange, show_tooltips=True)
                         if subplot is not None:
                             genome_subplots.append(subplot)
                     # Track 2: Repeat max identity
+                    identity_dicts = get_feature_data(cur, "Max repeat identity", contig_id, sample_id=None, xstart=xstart, xend=xend, downsample_threshold=downsample_threshold)
                     if identity_dicts:
                         subplot = make_bokeh_subplot(identity_dicts, subplot_size, shared_xrange, show_tooltips=True)
                         if subplot is not None:
@@ -144,7 +147,8 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
 
     # --- Add translated sequence subplot after DNA sequence ---
     if plot_translated_sequence:
-        trans_subplot = make_bokeh_translated_sequence_subplot(conn, contig_name, xstart, xend, _seq_height, shared_xrange)
+        _trans_height = translated_sequence_size if translated_sequence_size is not None else _seq_height
+        trans_subplot = make_bokeh_translated_sequence_subplot(conn, contig_name, xstart, xend, _trans_height, shared_xrange)
         if trans_subplot:
             insert_pos = 1 if seq_subplot_added else 0
             genome_subplots.insert(insert_pos, trans_subplot)

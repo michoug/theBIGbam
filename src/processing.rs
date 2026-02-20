@@ -29,8 +29,8 @@ use crate::compress::{
 };
 use crate::db::{DbWriter, MisassemblyData, MicrodiversityData, SideMisassemblyData, TopologyData, GCContentData, RepeatsData};
 use crate::gc_content::{compute_gc_content, compute_gc_skew, GCParams};
-use crate::features::{FeatureArrays, ModuleFlags};
-use crate::parser::{parse_annotations};
+use crate::features::{CdsIndex, FeatureArrays, ModuleFlags, compute_dominant_codon_changes};
+use crate::parser::{parse_annotations, compute_annotation_sequences};
 use crate::types::{
     ContigInfo, FeaturePoint, PackagingData, PlotType, PresenceData, SequencingType
 };
@@ -656,6 +656,9 @@ fn add_features_from_arrays(
             std: None,
             sequence: None,
             sequence_prevalence: None,
+            codon_category: None,
+            codon_change: None,
+            aa_change: None,
         }));
 
         let mismatches_f64: Vec<f64> = arrays.mismatches.iter().map(|&x| x as f64).collect();
@@ -667,6 +670,9 @@ fn add_features_from_arrays(
         let dominant_insertions = FeatureArrays::compute_dominant_sequences(&arrays.insertion_sequences, &arrays.primary_reads, threshold);
         let dominant_left_clips = FeatureArrays::compute_dominant_sequences(&arrays.left_clip_sequences, &arrays.primary_reads, threshold);
         let dominant_right_clips = FeatureArrays::compute_dominant_sequences(&arrays.right_clip_sequences, &arrays.primary_reads, threshold);
+
+        // Compute dominant codon changes from per-read codon tracking
+        let dominant_codons = compute_dominant_codon_changes(&arrays.codon_changes);
 
         // Attach dominant values to FeaturePoints by scanning the output
         // (features were just appended above, so they're at the end of the output vec)
@@ -683,6 +689,16 @@ fn add_features_from_arrays(
                         if base != 0 {
                             fp.sequence = Some(String::from(base as char));
                             fp.sequence_prevalence = Some(pct);
+                        }
+                    }
+                    // Attach codon change info
+                    if let Some((cat, codon, aa)) = dominant_codons.get(&pos_idx) {
+                        fp.codon_category = Some(cat.clone());
+                        if !codon.is_empty() {
+                            fp.codon_change = Some(codon.clone());
+                        }
+                        if !aa.is_empty() {
+                            fp.aa_change = Some(aa.clone());
                         }
                     }
                 }
@@ -724,6 +740,9 @@ fn add_features_from_arrays(
             std: None,
             sequence: None,
             sequence_prevalence: None,
+            codon_category: None,
+            codon_change: None,
+            aa_change: None,
         }));
 
         let mate_unmapped_f64: Vec<f64> = arrays.mate_not_mapped.iter().map(|&x| x as f64).collect();
@@ -739,6 +758,9 @@ fn add_features_from_arrays(
             std: None,
             sequence: None,
             sequence_prevalence: None,
+            codon_category: None,
+            codon_change: None,
+            aa_change: None,
         }));
 
         let mate_other_contig_f64: Vec<f64> = arrays.mate_on_another_contig.iter().map(|&x| x as f64).collect();
@@ -754,6 +776,9 @@ fn add_features_from_arrays(
             std: None,
             sequence: None,
             sequence_prevalence: None,
+            codon_category: None,
+            codon_change: None,
+            aa_change: None,
         }));
 
         // Insert sizes (curve for paired reads, self-referential)
@@ -956,6 +981,7 @@ pub fn process_sample(
     modules: &[String],
     config: &ProcessConfig,
     repeats: &[RepeatsData],
+    annotations: &[crate::types::FeatureAnnotation],
 ) -> Result<(Vec<FeaturePoint>, Vec<PresenceData>, Vec<PackagingData>, Vec<MisassemblyData>, Vec<MicrodiversityData>, Vec<SideMisassemblyData>, Vec<TopologyData>, String, SequencingType, u64, u64)> {
     let sample_name = bam_path
         .file_stem()
@@ -998,13 +1024,24 @@ pub fn process_sample(
             let ref_length = if config.circular { bam_length / 2 } else { bam_length };
 
             // Skip if contig not in GenBank list
-            if contigs.iter().find(|c| c.name == ref_name).is_none() {
+            let contig_info = contigs.iter().find(|c| c.name == ref_name);
+            if contig_info.is_none() {
                 return None;
             }
 
+            // Build CDS index for this contig (for codon analysis)
+            let contig_idx = contigs.iter().position(|c| c.name == ref_name).unwrap();
+            let contig_id = (contig_idx + 1) as i64;
+            let cds_index = if flags.mapping_metrics && !annotations.is_empty() {
+                let idx = CdsIndex::from_annotations(annotations, contig_id);
+                if idx.is_empty() { None } else { Some(idx) }
+            } else {
+                None
+            };
+
             // Process contig using streaming - single pass over reads
             // Early coverage check happens inside process_contig_streaming
-            let (mut arrays, coverage_pct, primary_count) = match process_contig_streaming(&mut bam, &ref_name, ref_length, seq_type, flags, config.circular, config.min_aligned_fraction, config.phagetermini_config.min_clipping_length) {
+            let (mut arrays, coverage_pct, primary_count) = match process_contig_streaming(&mut bam, &ref_name, ref_length, seq_type, flags, config.circular, config.min_aligned_fraction, config.phagetermini_config.min_clipping_length, cds_index.as_ref()) {
                 Ok(Some(result)) => result,
                 Ok(None) => return None,
                 Err(e) => {
@@ -1184,7 +1221,7 @@ pub fn run_all_samples(
 
     // 2. Parse annotations (GenBank/GFF3) or extract contigs from BAMs
     eprintln!("\n### Parsing input files...");
-    let (mut contigs, annotations) = if genbank_path.as_os_str().is_empty() {
+    let (mut contigs, mut annotations) = if genbank_path.as_os_str().is_empty() {
         eprintln!("No GenBank file provided - extracting contigs from BAM headers");
         let contigs = extract_contigs_from_bams(bam_files, config.circular)?;
         eprintln!("Found {} contigs from BAM files", contigs.len());
@@ -1204,6 +1241,11 @@ pub fn run_all_samples(
     if !assembly_path.as_os_str().is_empty() && assembly_path.exists() {
         eprintln!("\n### Merging sequences from assembly FASTA...");
         merge_sequences_from_fasta(&mut contigs, assembly_path)?;
+    }
+
+    // 3b. Compute nucleotide/protein sequences for CDS annotations
+    if !annotations.is_empty() {
+        compute_annotation_sequences(&contigs, &mut annotations);
     }
 
     if let Some(parent) = output_db.parent() {
@@ -1275,7 +1317,7 @@ pub fn run_all_samples(
     eprintln!("\n### Processing {} samples with {} threads", bam_files.len(), config.threads);
     eprintln!("Modules: {}\n", modules.join(", "));
 
-    let result = process_samples_parallel(&bam_files, &contigs, modules, config, db_writer, &repeats)?;
+    let result = process_samples_parallel(&bam_files, &contigs, modules, config, db_writer, &repeats, &annotations)?;
 
     print_summary(&result, output_db);
 
@@ -1304,6 +1346,7 @@ fn process_samples_parallel(
     config: &ProcessConfig,
     db_writer: DbWriter,
     repeats: &[RepeatsData],
+    annotations: &[crate::types::FeatureAnnotation],
 ) -> Result<ProcessResult> {
     let total = bam_files.len();
     let is_tty = atty::is(Stream::Stderr);
@@ -1315,7 +1358,7 @@ fn process_samples_parallel(
     //
     // Sequential mode only for single-threaded operation
     if config.threads == 1 {
-        return process_samples_sequential(bam_files, contigs, modules, config, db_writer, is_tty, repeats);
+        return process_samples_sequential(bam_files, contigs, modules, config, db_writer, is_tty, repeats, annotations);
     }
 
     // Adaptive channel size based on memory pressure from contig count
@@ -1434,7 +1477,7 @@ fn process_samples_parallel(
     bam_files.par_iter().for_each(|bam_path| {
         let sample_start = std::time::Instant::now();
 
-        match process_sample(bam_path, contigs, modules, config, repeats) {
+        match process_sample(bam_path, contigs, modules, config, repeats, annotations) {
             Ok((features, presences, packaging, misassembly, microdiversity, side_misassembly, topology, sample_name, sequencing_type, total_reads, mapped_reads)) => {
                 let sample_time = sample_start.elapsed().as_secs_f64();
                 completed_count.fetch_add(1, Ordering::SeqCst);
@@ -1511,6 +1554,7 @@ fn process_samples_sequential(
     db_writer: DbWriter,
     is_tty: bool,
     repeats: &[RepeatsData],
+    annotations: &[crate::types::FeatureAnnotation],
 ) -> Result<ProcessResult> {
     let total = bam_files.len();
     let start_time = std::time::Instant::now();
@@ -1538,7 +1582,7 @@ fn process_samples_sequential(
     for bam_path in bam_files {
         let sample_start = std::time::Instant::now();
 
-        match process_sample(bam_path, contigs, modules, config, repeats) {
+        match process_sample(bam_path, contigs, modules, config, repeats, annotations) {
             Ok((features, presences, packaging, misassembly, microdiversity, side_misassembly, topology, sample_name, sequencing_type, total_reads, mapped_reads)) => {
                 let process_elapsed = sample_start.elapsed();
                 processing_time_total += process_elapsed;

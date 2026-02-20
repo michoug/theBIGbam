@@ -303,6 +303,9 @@ pub fn add_compressed_feature_with_reference(
         std: None,
         sequence: None,
         sequence_prevalence: None,
+        codon_category: None,
+        codon_change: None,
+        aa_change: None,
     }));
 
     runs
@@ -348,6 +351,9 @@ pub fn add_compressed_feature_with_median(
             std: None,
             sequence: None,
             sequence_prevalence: None,
+            codon_category: None,
+            codon_change: None,
+            aa_change: None,
         }
     }));
 
@@ -400,6 +406,9 @@ pub fn add_compressed_feature_with_stats(
             std: std_val,
             sequence: None,
             sequence_prevalence: None,
+            codon_category: None,
+            codon_change: None,
+            aa_change: None,
         }
     }));
 

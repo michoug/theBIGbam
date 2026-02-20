@@ -55,6 +55,12 @@ impl DbWriter {
         // Insert contigs
         insert_contigs(&conn, contigs)?;
 
+        // Insert contig sequences (from GenBank or FASTA)
+        insert_contig_sequences(&conn, contigs)?;
+
+        // Insert codon table (standard genetic code)
+        insert_codon_table(&conn)?;
+
         // Insert annotations
         insert_annotations(&conn, annotations)?;
 
@@ -435,6 +441,7 @@ impl DbWriter {
                 .with_context(|| format!("Failed to create appender for {}", table_name))?;
 
             let has_sequences = FEATURES_WITH_SEQUENCES.contains(&table_name.as_str());
+            let has_codons = FEATURES_WITH_CODONS.contains(&table_name.as_str());
             let is_single_pos = SINGLE_POSITION_FEATURES.contains(&table_name.as_str());
 
             if has_stats && has_sequences {
@@ -458,6 +465,15 @@ impl DbWriter {
                         let std = f.std.map(|v| if is_scaled { (v * 100.0).round() as i32 } else { v.round() as i32 });
                         let last_pos: Option<i32> = if is_single_pos { None } else { Some(f.end_pos) };
                         appender.append_row(params![contig_id, sample_id, f.start_pos, last_pos, value, mean, median, std])?;
+                        *contig_row_counts.entry(contig_id).or_insert(0) += 1;
+                    }
+                }
+            } else if has_sequences && has_codons {
+                for f in feature_points {
+                    if let Some(&contig_id) = self.contig_name_to_id.get(&f.contig_name) {
+                        let value = if is_scaled { (f.value * 100.0).round() as i32 } else { f.value.round() as i32 };
+                        let last_pos: Option<i32> = if is_single_pos { None } else { Some(f.end_pos) };
+                        appender.append_row(params![contig_id, sample_id, f.start_pos, last_pos, value, &f.sequence, f.sequence_prevalence, &f.codon_category, &f.codon_change, &f.aa_change])?;
                         *contig_row_counts.entry(contig_id).or_insert(0) += 1;
                     }
                 }
@@ -978,6 +994,114 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
     )
     .context("Failed to create Contig_invertedRepeats table")?;
 
+    // SQL Views for repeat aggregation (sweep-line algorithm computed on demand)
+    // These views produce (Contig_id, First_position, Last_position, Value) like other Contig_* tables,
+    // allowing the standard binning logic in get_feature_data() to work with repeats.
+
+    // View: Contig_direct_repeat_count - count of overlapping direct repeats per segment
+    conn.execute(
+        "CREATE VIEW Contig_direct_repeat_count AS
+        WITH boundaries AS (
+            SELECT Contig_id, LEAST(Position1, Position2) AS pos FROM Contig_directRepeats
+            UNION
+            SELECT Contig_id, GREATEST(Position1, Position2) + 1 AS pos FROM Contig_directRepeats
+        ),
+        segments AS (
+            SELECT Contig_id, pos AS seg_start,
+                   LEAD(pos) OVER (PARTITION BY Contig_id ORDER BY pos) - 1 AS seg_end
+            FROM boundaries
+        )
+        SELECT s.Contig_id,
+               s.seg_start AS First_position,
+               s.seg_end AS Last_position,
+               (SELECT COUNT(*) FROM Contig_directRepeats r
+                WHERE r.Contig_id = s.Contig_id
+                  AND LEAST(r.Position1, r.Position2) <= s.seg_end
+                  AND GREATEST(r.Position1, r.Position2) >= s.seg_start) AS Value
+        FROM segments s
+        WHERE s.seg_end IS NOT NULL",
+        [],
+    )
+    .context("Failed to create Contig_direct_repeat_count view")?;
+
+    // View: Contig_inverted_repeat_count - count of overlapping inverted repeats per segment
+    conn.execute(
+        "CREATE VIEW Contig_inverted_repeat_count AS
+        WITH boundaries AS (
+            SELECT Contig_id, LEAST(Position1, Position2) AS pos FROM Contig_invertedRepeats
+            UNION
+            SELECT Contig_id, GREATEST(Position1, Position2) + 1 AS pos FROM Contig_invertedRepeats
+        ),
+        segments AS (
+            SELECT Contig_id, pos AS seg_start,
+                   LEAD(pos) OVER (PARTITION BY Contig_id ORDER BY pos) - 1 AS seg_end
+            FROM boundaries
+        )
+        SELECT s.Contig_id,
+               s.seg_start AS First_position,
+               s.seg_end AS Last_position,
+               (SELECT COUNT(*) FROM Contig_invertedRepeats r
+                WHERE r.Contig_id = s.Contig_id
+                  AND LEAST(r.Position1, r.Position2) <= s.seg_end
+                  AND GREATEST(r.Position1, r.Position2) >= s.seg_start) AS Value
+        FROM segments s
+        WHERE s.seg_end IS NOT NULL",
+        [],
+    )
+    .context("Failed to create Contig_inverted_repeat_count view")?;
+
+    // View: Contig_direct_repeat_identity - max identity of overlapping direct repeats per segment
+    conn.execute(
+        "CREATE VIEW Contig_direct_repeat_identity AS
+        WITH boundaries AS (
+            SELECT Contig_id, LEAST(Position1, Position2) AS pos FROM Contig_directRepeats
+            UNION
+            SELECT Contig_id, GREATEST(Position1, Position2) + 1 AS pos FROM Contig_directRepeats
+        ),
+        segments AS (
+            SELECT Contig_id, pos AS seg_start,
+                   LEAD(pos) OVER (PARTITION BY Contig_id ORDER BY pos) - 1 AS seg_end
+            FROM boundaries
+        )
+        SELECT s.Contig_id,
+               s.seg_start AS First_position,
+               s.seg_end AS Last_position,
+               (SELECT MAX(r.Pident) / 100.0 FROM Contig_directRepeats r
+                WHERE r.Contig_id = s.Contig_id
+                  AND LEAST(r.Position1, r.Position2) <= s.seg_end
+                  AND GREATEST(r.Position1, r.Position2) >= s.seg_start) AS Value
+        FROM segments s
+        WHERE s.seg_end IS NOT NULL",
+        [],
+    )
+    .context("Failed to create Contig_direct_repeat_identity view")?;
+
+    // View: Contig_inverted_repeat_identity - max identity of overlapping inverted repeats per segment
+    conn.execute(
+        "CREATE VIEW Contig_inverted_repeat_identity AS
+        WITH boundaries AS (
+            SELECT Contig_id, LEAST(Position1, Position2) AS pos FROM Contig_invertedRepeats
+            UNION
+            SELECT Contig_id, GREATEST(Position1, Position2) + 1 AS pos FROM Contig_invertedRepeats
+        ),
+        segments AS (
+            SELECT Contig_id, pos AS seg_start,
+                   LEAD(pos) OVER (PARTITION BY Contig_id ORDER BY pos) - 1 AS seg_end
+            FROM boundaries
+        )
+        SELECT s.Contig_id,
+               s.seg_start AS First_position,
+               s.seg_end AS Last_position,
+               (SELECT MAX(r.Pident) / 100.0 FROM Contig_invertedRepeats r
+                WHERE r.Contig_id = s.Contig_id
+                  AND LEAST(r.Position1, r.Position2) <= s.seg_end
+                  AND GREATEST(r.Position1, r.Position2) >= s.seg_start) AS Value
+        FROM segments s
+        WHERE s.seg_end IS NOT NULL",
+        [],
+    )
+    .context("Failed to create Contig_inverted_repeat_identity view")?;
+
     // Contig_GCContent table - stores GC content (contig-level, sample-independent)
     // Value stored as INTEGER (0-100 percentage)
     conn.execute(
@@ -1081,7 +1205,9 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
             \"Function\" TEXT,
             Phrog INTEGER,
             Locus_tag TEXT,
-            Longest_isoform BOOLEAN
+            Longest_isoform BOOLEAN,
+            Nucleotide_sequence TEXT,
+            Protein_sequence TEXT
         )",
         [],
     )
@@ -1142,6 +1268,28 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
     )
     .context("Failed to create Constants table")?;
 
+    // Contig_sequence table - stores full contig sequences for visualization
+    conn.execute(
+        "CREATE TABLE Contig_sequence (
+            Contig_id INTEGER PRIMARY KEY,
+            Sequence TEXT NOT NULL
+        )",
+        [],
+    )
+    .context("Failed to create Contig_sequence table")?;
+
+    // Codon_table - standard genetic code lookup (64 codons)
+    conn.execute(
+        "CREATE TABLE Codon_table (
+            Codon TEXT PRIMARY KEY,
+            AminoAcid TEXT NOT NULL,
+            AminoAcid_name TEXT NOT NULL,
+            Color TEXT NOT NULL
+        )",
+        [],
+    )
+    .context("Failed to create Codon_table table")?;
+
     Ok(())
 }
 
@@ -1166,6 +1314,81 @@ fn insert_contigs(conn: &Connection, contigs: &[ContigInfo]) -> Result<()> {
     }
 
     appender.flush().context("Failed to flush Contig appender")?;
+    Ok(())
+}
+
+/// Insert contig sequences into the database.
+fn insert_contig_sequences(conn: &Connection, contigs: &[ContigInfo]) -> Result<()> {
+    let mut appender = conn.appender("Contig_sequence")
+        .context("Failed to create Contig_sequence appender")?;
+
+    let mut count = 0;
+    for (i, contig) in contigs.iter().enumerate() {
+        if let Some(ref seq) = contig.sequence {
+            let seq_str = String::from_utf8_lossy(seq).into_owned();
+            appender.append_row(params![(i + 1) as i64, &seq_str])?;
+            count += 1;
+        }
+    }
+
+    appender.flush().context("Failed to flush Contig_sequence appender")?;
+    eprintln!("Stored sequences for {}/{} contigs", count, contigs.len());
+    Ok(())
+}
+
+/// Insert the standard genetic code codon table (64 codons).
+fn insert_codon_table(conn: &Connection) -> Result<()> {
+    let mut appender = conn.appender("Codon_table")
+        .context("Failed to create Codon_table appender")?;
+
+    // Standard genetic code: (codon, 1-letter AA, full name, color)
+    // Colors by biochemical property:
+    //   Hydrophobic aliphatic (G,A,V,L,I,P): #2d6a4f
+    //   Aromatic (F,W,Y): #b5838d
+    //   Polar uncharged (S,T,N,Q,C,M): #457b9d
+    //   Positively charged (K,R,H): #9b2226
+    //   Negatively charged (D,E): #e9c46a
+    //   Stop (*): #6a3d9a
+    let codons: &[(&str, &str, &str, &str)] = &[
+        ("TTT", "F", "Phenylalanine", "#b5838d"), ("TTC", "F", "Phenylalanine", "#b5838d"),
+        ("TTA", "L", "Leucine", "#2d6a4f"), ("TTG", "L", "Leucine", "#2d6a4f"),
+        ("TCT", "S", "Serine", "#457b9d"), ("TCC", "S", "Serine", "#457b9d"),
+        ("TCA", "S", "Serine", "#457b9d"), ("TCG", "S", "Serine", "#457b9d"),
+        ("TAT", "Y", "Tyrosine", "#b5838d"), ("TAC", "Y", "Tyrosine", "#b5838d"),
+        ("TAA", "*", "Stop", "#6a3d9a"), ("TAG", "*", "Stop", "#6a3d9a"),
+        ("TGT", "C", "Cysteine", "#457b9d"), ("TGC", "C", "Cysteine", "#457b9d"),
+        ("TGA", "*", "Stop", "#6a3d9a"), ("TGG", "W", "Tryptophan", "#b5838d"),
+        ("CTT", "L", "Leucine", "#2d6a4f"), ("CTC", "L", "Leucine", "#2d6a4f"),
+        ("CTA", "L", "Leucine", "#2d6a4f"), ("CTG", "L", "Leucine", "#2d6a4f"),
+        ("CCT", "P", "Proline", "#2d6a4f"), ("CCC", "P", "Proline", "#2d6a4f"),
+        ("CCA", "P", "Proline", "#2d6a4f"), ("CCG", "P", "Proline", "#2d6a4f"),
+        ("CAT", "H", "Histidine", "#9b2226"), ("CAC", "H", "Histidine", "#9b2226"),
+        ("CAA", "Q", "Glutamine", "#457b9d"), ("CAG", "Q", "Glutamine", "#457b9d"),
+        ("CGT", "R", "Arginine", "#9b2226"), ("CGC", "R", "Arginine", "#9b2226"),
+        ("CGA", "R", "Arginine", "#9b2226"), ("CGG", "R", "Arginine", "#9b2226"),
+        ("ATT", "I", "Isoleucine", "#2d6a4f"), ("ATC", "I", "Isoleucine", "#2d6a4f"),
+        ("ATA", "I", "Isoleucine", "#2d6a4f"), ("ATG", "M", "Methionine", "#457b9d"),
+        ("ACT", "T", "Threonine", "#457b9d"), ("ACC", "T", "Threonine", "#457b9d"),
+        ("ACA", "T", "Threonine", "#457b9d"), ("ACG", "T", "Threonine", "#457b9d"),
+        ("AAT", "N", "Asparagine", "#457b9d"), ("AAC", "N", "Asparagine", "#457b9d"),
+        ("AAA", "K", "Lysine", "#9b2226"), ("AAG", "K", "Lysine", "#9b2226"),
+        ("AGT", "S", "Serine", "#457b9d"), ("AGC", "S", "Serine", "#457b9d"),
+        ("AGA", "R", "Arginine", "#9b2226"), ("AGG", "R", "Arginine", "#9b2226"),
+        ("GTT", "V", "Valine", "#2d6a4f"), ("GTC", "V", "Valine", "#2d6a4f"),
+        ("GTA", "V", "Valine", "#2d6a4f"), ("GTG", "V", "Valine", "#2d6a4f"),
+        ("GCT", "A", "Alanine", "#2d6a4f"), ("GCC", "A", "Alanine", "#2d6a4f"),
+        ("GCA", "A", "Alanine", "#2d6a4f"), ("GCG", "A", "Alanine", "#2d6a4f"),
+        ("GAT", "D", "Aspartate", "#e9c46a"), ("GAC", "D", "Aspartate", "#e9c46a"),
+        ("GAA", "E", "Glutamate", "#e9c46a"), ("GAG", "E", "Glutamate", "#e9c46a"),
+        ("GGT", "G", "Glycine", "#2d6a4f"), ("GGC", "G", "Glycine", "#2d6a4f"),
+        ("GGA", "G", "Glycine", "#2d6a4f"), ("GGG", "G", "Glycine", "#2d6a4f"),
+    ];
+
+    for &(codon, aa, name, color) in codons {
+        appender.append_row(params![codon, aa, name, color])?;
+    }
+
+    appender.flush().context("Failed to flush Codon_table appender")?;
     Ok(())
 }
 
@@ -1261,6 +1484,8 @@ fn insert_annotations(conn: &Connection, annotations: &[FeatureAnnotation]) -> R
             &ann.phrog,
             &ann.locus_tag,
             longest_isoform,
+            &ann.nucleotide_sequence,
+            &ann.protein_sequence,
         ])
         .with_context(|| format!(
             "Failed to append annotation: contig_id={}, start={}, end={}, type={}",
@@ -1309,10 +1534,12 @@ fn populate_annotated_types(conn: &Connection) -> Result<()> {
 /// Create Variable metadata entries only. Feature tables are created lazily.
 fn create_variable_tables(conn: &Connection) -> Result<()> {
     for (i, v) in VARIABLES.iter().enumerate() {
-        // Special case: contig-level data is stored in separate Contig_* tables
+        // Special case: contig-level data is stored in separate Contig_* tables/views
         let table_name = match v.name {
-            "direct_repeat_count" | "direct_repeat_identity" => "Contig_directRepeats".to_string(),
-            "inverted_repeat_count" | "inverted_repeat_identity" => "Contig_invertedRepeats".to_string(),
+            "direct_repeat_count" => "Contig_direct_repeat_count".to_string(),
+            "direct_repeat_identity" => "Contig_direct_repeat_identity".to_string(),
+            "inverted_repeat_count" => "Contig_inverted_repeat_count".to_string(),
+            "inverted_repeat_identity" => "Contig_inverted_repeat_identity".to_string(),
             "gc_content" => "Contig_GCContent".to_string(),
             "gc_skew" => "Contig_GCSkew".to_string(),
             _ => feature_table_name(v.name),
@@ -1353,6 +1580,11 @@ const FEATURES_WITH_SEQUENCES: &[&str] = &[
     "Feature_reads_ends",
 ];
 
+/// Feature tables that have Codon_category, Codon_change, AA_change columns.
+const FEATURES_WITH_CODONS: &[&str] = &[
+    "Feature_mismatches",
+];
+
 /// Feature tables where Last_position is always equal to First_position (single-position bar spikes).
 /// For these tables, Last_position is stored as NULL to save storage space.
 /// At read time, COALESCE(Last_position, First_position) recovers the value.
@@ -1377,6 +1609,7 @@ fn create_feature_table_if_needed(
     }
 
     let has_sequences = FEATURES_WITH_SEQUENCES.contains(&table_name);
+    let has_codons = FEATURES_WITH_CODONS.contains(&table_name);
 
     let table_sql = if has_stats && has_sequences {
         format!(
@@ -1405,6 +1638,22 @@ fn create_feature_table_if_needed(
                 Mean INTEGER,
                 Median INTEGER,
                 Std INTEGER
+            )",
+            table_name
+        )
+    } else if has_sequences && has_codons {
+        format!(
+            "CREATE TABLE {} (
+                Contig_id INTEGER,
+                Sample_id INTEGER,
+                First_position INTEGER,
+                Last_position INTEGER,
+                Value INTEGER,
+                Sequence TEXT,
+                Sequence_prevalence INTEGER,
+                Codon_category TEXT,
+                Codon_change TEXT,
+                AA_change TEXT
             )",
             table_name
         )

@@ -237,6 +237,8 @@ pub fn parse_genbank(
                 function,
                 phrog,
                 locus_tag,
+                nucleotide_sequence: None,
+                protein_sequence: None,
             });
         }
 
@@ -461,6 +463,8 @@ pub fn parse_gff3(
             function,
             phrog,
             locus_tag,
+            nucleotide_sequence: None,
+            protein_sequence: None,
         });
     }
 
@@ -519,6 +523,110 @@ pub fn parse_fasta(path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     }
 
     Ok(records)
+}
+
+// ============================================================================
+// Sequence Translation
+// ============================================================================
+
+/// Compute the reverse complement of a DNA sequence.
+pub fn reverse_complement(dna: &[u8]) -> Vec<u8> {
+    dna.iter()
+        .rev()
+        .map(|&b| match b {
+            b'A' | b'a' => b'T',
+            b'T' | b't' => b'A',
+            b'C' | b'c' => b'G',
+            b'G' | b'g' => b'C',
+            _ => b'N',
+        })
+        .collect()
+}
+
+/// Translate a DNA sequence to protein using the standard genetic code.
+/// Handles partial codons at the end by ignoring them.
+pub fn translate_dna(dna: &[u8]) -> String {
+    let mut protein = String::with_capacity(dna.len() / 3 + 1);
+    for codon in dna.chunks(3) {
+        if codon.len() < 3 {
+            break;
+        }
+        let aa = match &[codon[0].to_ascii_uppercase(), codon[1].to_ascii_uppercase(), codon[2].to_ascii_uppercase()] {
+            b"TTT" | b"TTC" => 'F',
+            b"TTA" | b"TTG" | b"CTT" | b"CTC" | b"CTA" | b"CTG" => 'L',
+            b"ATT" | b"ATC" | b"ATA" => 'I',
+            b"ATG" => 'M',
+            b"GTT" | b"GTC" | b"GTA" | b"GTG" => 'V',
+            b"TCT" | b"TCC" | b"TCA" | b"TCG" | b"AGT" | b"AGC" => 'S',
+            b"CCT" | b"CCC" | b"CCA" | b"CCG" => 'P',
+            b"ACT" | b"ACC" | b"ACA" | b"ACG" => 'T',
+            b"GCT" | b"GCC" | b"GCA" | b"GCG" => 'A',
+            b"TAT" | b"TAC" => 'Y',
+            b"TAA" | b"TAG" | b"TGA" => '*',
+            b"CAT" | b"CAC" => 'H',
+            b"CAA" | b"CAG" => 'Q',
+            b"AAT" | b"AAC" => 'N',
+            b"AAA" | b"AAG" => 'K',
+            b"GAT" | b"GAC" => 'D',
+            b"GAA" | b"GAG" => 'E',
+            b"TGT" | b"TGC" => 'C',
+            b"TGG" => 'W',
+            b"CGT" | b"CGC" | b"CGA" | b"CGG" | b"AGA" | b"AGG" => 'R',
+            b"GGT" | b"GGC" | b"GGA" | b"GGG" => 'G',
+            _ => 'X',
+        };
+        protein.push(aa);
+    }
+    protein
+}
+
+/// Compute nucleotide and protein sequences for CDS annotations.
+///
+/// For each CDS annotation, extracts the subsequence from the contig sequence,
+/// handles strand (reverse complement for -1), and translates to protein.
+/// This must be called AFTER parse_annotations() AND merge_sequences_from_fasta()
+/// so that contig sequences are available.
+pub fn compute_annotation_sequences(
+    contigs: &[ContigInfo],
+    annotations: &mut [FeatureAnnotation],
+) {
+    // Build contig_id -> sequence lookup
+    let seq_by_id: HashMap<i64, &[u8]> = contigs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| c.sequence.as_ref().map(|s| ((i + 1) as i64, s.as_slice())))
+        .collect();
+
+    let mut count = 0;
+    for ann in annotations.iter_mut() {
+        if ann.feature_type != "CDS" {
+            continue;
+        }
+        let Some(seq) = seq_by_id.get(&ann.contig_id) else {
+            continue;
+        };
+
+        let start = (ann.start - 1) as usize; // 1-based to 0-based
+        let end = ann.end as usize;
+        if end > seq.len() || start >= end {
+            continue;
+        }
+
+        let subseq = &seq[start..end];
+        let nuc = if ann.strand == -1 {
+            reverse_complement(subseq)
+        } else {
+            subseq.to_vec()
+        };
+
+        let nuc_str = String::from_utf8_lossy(&nuc).into_owned();
+        let protein = translate_dna(&nuc);
+
+        ann.nucleotide_sequence = Some(nuc_str);
+        ann.protein_sequence = Some(protein);
+        count += 1;
+    }
+    eprintln!("Computed sequences for {count} CDS annotations");
 }
 
 #[cfg(test)]

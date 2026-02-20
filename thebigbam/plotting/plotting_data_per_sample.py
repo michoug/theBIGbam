@@ -507,8 +507,8 @@ def make_bokeh_translated_sequence_subplot(conn, contig_name, xstart, xend, heig
     try:
         cur = conn.cursor()
 
-        # Check table exists
-        cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Contig_annotation_translated'")
+        # Check Contig_annotation has Protein_sequence column
+        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name = 'Contig_annotation' AND column_name = 'Protein_sequence'")
         if cur.fetchone() is None:
             return None
 
@@ -528,7 +528,7 @@ def make_bokeh_translated_sequence_subplot(conn, contig_name, xstart, xend, heig
         # Query CDS rows that overlap the visible window (only longest isoforms)
         cur.execute("""
             SELECT Start, "End", Strand, Nucleotide_sequence, Protein_sequence, Product
-            FROM Contig_annotation_translated
+            FROM Contig_annotation
             WHERE Contig_id = ? AND Type = 'CDS'
               AND Protein_sequence IS NOT NULL
               AND "End" >= ? AND Start <= ?
@@ -678,337 +678,6 @@ def make_bokeh_translated_sequence_subplot(conn, contig_name, xstart, xend, heig
         traceback.print_exc()
         return None
 
-
-def merge_rle_segments(plus_rows, minus_rows):
-    """Merge two RLE-encoded arrays by summing overlapping values.
-
-    Args:
-        plus_rows: List of (first, last, value) tuples from plus strand
-        minus_rows: List of (first, last, value) tuples from minus strand
-
-    Returns:
-        List of (first, last, combined_value) tuples with merged segments
-    """
-    # Collect all boundaries from both sources
-    boundaries = set()
-    for first, last, _ in plus_rows:
-        boundaries.add(first)
-        boundaries.add(last + 1)
-    for first, last, _ in minus_rows:
-        boundaries.add(first)
-        boundaries.add(last + 1)
-
-    if not boundaries:
-        return []
-
-    # Create segments from sorted boundaries
-    sorted_bounds = sorted(boundaries)
-    result = []
-
-    for i in range(len(sorted_bounds) - 1):
-        seg_start = sorted_bounds[i]
-        seg_end = sorted_bounds[i + 1] - 1
-
-        # Sum values from both strands that cover this segment
-        # Both arrays are sorted by first position, so we can break early
-        value = 0
-        for first, last, val in plus_rows:
-            if first > seg_end:
-                break
-            if first <= seg_start and last >= seg_end:
-                value += val
-        for first, last, val in minus_rows:
-            if first > seg_end:
-                break
-            if first <= seg_start and last >= seg_end:
-                value += val
-
-        result.append((seg_start, seg_end, value))
-
-    return result
-
-
-def aggregate_repeats_sweep(rows, original_positions=None):
-    """Aggregate repeat intervals using a boundary-based sweep-line.
-
-    Each repeat covers [min(pos1, pos2), max(pos1, pos2)] (first copy only).
-    For each segment between consecutive boundaries, compute:
-      - count: number of overlapping repeat intervals
-      - max_identity: max pident among overlapping intervals
-
-    Args:
-        rows: List of (pos1, pos2, pos1prime, pos2prime, pident_int) tuples
-        original_positions: Optional list of (orig_start, orig_end) per row,
-            used to track which repeat regions contribute to each segment
-
-    Returns:
-        (count_segments, identity_segments) - each a list of
-        (first, last, value, meta) tuples with adjacent same-value+meta
-        segments merged (RLE compression). meta is a tuple of positions for
-        count, or a single (start, end) for identity.
-    """
-    if not rows:
-        return [], []
-
-    # Build intervals: [start, end, pident, idx]
-    intervals = []
-    for idx, (pos1, pos2, _pos1p, _pos2p, pident_int) in enumerate(rows):
-        start = min(pos1, pos2)
-        end = max(pos1, pos2)
-        pident = pident_int / 100.0 if pident_int is not None else 0.0
-        intervals.append((start, end, pident, idx))
-
-    # Collect all boundaries
-    boundaries = set()
-    for start, end, _, _ in intervals:
-        boundaries.add(start)
-        boundaries.add(end + 1)
-
-    sorted_bounds = sorted(boundaries)
-    if len(sorted_bounds) < 2:
-        return [], []
-
-    # Sweep: for each segment between consecutive boundaries, find overlapping intervals
-    raw_count = []
-    raw_identity = []
-    for i in range(len(sorted_bounds) - 1):
-        seg_start = sorted_bounds[i]
-        seg_end = sorted_bounds[i + 1] - 1
-
-        count = 0
-        max_ident = 0.0
-        max_ident_idx = -1
-        overlapping_indices = []
-        for iv_start, iv_end, pident, iv_idx in intervals:
-            if iv_start > seg_end:
-                continue
-            if iv_end < seg_start:
-                continue
-            # Interval overlaps this segment
-            count += 1
-            overlapping_indices.append(iv_idx)
-            if pident > max_ident:
-                max_ident = pident
-                max_ident_idx = iv_idx
-
-        if count > 0:
-            if original_positions is not None:
-                count_meta = tuple(original_positions[j] for j in overlapping_indices)
-                identity_meta = original_positions[max_ident_idx]
-            else:
-                count_meta = None
-                identity_meta = None
-            raw_count.append((seg_start, seg_end, count, count_meta))
-            raw_identity.append((seg_start, seg_end, max_ident, identity_meta))
-
-    # RLE merge: collapse adjacent segments with same value AND meta
-    def _rle_merge(segments):
-        if not segments:
-            return []
-        merged = [segments[0]]
-        for first, last, value, meta in segments[1:]:
-            prev_first, prev_last, prev_value, prev_meta = merged[-1]
-            if value == prev_value and meta == prev_meta and first == prev_last + 1:
-                merged[-1] = (prev_first, last, value, meta)
-            else:
-                merged.append((first, last, value, meta))
-        return merged
-
-    return _rle_merge(raw_count), _rle_merge(raw_identity)
-
-
-def _format_count_positions(all_positions):
-    """Format all overlapping repeat positions for count tooltip."""
-    if not all_positions:
-        return ""
-    MAX_DISPLAY = 5
-    parts = [f"({s:,}, {e:,})" for s, e in all_positions[:MAX_DISPLAY]]
-    result = ", ".join(parts)
-    if len(all_positions) > MAX_DISPLAY:
-        result += f", ... (+{len(all_positions) - MAX_DISPLAY} more)"
-    return result
-
-def _format_identity_position(best_position):
-    """Format the best-identity repeat position for identity tooltip."""
-    if best_position is None:
-        return ""
-    return f"({best_position[0]:,}, {best_position[1]:,})"
-
-
-def _segments_to_curve_coords(segments, position_formatter=None):
-    """Convert (first, last, value[, meta]) segments to x/y arrays for varea plotting.
-
-    Inserts zero-padding between non-contiguous segments so varea doesn't
-    fill across gaps.
-
-    Args:
-        segments: List of (first, last, value) or (first, last, value, meta) tuples
-        position_formatter: Optional callable that formats meta into a string.
-            When provided, returns a third list of position strings.
-
-    Returns:
-        (x_list, y_list) when position_formatter is None
-        (x_list, y_list, pos_strings) when position_formatter is provided
-    """
-    if not segments:
-        if position_formatter is not None:
-            return [], [], []
-        return [], []
-
-    x_coords = []
-    y_coords = []
-    pos_strings = [] if position_formatter is not None else None
-
-    for i, seg in enumerate(segments):
-        first, last, value = seg[0], seg[1], seg[2]
-        meta = seg[3] if len(seg) > 3 else None
-
-        # Insert zero gap before this segment if it's not contiguous with previous
-        if i > 0:
-            prev_last = segments[i - 1][1]
-            if first > prev_last + 1:
-                # Drop to zero at end of previous segment
-                x_coords.append(prev_last + 1)
-                y_coords.append(0)
-                if pos_strings is not None:
-                    pos_strings.append("")
-                # Stay at zero until start of this segment
-                x_coords.append(first - 1)
-                y_coords.append(0)
-                if pos_strings is not None:
-                    pos_strings.append("")
-
-        # Segment start and end
-        formatted = position_formatter(meta) if position_formatter is not None else None
-        x_coords.append(first)
-        y_coords.append(value)
-        if pos_strings is not None:
-            pos_strings.append(formatted)
-        if first != last:
-            x_coords.append(last)
-            y_coords.append(value)
-            if pos_strings is not None:
-                pos_strings.append(formatted)
-
-    if pos_strings is not None:
-        return x_coords, y_coords, pos_strings
-    return x_coords, y_coords
-
-
-def get_repeats_aggregated_data(cur, contig_id, xstart=None, xend=None):
-    """Get aggregated repeat data as two sets of curve feature dicts.
-
-    For each repeat type (direct, inverted):
-      - Queries raw repeats from Contig_directRepeats / Contig_invertedRepeats
-      - Aggregates into count and max-identity curves via sweep-line
-      - Returns curve feature dicts ready for make_bokeh_subplot()
-
-    Args:
-        cur: DuckDB cursor
-        contig_id: Contig ID
-        xstart: Optional start position for filtering
-        xend: Optional end position for filtering
-
-    Returns:
-        (count_feature_dicts, identity_feature_dicts) - each is a list of 0-2
-        feature dicts (one per repeat type that has data)
-    """
-    # Each entry: (count_variable, identity_variable, table_name)
-    repeat_types = [
-        ("direct_repeat_count", "direct_repeat_identity", "Contig_directRepeats"),
-        ("inverted_repeat_count", "inverted_repeat_identity", "Contig_invertedRepeats"),
-    ]
-
-    count_feature_dicts = []
-    identity_feature_dicts = []
-
-    for count_var, identity_var, table_name in repeat_types:
-        # Get variable info for count and identity from Variable table
-        cur.execute(
-            "SELECT Color, Alpha, Fill_alpha, Title "
-            "FROM Variable WHERE Variable_name=?",
-            (count_var,)
-        )
-        count_meta = cur.fetchone()
-
-        cur.execute(
-            "SELECT Color, Alpha, Fill_alpha, Title "
-            "FROM Variable WHERE Variable_name=?",
-            (identity_var,)
-        )
-        identity_meta = cur.fetchone()
-
-        if not count_meta and not identity_meta:
-            continue
-
-        # Query raw repeats
-        try:
-            position_filter = ""
-            params = [contig_id]
-            if xstart is not None and xend is not None:
-                position_filter = " AND Position2 >= ? AND Position1 <= ?"
-                params.extend([xstart, xend])
-
-            cur.execute(
-                f"SELECT Position1, Position2, Position1prime, Position2prime, Pident "
-                f"FROM {table_name} WHERE Contig_id=?{position_filter} ORDER BY Position1",
-                tuple(params)
-            )
-            rows = cur.fetchall()
-        except Exception:
-            continue
-
-        if not rows:
-            continue
-
-        # Capture original (unclipped) repeat positions before clipping
-        original_positions = [(min(p1, p2), max(p1, p2)) for p1, p2, _, _, _ in rows]
-
-        # Clip to requested range
-        if xstart is not None and xend is not None:
-            clipped = []
-            for pos1, pos2, pos1p, pos2p, pident_int in rows:
-                clipped.append((max(pos1, xstart), min(pos2, xend), pos1p, pos2p, pident_int))
-            rows = clipped
-
-        # Aggregate
-        count_segments, identity_segments = aggregate_repeats_sweep(rows, original_positions=original_positions)
-
-        # Convert to curve coordinates (with position formatters for tooltips)
-        count_x, count_y, count_pos = _segments_to_curve_coords(count_segments, position_formatter=_format_count_positions)
-        ident_x, ident_y, ident_pos = _segments_to_curve_coords(identity_segments, position_formatter=_format_identity_position)
-
-        # Build feature dicts (type="curve" overrides whatever Variable table says)
-        if count_x and count_meta:
-            color, alpha, fill_alpha, title = count_meta
-            count_feature_dicts.append({
-                "type": "curve",
-                "color": color,
-                "alpha": alpha,
-                "fill_alpha": fill_alpha,
-                "size": 1,
-                "title": title,
-                "x": count_x,
-                "y": count_y,
-                "has_stats": False,
-                "repeat_positions": count_pos,
-            })
-        if ident_x and identity_meta:
-            color, alpha, fill_alpha, title = identity_meta
-            identity_feature_dicts.append({
-                "type": "curve",
-                "color": color,
-                "alpha": alpha,
-                "fill_alpha": fill_alpha,
-                "size": 1,
-                "title": title,
-                "x": ident_x,
-                "y": ident_y,
-                "has_stats": False,
-                "repeat_positions": ident_pos,
-            })
-
-    return count_feature_dicts, identity_feature_dicts
 
 
 ### Function to get variable metadata (rendering info from Variable table)
@@ -1278,76 +947,6 @@ def _rle_weighted_bin_sql(feature_table, is_contig_table, xstart, xend, sample_i
         return x_coords, y_coords
 
 
-def _rle_weighted_bin_primary_reads(xstart, xend, sample_id, contig_id, cur, num_bins=_NUM_BINS):
-    """Bin primary_reads by binning plus and minus strands separately, then summing per bin.
-    
-    Each RLE row is expanded to all bins it overlaps via generate_series.
-    Returns (x_coords, y_coords) where x is the bin center.
-    """
-    window_size = xend - xstart + 1
-    bin_width = max(1, window_size // num_bins)
-
-    # Store per-bin: {bin_idx: [(position, value), ...]} for each strand
-    bin_contributions = {}
-
-    for table_name in ["Feature_primary_reads_plus_only", "Feature_primary_reads_minus_only"]:
-        sql = (
-            f"SELECT bin_idx AS bin, "
-            f"MAX(CAST(Value AS DOUBLE)) AS max_value, "
-            f"ARG_MAX(mid_pos, CAST(Value AS DOUBLE)) AS max_pos "
-            f"FROM ("
-            f"  SELECT f.Value, (f.First_position + {_LP}) / 2 AS mid_pos, "
-            f"  UNNEST(generate_series("
-            f"    GREATEST(0, CAST((GREATEST(f.First_position, ?) - ?) / ? AS INTEGER)), "
-            f"    LEAST(? - 1, CAST((LEAST({_LP}, ?) - ?) / ? AS INTEGER))"
-            f"  )) AS bin_idx "
-            f"  FROM {table_name} f "
-            f"  WHERE f.Sample_id = ? AND f.Contig_id = ? AND {_LP} >= ? AND f.First_position <= ?"
-            f") sub "
-            f"GROUP BY bin_idx ORDER BY bin_idx"
-        )
-        params = (xstart, xstart, bin_width,
-                  num_bins, xend, xstart, bin_width,
-                  sample_id, contig_id, xstart, xend)
-        cur.execute(sql, params)
-        for bin_idx, max_value, max_pos in cur.fetchall():
-            if max_value is not None and bin_idx is not None:
-                bi = int(bin_idx)
-                bin_start = xstart + bi * bin_width
-                position = max(bin_start, min(bin_start + bin_width - 1, int(max_pos))) if max_pos is not None else int(bin_start + bin_width // 2)
-                if bi not in bin_contributions:
-                    bin_contributions[bi] = []
-                bin_contributions[bi].append((position, float(max_value)))
-
-    if not bin_contributions:
-        return [], []
-
-    # Sum contributions per bin and track position of max contributor
-    results = {}  # bin_idx -> (sum_value, position_of_max_contributor)
-    for bi, contributions in bin_contributions.items():
-        total_value = sum(val for pos, val in contributions)
-        # Use position from the strand that contributed more
-        max_contributor = max(contributions, key=lambda x: x[1])
-        results[bi] = (total_value, max_contributor[0])
-
-    # Zero-fill all bins between min and max occupied bins
-    min_bin = min(results)
-    max_bin = max(results)
-    x_coords = []
-    y_coords = []
-    for bi in range(min_bin, max_bin + 1):
-        if bi in results:
-            value, position = results[bi]
-            x_coords.append(position)
-            y_coords.append(value)
-        else:
-            # Zero-filled bin: use bin center (bin_width matches SQL integer division)
-            bin_center = int(xstart + (bi + 0.5) * bin_width)
-            x_coords.append(bin_center)
-            y_coords.append(0.0)
-    return x_coords, y_coords
-
-
 ### Function to get features of one variable
 def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None, variable_metadata=None, downsample_threshold=None, min_relative_value=0.0):
     """Get feature data for plotting.
@@ -1376,10 +975,10 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
     # example the clippings (right vs left)
     list_feature_dict = []
 
-    # Check once whether the codon-annotated mismatches table exists
+    # Check once whether Feature_mismatches has codon columns
     has_codon_table = False
     try:
-        cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Feature_mismatches_with_codons'")
+        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name = 'Feature_mismatches' AND column_name = 'Codon_category'")
         has_codon_table = cur.fetchone() is not None
     except Exception:
         pass
@@ -1387,11 +986,10 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
     for row in rows:
         type_picked, color, alpha, fill_alpha, size, title, feature_table = row
 
-        # Upgrade to codon-annotated table if available
+        # Check if this is a mismatches table with codon annotation
         has_codon_annotation = False
         original_feature_table = feature_table
         if feature_table == "Feature_mismatches" and has_codon_table:
-            feature_table = "Feature_mismatches_with_codons"
             has_codon_annotation = True
 
         feature_dict = {
@@ -1427,10 +1025,10 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
             has_sequences_bin = original_feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_SEQUENCES]
             is_bars = type_picked == "bars"
 
-            # Special case: primary_reads combines two strand tables (always curve)
+            # Special case: primary_reads VIEW combines strand tables — treat as regular curve
             if feature_table == "Feature_primary_reads":
-                x_coords, y_coords = _rle_weighted_bin_primary_reads(
-                    xstart, xend, sample_id, contig_id, cur
+                x_coords, y_coords = _rle_weighted_bin_sql(
+                    "Feature_primary_reads", False, xstart, xend, sample_id, contig_id, cur
                 )
                 seq_coords_bin = []
                 prev_coords_bin = []
@@ -1516,7 +1114,7 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
                     placeholders = ','.join(['?'] * len(pos_set))
                     cur.execute(
                         f"SELECT First_position, Codon_category, Codon_change, AA_change "
-                        f"FROM Feature_mismatches_with_codons "
+                        f"FROM Feature_mismatches "
                         f"WHERE Contig_id = ? AND Sample_id = ? AND First_position IN ({placeholders})",
                         (contig_id, sample_id, *pos_set)
                     )
@@ -1538,26 +1136,19 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
             has_stats = original_feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_STATS]
             has_sequences = original_feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_SEQUENCES]
 
-            # Special handling for primary_reads: combine strand tables in Python
+            # Special handling for primary_reads: query VIEW directly (no Python-side merge)
             if feature_table == "Feature_primary_reads":
                 position_filter = ""
                 params = [sample_id, contig_id]
                 if xstart is not None and xend is not None:
-                    position_filter = f" AND {_LP} >= ? AND First_position <= ?"
+                    position_filter = f" AND Last_position >= ? AND First_position <= ?"
                     params.extend([xstart, xend])
                 cur.execute(
-                    f"SELECT First_position, {_LP}, Value FROM Feature_primary_reads_plus_only "
+                    f"SELECT First_position, Last_position, Value FROM Feature_primary_reads "
                     f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
                     tuple(params)
                 )
-                plus_rows = cur.fetchall()
-                cur.execute(
-                    f"SELECT First_position, {_LP}, Value FROM Feature_primary_reads_minus_only "
-                    f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
-                    tuple(params)
-                )
-                minus_rows = cur.fetchall()
-                data_rows = merge_rle_segments(plus_rows, minus_rows)
+                data_rows = cur.fetchall()
             elif has_stats and has_sequences:
                 position_filter = ""
                 params = [sample_id, contig_id]
@@ -2123,10 +1714,10 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
         and (xend - xstart) > _threshold
     )
 
-    # Check once whether the codon-annotated mismatches table exists (batch version)
+    # Check once whether Feature_mismatches has codon columns (batch version)
     has_codon_table_batch = False
     try:
-        cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Feature_mismatches_with_codons'")
+        cur.execute("SELECT 1 FROM information_schema.columns WHERE table_name = 'Feature_mismatches' AND column_name = 'Codon_category'")
         has_codon_table_batch = cur.fetchone() is not None
     except Exception:
         pass
@@ -2134,11 +1725,10 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
     for row in rows:
         type_picked, color, alpha, fill_alpha, size, title, feature_table = row
 
-        # Upgrade to codon-annotated table if available
+        # Check if this is a mismatches table with codon annotation
         has_codon_annotation = False
         original_feature_table = feature_table
         if feature_table == "Feature_mismatches" and has_codon_table_batch:
-            feature_table = "Feature_mismatches_with_codons"
             has_codon_annotation = True
 
         is_relative_scaled = original_feature_table in RELATIVE_SCALED_FEATURES
@@ -2153,53 +1743,12 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
         if use_binning:
             # --- DOWNSAMPLING PATH ---
             if feature_table == "Feature_primary_reads":
-                # Bin each strand table separately, then sum per bin per sample
-                # Track position of max contributor per bin
-                window_size = xend - xstart + 1
-                bin_width = max(1, window_size // _NUM_BINS)
-
-                # Store {sid: {bin: [(position, value), ...]}} for each strand
-                bins_by_sample = {sid: {} for sid in sample_ids}
-                for table_name in ["Feature_primary_reads_plus_only", "Feature_primary_reads_minus_only"]:
-                    sql = (
-                        f"SELECT Sample_id, bin_idx AS bin, "
-                        f"MAX(CAST(Value AS DOUBLE)) AS max_value, "
-                        f"ARG_MAX(mid_pos, CAST(Value AS DOUBLE)) AS max_pos "
-                        f"FROM ("
-                        f"  SELECT f.Sample_id, f.Value, (f.First_position + {_LP}) / 2 AS mid_pos, "
-                        f"  UNNEST(generate_series("
-                        f"    GREATEST(0, CAST((GREATEST(f.First_position, ?) - ?) / ? AS INTEGER)), "
-                        f"    LEAST(? - 1, CAST((LEAST({_LP}, ?) - ?) / ? AS INTEGER))"
-                        f"  )) AS bin_idx "
-                        f"  FROM {table_name} f "
-                        f"  WHERE f.Sample_id IN ({placeholders}) AND f.Contig_id = ? "
-                        f"  AND {_LP} >= ? AND f.First_position <= ?"
-                        f") sub "
-                        f"GROUP BY Sample_id, bin_idx ORDER BY Sample_id, bin_idx"
-                    )
-                    params = (xstart, xstart, bin_width,
-                              num_bins, xend, xstart, bin_width) + tuple(sample_ids) + (contig_id, xstart, xend)
-                    cur.execute(sql, params)
-                    for sid, bin_idx, max_value, max_pos in cur.fetchall():
-                        if sid in bins_by_sample and max_value is not None and bin_idx is not None:
-                            bi = int(bin_idx)
-                            bin_start = xstart + bi * bin_width
-                            position = max(bin_start, min(bin_start + bin_width - 1, int(max_pos))) if max_pos is not None else int(bin_start + bin_width // 2)
-                            if bi not in bins_by_sample[sid]:
-                                bins_by_sample[sid][bi] = []
-                            bins_by_sample[sid][bi].append((position, float(max_value)))
-
-                # Aggregate per sample: sum values and use position of max contributor
-                for sid in sample_ids:
-                    x_coords = []
-                    y_coords = []
-                    for bi in sorted(bins_by_sample[sid].keys()):
-                        contributions = bins_by_sample[sid][bi]
-                        total_value = sum(val for pos, val in contributions)
-                        # Use position from the strand that contributed more
-                        max_contributor = max(contributions, key=lambda x: x[1])
-                        x_coords.append(max_contributor[0])
-                        y_coords.append(total_value)
+                # Query Feature_primary_reads VIEW via batch binning (strand merge done in SQL)
+                batch_results_bin = _rle_weighted_bin_batch_sql(
+                    "Feature_primary_reads", xstart, xend, sample_ids, contig_id, cur, type_picked="curve"
+                )
+                for sid, bin_coords in batch_results_bin.items():
+                    x_coords, y_coords = bin_coords
                     if x_coords:
                         feature_dict = {
                             "type": type_picked, "color": color, "alpha": alpha,
@@ -2301,7 +1850,7 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
                                 ph = ','.join(['?'] * len(pos_set))
                                 cur.execute(
                                     f"SELECT First_position, Codon_category, Codon_change, AA_change "
-                                    f"FROM Feature_mismatches_with_codons "
+                                    f"FROM Feature_mismatches "
                                     f"WHERE Contig_id = ? AND Sample_id = ? AND First_position IN ({ph})",
                                     (contig_id, sid, *pos_set)
                                 )
@@ -2326,41 +1875,20 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
                 extra_params = [xstart, xend]
 
             if feature_table == "Feature_primary_reads":
-                # Batch query for plus strand
+                # Query Feature_primary_reads VIEW directly (strand merge done in SQL VIEW)
                 params = list(sample_ids) + [contig_id] + extra_params
                 cur.execute(
-                    f"SELECT Sample_id, First_position, {_LP}, Value "
-                    f"FROM Feature_primary_reads_plus_only "
+                    f"SELECT Sample_id, First_position, Last_position, Value "
+                    f"FROM Feature_primary_reads "
                     f"WHERE Sample_id IN ({placeholders}) AND Contig_id=?{position_filter} "
                     f"ORDER BY Sample_id, First_position",
                     tuple(params)
                 )
-                all_plus = cur.fetchall()
-
-                # Batch query for minus strand
-                cur.execute(
-                    f"SELECT Sample_id, First_position, {_LP}, Value "
-                    f"FROM Feature_primary_reads_minus_only "
-                    f"WHERE Sample_id IN ({placeholders}) AND Contig_id=?{position_filter} "
-                    f"ORDER BY Sample_id, First_position",
-                    tuple(params)
-                )
-                all_minus = cur.fetchall()
-
-                # Group by sample_id
-                plus_by_sample = {sid: [] for sid in sample_ids}
-                for sid, first, last, val in all_plus:
-                    if sid in plus_by_sample:
-                        plus_by_sample[sid].append((first, last, val))
-
-                minus_by_sample = {sid: [] for sid in sample_ids}
-                for sid, first, last, val in all_minus:
-                    if sid in minus_by_sample:
-                        minus_by_sample[sid].append((first, last, val))
-
-                # Merge and expand per sample
+                rows_by_sample: dict = {}
+                for sid, first, last, val in cur.fetchall():
+                    rows_by_sample.setdefault(sid, []).append((first, last, val))
                 for sid in sample_ids:
-                    data_rows = merge_rle_segments(plus_by_sample[sid], minus_by_sample[sid])
+                    data_rows = rows_by_sample.get(sid, [])
                     expanded = _expand_rle_rows(data_rows, type_picked, has_stats, is_scaled, xstart, xend, False, min_relative_value)
                     if expanded is not None:
                         feature_dict = {
@@ -2532,41 +2060,34 @@ def parse_requested_features(list_features):
     - "assemblycheck" or "Assembly check" -> all assembly check features
     - "genome" or "Genome" -> Repeat count + Max repeat identity + GC content + GC skew
 
-    Returns tuple of (deduplicated list of individual feature names, include_repeat_count, include_repeat_identity).
-    Note: GC content and GC skew are returned as regular features in the list.
+    Returns deduplicated list of individual feature names (subplot names).
+    All features including repeats are returned as regular features.
     """
     features = []
-    include_repeat_count = False
-    include_repeat_identity = False
 
     for item in list_features:
         item_lower = item.lower().strip()
 
         # Module: Genome
         if item_lower in ["genome"]:
-            include_repeat_count = True
-            include_repeat_identity = True
-            features.extend(["GC content", "GC skew"])
+            features.extend(["Repeat count", "Max repeat identity", "GC content", "GC skew"])
         # Module: Coverage
         elif item_lower in ["coverage"]:
             features.extend(["Primary alignments", "Other alignments"])
         # Module: Phage termini / phagetermini
         elif item_lower in ["phage termini", "phagetermini", "phage_termini"]:
-            features.extend(["Coverage reduced", "Reads termini", "Read termini transformation"])
-            include_repeat_count = True
-            include_repeat_identity = True
+            features.extend(["Coverage reduced", "Reads termini", "Read termini transformation", "Repeat count", "Max repeat identity"])
         # Module: Assembly check / assemblycheck
         elif item_lower in ["assembly check", "assemblycheck", "assembly_check"]:
             features.extend(["Clippings", "Indels", "Mismatches", "Read lengths", "Insert sizes", "Bad orientations"])
         # Handle individual repeat subplot buttons
         elif item_lower in ["repeat count"]:
-            include_repeat_count = True
+            features.append("Repeat count")
         elif item_lower in ["max repeat identity"]:
-            include_repeat_identity = True
+            features.append("Max repeat identity")
         # Handle legacy "Repeats" (also accept "duplications")
         elif item_lower in ["repeats", "repeat", "duplications", "duplication"]:
-            include_repeat_count = True
-            include_repeat_identity = True
+            features.extend(["Repeat count", "Max repeat identity"])
         # Handle "GC content" specifically - add as regular feature
         elif item_lower in ["gc_content", "gc content", "gccontent", "gc"]:
             features.append("GC content")
@@ -2580,11 +2101,11 @@ def parse_requested_features(list_features):
     # Deduplicate while preserving order
     seen = set()
     deduped_features = [f for f in features if not (f in seen or seen.add(f))]
-    return deduped_features, include_repeat_count, include_repeat_identity
+    return deduped_features
 
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=100, genbank_path=None, feature_types=None, use_phage_colors=False, plot_isoforms=True, plot_sequence=False, plot_translated_sequence=False, same_y_scale=False, genemap_size=None, sequence_size=None, downsample_threshold=None, max_genemap_window=None, max_sequence_window=None, min_relative_value=0.0):
+def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=100, genbank_path=None, feature_types=None, use_phage_colors=False, plot_isoforms=True, plot_sequence=False, plot_translated_sequence=False, same_y_scale=False, genemap_size=None, sequence_size=None, translated_sequence_size=None, downsample_threshold=None, max_genemap_window=None, max_sequence_window=None, min_relative_value=0.0):
     """Generate a Bokeh plot for a single sample."""
     cur = conn.cursor()
 
@@ -2636,34 +2157,18 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
 
     # --- Add translated sequence subplot right after DNA sequence ---
     if plot_translated_sequence and xstart is not None and xend is not None and (xend - xstart) <= _seq_threshold:
-        _seq_height = sequence_size if sequence_size is not None else subplot_size // 2
-        trans_subplot = make_bokeh_translated_sequence_subplot(conn, contig_name, xstart, xend, _seq_height, shared_xrange)
+        _trans_height = translated_sequence_size if translated_sequence_size is not None else (sequence_size if sequence_size is not None else subplot_size // 2)
+        trans_subplot = make_bokeh_translated_sequence_subplot(conn, contig_name, xstart, xend, _trans_height, shared_xrange)
         if trans_subplot:
             subplots.append(trans_subplot)
     elif plot_translated_sequence and xstart is not None and xend is not None and (xend - xstart) > _seq_threshold:
         print(f"Translated sequence not plotted: window > {_seq_threshold} bp", flush=True)
 
-    requested_features, include_repeat_count, include_repeat_identity = parse_requested_features(list_features)
+    requested_features = parse_requested_features(list_features)
 
-    # Add Repeats subplots if requested (contig-level, sample-independent)
-    if include_repeat_count or include_repeat_identity:
-        try:
-            count_dicts, identity_dicts = get_repeats_aggregated_data(cur, contig_id, xstart, xend)
-            # Track 1: Repeat count (direct + inverted as separate legend entries)
-            if include_repeat_count and count_dicts:
-                subplot = make_bokeh_subplot(count_dicts, subplot_size, shared_xrange, show_tooltips=True)
-                if subplot is not None:
-                    subplots.append(subplot)
-            # Track 2: Repeat max identity (direct + inverted as separate legend entries)
-            if include_repeat_identity and identity_dicts:
-                subplot = make_bokeh_subplot(identity_dicts, subplot_size, shared_xrange, show_tooltips=True)
-                if subplot is not None:
-                    subplots.append(subplot)
-        except Exception as e:
-            print(f"Error processing Repeats: {e}", flush=True)
-
-    # Separate contig-level features (GC content, GC skew) from sample-dependent features
-    contig_level_features = ["GC content", "GC skew"]
+    # Separate contig-level features from sample-dependent features
+    # Repeat features now use SQL views with standard binning (like GC content/skew)
+    contig_level_features = ["GC content", "GC skew", "Repeat count", "Max repeat identity"]
     contig_features = [f for f in requested_features if f in contig_level_features]
     sample_features = [f for f in requested_features if f not in contig_level_features]
 

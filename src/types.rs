@@ -382,6 +382,10 @@ pub struct FeatureAnnotation {
     pub phrog: Option<i32>,
     /// Locus tag for isoform grouping (e.g., "GENE_001")
     pub locus_tag: Option<String>,
+    /// Nucleotide sequence for CDS features (extracted from contig sequence)
+    pub nucleotide_sequence: Option<String>,
+    /// Protein sequence for CDS features (translated from nucleotide_sequence)
+    pub protein_sequence: Option<String>,
 }
 
 /// A single data point for a calculated feature.
@@ -422,6 +426,12 @@ pub struct FeaturePoint {
     pub sequence: Option<String>,
     /// Prevalence of the dominant sequence, as percentage × 10 (e.g., 853 = 85.3%)
     pub sequence_prevalence: Option<i32>,
+    /// Codon category: "Synonymous", "Non-synonymous", or "Intergenic" (mismatches only)
+    pub codon_category: Option<String>,
+    /// Mutant codon (e.g., "ACG") for mismatch positions in CDS
+    pub codon_change: Option<String>,
+    /// Amino acid change description (e.g., "V (Valine)") for mismatch positions in CDS
+    pub aa_change: Option<String>,
 }
 
 /// Coverage data for a contig in a sample.
