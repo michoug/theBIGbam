@@ -250,6 +250,12 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None, show_to
                     for v in data_feature["sequence_prevalence"]
                 ]
 
+            # Add codon annotation if available
+            if "codon_category" in data_feature:
+                data_dict["codon_category"] = data_feature["codon_category"]
+                data_dict["codon_change"] = data_feature["codon_change"]
+                data_dict["aa_change"] = data_feature["aa_change"]
+
             source = ColumnDataSource(data=data_dict)
 
             # Part specific to the type of subplot
@@ -335,12 +341,17 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None, show_to
                 tooltips.append(("Sequence", "@sequence"))
                 tooltips.append(("Prevalence", "@sequence_prevalence_str"))
         elif has_any_sequences:
+            has_codon_data = any("codon_category" in d for d in feature_dict)
             tooltips = [
                 ("Position", "@x{0,0}"),
                 ("Value", "@y{0.00}"),
                 ("Sequence", "@sequence"),
                 ("Prevalence", "@sequence_prevalence_str"),
             ]
+            if has_codon_data:
+                tooltips.append(("Category", "@codon_category"))
+                tooltips.append(("Codon", "@codon_change"))
+                tooltips.append(("Amino acid", "@aa_change"))
         else:
             tooltips = [("Position", "@x{0,0}"), ("Value", "@y{0.00}")]
 
@@ -473,6 +484,198 @@ def make_bokeh_sequence_subplot(conn, contig_name, xstart, xend, height, x_range
         return p
 
     except Exception:
+        return None
+
+
+### Function to render translated amino acid sequence as colored rectangles
+def make_bokeh_translated_sequence_subplot(conn, contig_name, xstart, xend, height, x_range):
+    """Create a subplot showing color-coded amino acid rectangles for CDS annotations.
+
+    Forward-strand CDS are drawn in the top half (y: 0.5–1.0),
+    reverse-strand CDS in the bottom half (y: 0.0–0.5).
+
+    Returns None if no translated annotation data is available.
+
+    Args:
+        conn: DuckDB connection
+        contig_name: Name of the contig
+        xstart: Start position (1-based genome position)
+        xend: End position
+        height: Height of the subplot in pixels
+        x_range: Shared x_range from other subplots
+    """
+    try:
+        cur = conn.cursor()
+
+        # Check table exists
+        cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Contig_annotation_translated'")
+        if cur.fetchone() is None:
+            return None
+
+        # Load codon color/name lookup
+        cur.execute("SELECT Codon, AminoAcid, AminoAcid_name, Color FROM Codon_table")
+        codon_info = {}
+        for codon, aa, aa_name, color in cur.fetchall():
+            codon_info[codon.upper()] = (aa, aa_name, color)
+
+        # Get contig_id
+        cur.execute("SELECT Contig_id FROM Contig WHERE Contig_name = ?", (contig_name,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        contig_id = row[0]
+
+        # Query CDS rows that overlap the visible window (only longest isoforms)
+        cur.execute("""
+            SELECT Start, "End", Strand, Nucleotide_sequence, Protein_sequence, Product
+            FROM Contig_annotation_translated
+            WHERE Contig_id = ? AND Type = 'CDS'
+              AND Protein_sequence IS NOT NULL
+              AND "End" >= ? AND Start <= ?
+              AND (Locus_tag IS NULL OR Longest_isoform = true)
+        """, (contig_id, xstart, xend))
+        cds_rows = cur.fetchall()
+
+        if not cds_rows:
+            return None
+
+        # --- Pass 1: assign each CDS a lane using greedy interval graph coloring ---
+        # Within each strand, CDS that overlap share the half-band; non-overlapping
+        # CDS reuse the same lane.  Greedy coloring (sorted by start) gives an
+        # optimal 2-coloring whenever possible (A→0, B→1, C→0, …).
+        def assign_lanes(strand_cds_list):
+            """Return {cds_idx: lane} using greedy interval-graph coloring.
+
+            strand_cds_list: [(cds_idx, start, end), …] sorted by start.
+            """
+            lane_ends = []          # lane_ends[lane] = end of last CDS in that lane
+            assignment = {}         # cds_idx -> lane number
+            for cds_idx, cds_start, cds_end in strand_cds_list:
+                assigned_lane = None
+                for lane, end in enumerate(lane_ends):
+                    if end < cds_start:          # no overlap — reuse lane
+                        assigned_lane = lane
+                        lane_ends[lane] = cds_end
+                        break
+                if assigned_lane is None:
+                    assigned_lane = len(lane_ends)
+                    lane_ends.append(cds_end)
+                assignment[cds_idx] = assigned_lane
+            return assignment
+
+        forward_cds = []
+        reverse_cds = []
+        for cds_idx, (cds_start, cds_end, strand, nuc_seq, prot_seq, product) in enumerate(cds_rows):
+            strand = int(strand) if strand is not None else 1
+            if strand >= 0:
+                forward_cds.append((cds_idx, cds_start, cds_end))
+            else:
+                reverse_cds.append((cds_idx, cds_start, cds_end))
+        forward_cds.sort(key=lambda x: x[1])
+        reverse_cds.sort(key=lambda x: x[1])
+
+        fwd_lanes = assign_lanes(forward_cds)
+        rev_lanes = assign_lanes(reverse_cds)
+        cds_lane = {**fwd_lanes, **rev_lanes}
+
+        fwd_num_lanes = max(fwd_lanes.values(), default=-1) + 1  # 0 if empty
+        rev_num_lanes = max(rev_lanes.values(), default=-1) + 1
+        total_lanes = fwd_num_lanes + rev_num_lanes
+
+        # --- Pass 2: build rectangles with lane-aware y-coords ---
+        # All CDS share the full 0.0–1.0 band: forward lanes first (top), reverse lanes below.
+        lefts, rights, bottoms, tops = [], [], [], []
+        colors, amino_acids, aa_names, codons_list = [], [], [], []
+        pos_starts, pos_ends = [], []
+
+        for cds_idx, (cds_start, cds_end, strand, nuc_seq, prot_seq, product) in enumerate(cds_rows):
+            strand = int(strand) if strand is not None else 1
+            lane = cds_lane[cds_idx]
+            # Global lane index: forward lanes 0..fwd-1, then reverse lanes fwd..fwd+rev-1
+            global_lane = lane if strand >= 0 else fwd_num_lanes + lane
+
+            for i, aa in enumerate(prot_seq):
+                # Compute genomic coordinates of this codon
+                if strand >= 0:  # forward
+                    left = cds_start + i * 3 - 0.5
+                    right = cds_start + i * 3 + 2.5
+                else:  # reverse
+                    left = cds_end - (i + 1) * 3 + 1 - 0.5
+                    right = cds_end - i * 3 + 0.5
+
+                # Clip to visible window
+                if right < xstart or left > xend:
+                    continue
+
+                # Extract the codon triplet from nucleotide sequence
+                codon_str = nuc_seq[i * 3:i * 3 + 3].upper() if nuc_seq and i * 3 + 3 <= len(nuc_seq) else "???"
+
+                info = codon_info.get(codon_str, (aa, 'Unknown', '#999999'))
+
+                # Compute y-coords: full 0.0–1.0 band divided among all lanes
+                lane_height = 1.0 / total_lanes
+                top_y = 1.0 - global_lane * lane_height
+                bottom_y = top_y - lane_height
+
+                lefts.append(left)
+                rights.append(right)
+                bottoms.append(bottom_y)
+                tops.append(top_y)
+                colors.append(info[2])
+                amino_acids.append(aa)
+                aa_names.append(info[1])
+                codons_list.append(codon_str)
+                pos_starts.append(int(left + 0.5))
+                pos_ends.append(int(right - 0.5))
+
+        if not lefts:
+            return None
+
+        source = ColumnDataSource(data=dict(
+            left=lefts, right=rights, bottom=bottoms, top=tops,
+            color=colors, amino_acid=amino_acids, amino_acid_name=aa_names,
+            codon=codons_list, position_start=pos_starts, position_end=pos_ends,
+        ))
+
+        p = figure(
+            height=height,
+            x_range=x_range,
+            y_range=Range1d(0, 1),
+            tools="xpan,reset,save"
+        )
+
+        p.quad(
+            left='left', right='right', bottom='bottom', top='top',
+            color='color', source=source, line_color=None
+        )
+
+        hover = HoverTool(tooltips=[
+            ("Position", "@position_start{0,0}–@position_end{0,0}"),
+            ("Codon", "@codon"),
+            ("Amino acid", "@amino_acid (@amino_acid_name)"),
+        ])
+        p.add_tools(hover)
+
+        # Match styling from make_bokeh_sequence_subplot
+        p.toolbar.logo = None
+        p.xaxis.formatter = NumeralTickFormatter(format="0,0")
+        p.yaxis.visible = False
+        p.xgrid.visible = False
+        p.ygrid.visible = False
+        p.outline_line_color = None
+        p.min_border_left = 40
+        p.min_border_right = 10
+
+        wheel = WheelZoomTool(dimensions='width')
+        p.add_tools(wheel)
+        p.toolbar.active_scroll = wheel
+
+        return p
+
+    except Exception as e:
+        print(f"  WARNING: Could not create translated sequence subplot: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -1173,9 +1376,24 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
     # example the clippings (right vs left)
     list_feature_dict = []
 
+    # Check once whether the codon-annotated mismatches table exists
+    has_codon_table = False
+    try:
+        cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Feature_mismatches_with_codons'")
+        has_codon_table = cur.fetchone() is not None
+    except Exception:
+        pass
+
     for row in rows:
         type_picked, color, alpha, fill_alpha, size, title, feature_table = row
-        
+
+        # Upgrade to codon-annotated table if available
+        has_codon_annotation = False
+        original_feature_table = feature_table
+        if feature_table == "Feature_mismatches" and has_codon_table:
+            feature_table = "Feature_mismatches_with_codons"
+            has_codon_annotation = True
+
         feature_dict = {
             "type": type_picked,
             "color": color,
@@ -1189,13 +1407,13 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
         }
 
         # Check if this feature stores scaled values (stored as INTEGER ×100)
-        is_scaled = feature_table in _SCALED_FEATURES
+        is_scaled = original_feature_table in _SCALED_FEATURES
 
         # Check if this feature stores relative values (stored as INTEGER ×1000)
-        is_relative_scaled = feature_table in RELATIVE_SCALED_FEATURES
+        is_relative_scaled = original_feature_table in RELATIVE_SCALED_FEATURES
 
         # Detect contig-level table (no Sample_id column)
-        is_contig_table = feature_table.startswith("Contig_")
+        is_contig_table = original_feature_table.startswith("Contig_")
 
         # --- DOWNSAMPLING PATH: large windows (> threshold) ---
         _threshold = downsample_threshold if downsample_threshold is not None else _DOWNSAMPLE_THRESHOLD
@@ -1206,7 +1424,7 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
 
         if use_binning:
             # Check if this feature has sequence columns (needed for binning path too)
-            has_sequences_bin = feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_SEQUENCES]
+            has_sequences_bin = original_feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_SEQUENCES]
             is_bars = type_picked == "bars"
 
             # Special case: primary_reads combines two strand tables (always curve)
@@ -1288,14 +1506,37 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
             if has_sequences_bin and x_coords:
                 feature_dict["sequence"] = seq_coords_bin
                 feature_dict["sequence_prevalence"] = prev_coords_bin
+            # Fetch codon annotation for binned mismatch bars
+            if has_codon_annotation and fps_bin and x_coords:
+                codon_cats = [""] * len(fps_bin)
+                codon_chgs = [""] * len(fps_bin)
+                aa_chgs = [""] * len(fps_bin)
+                try:
+                    pos_set = set(fps_bin)
+                    placeholders = ','.join(['?'] * len(pos_set))
+                    cur.execute(
+                        f"SELECT First_position, Codon_category, Codon_change, AA_change "
+                        f"FROM Feature_mismatches_with_codons "
+                        f"WHERE Contig_id = ? AND Sample_id = ? AND First_position IN ({placeholders})",
+                        (contig_id, sample_id, *pos_set)
+                    )
+                    codon_lookup = {r[0]: (r[1] or "", r[2] or "", r[3] or "") for r in cur.fetchall()}
+                    for i, fp in enumerate(fps_bin):
+                        if fp in codon_lookup:
+                            codon_cats[i], codon_chgs[i], aa_chgs[i] = codon_lookup[fp]
+                except Exception:
+                    pass
+                feature_dict["codon_category"] = codon_cats
+                feature_dict["codon_change"] = codon_chgs
+                feature_dict["aa_change"] = aa_chgs
             if x_coords:
                 list_feature_dict.append(feature_dict)
 
         else:
             # --- FULL RESOLUTION PATH: small windows or undefined range ---
             # Check if this feature has statistics columns
-            has_stats = feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_STATS]
-            has_sequences = feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_SEQUENCES]
+            has_stats = original_feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_STATS]
+            has_sequences = original_feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_SEQUENCES]
 
             # Special handling for primary_reads: combine strand tables in Python
             if feature_table == "Feature_primary_reads":
@@ -1347,8 +1588,9 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
                 if xstart is not None and xend is not None:
                     position_filter = f" AND {_LP} >= ? AND First_position <= ?"
                     params.extend([xstart, xend])
+                codon_cols = ", Codon_category, Codon_change, AA_change" if has_codon_annotation else ""
                 cur.execute(
-                    f"SELECT First_position, {_LP}, Value, Sequence, Sequence_prevalence FROM {feature_table} "
+                    f"SELECT First_position, {_LP}, Value, Sequence, Sequence_prevalence{codon_cols} FROM {feature_table} "
                     f"WHERE Sample_id=? AND Contig_id=?{position_filter} ORDER BY First_position",
                     tuple(params)
                 )
@@ -1393,11 +1635,15 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
                         if clipped_first <= clipped_last:
                             clipped_rows.append((clipped_first, clipped_last, value, mean, median, std))
                     elif has_sequences:
-                        first_pos, last_pos, value, seq, seq_prev = row
+                        if has_codon_annotation:
+                            first_pos, last_pos, value, seq, seq_prev, cc, cchg, achg = row
+                        else:
+                            first_pos, last_pos, value, seq, seq_prev = row
+                            cc = cchg = achg = None
                         clipped_first = max(first_pos, xstart)
                         clipped_last = min(last_pos, xend)
                         if clipped_first <= clipped_last:
-                            clipped_rows.append((clipped_first, clipped_last, value, seq, seq_prev))
+                            clipped_rows.append((clipped_first, clipped_last, value, seq, seq_prev, cc, cchg, achg) if has_codon_annotation else (clipped_first, clipped_last, value, seq, seq_prev))
                     else:
                         first_pos, last_pos, value = row
                         clipped_first = max(first_pos, xstart)
@@ -1417,18 +1663,28 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
             width_coords = []
             first_pos_coords = []
             last_pos_coords = []
+            codon_cat_coords = []
+            codon_chg_coords = []
+            aa_chg_coords = []
             for row in data_rows:
                 if has_stats and has_sequences:
                     first_pos, last_pos, value, mean, median, std, seq, seq_prev = row
+                    cc = cchg = achg = None
                 elif has_stats:
                     first_pos, last_pos, value, mean, median, std = row
                     seq = seq_prev = None
+                    cc = cchg = achg = None
                 elif has_sequences:
-                    first_pos, last_pos, value, seq, seq_prev = row
+                    if has_codon_annotation:
+                        first_pos, last_pos, value, seq, seq_prev, cc, cchg, achg = row
+                    else:
+                        first_pos, last_pos, value, seq, seq_prev = row
+                        cc = cchg = achg = None
                     mean = median = std = None
                 else:
                     first_pos, last_pos, value = row
                     mean = median = std = seq = seq_prev = None
+                    cc = cchg = achg = None
                 # Convert sequence prevalence from ×10 integer to percentage
                 if seq_prev is not None:
                     seq_prev = seq_prev / 10.0
@@ -1443,6 +1699,10 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
                     value = value / 100.0 if value is not None else None
                 if is_relative_scaled and min_relative_value > 0.0 and value is not None and value < min_relative_value:
                     continue
+                # Normalize codon values to empty string for tooltip display
+                cc_val = cc if cc else ""
+                cchg_val = cchg if cchg else ""
+                achg_val = achg if achg else ""
                 if type_picked == "bars":
                     midpoint = (first_pos + last_pos) / 2.0
                     width = last_pos - first_pos + 1
@@ -1458,6 +1718,10 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
                     if has_sequences:
                         sequence_coords.append(seq)
                         prevalence_coords.append(seq_prev)
+                    if has_codon_annotation:
+                        codon_cat_coords.append(cc_val)
+                        codon_chg_coords.append(cchg_val)
+                        aa_chg_coords.append(achg_val)
                 else:
                     if first_pos == last_pos:
                         x_coords.append(first_pos)
@@ -1469,6 +1733,10 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
                         if has_sequences:
                             sequence_coords.append(seq)
                             prevalence_coords.append(seq_prev)
+                        if has_codon_annotation:
+                            codon_cat_coords.append(cc_val)
+                            codon_chg_coords.append(cchg_val)
+                            aa_chg_coords.append(achg_val)
                     else:
                         x_coords.extend([first_pos, last_pos])
                         y_coords.extend([value, value])
@@ -1479,6 +1747,10 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
                         if has_sequences:
                             sequence_coords.extend([seq, seq])
                             prevalence_coords.extend([seq_prev, seq_prev])
+                        if has_codon_annotation:
+                            codon_cat_coords.extend([cc_val, cc_val])
+                            codon_chg_coords.extend([cchg_val, cchg_val])
+                            aa_chg_coords.extend([achg_val, achg_val])
             feature_dict["x"] = x_coords
             feature_dict["y"] = y_coords
             feature_dict["has_stats"] = has_stats
@@ -1495,6 +1767,10 @@ def get_feature_data(cur, feature, contig_id, sample_id, xstart=None, xend=None,
             if has_sequences:
                 feature_dict["sequence"] = sequence_coords
                 feature_dict["sequence_prevalence"] = prevalence_coords
+            if has_codon_annotation:
+                feature_dict["codon_category"] = codon_cat_coords
+                feature_dict["codon_change"] = codon_chg_coords
+                feature_dict["aa_change"] = aa_chg_coords
             if x_coords:
                 list_feature_dict.append(feature_dict)
 
@@ -1847,17 +2123,32 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
         and (xend - xstart) > _threshold
     )
 
+    # Check once whether the codon-annotated mismatches table exists (batch version)
+    has_codon_table_batch = False
+    try:
+        cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Feature_mismatches_with_codons'")
+        has_codon_table_batch = cur.fetchone() is not None
+    except Exception:
+        pass
+
     for row in rows:
         type_picked, color, alpha, fill_alpha, size, title, feature_table = row
 
-        is_relative_scaled = feature_table in RELATIVE_SCALED_FEATURES
+        # Upgrade to codon-annotated table if available
+        has_codon_annotation = False
+        original_feature_table = feature_table
+        if feature_table == "Feature_mismatches" and has_codon_table_batch:
+            feature_table = "Feature_mismatches_with_codons"
+            has_codon_annotation = True
 
-        has_stats = feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_STATS]
-        has_sequences = feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_SEQUENCES]
-        is_scaled = feature_table in _SCALED_FEATURES
+        is_relative_scaled = original_feature_table in RELATIVE_SCALED_FEATURES
+
+        has_stats = original_feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_STATS]
+        has_sequences = original_feature_table in [f"Feature_{f}" for f in _FEATURES_WITH_SEQUENCES]
+        is_scaled = original_feature_table in _SCALED_FEATURES
 
         # Detect contig-level table (no Sample_id column)
-        is_contig_table = feature_table.startswith("Contig_")
+        is_contig_table = original_feature_table.startswith("Contig_")
 
         if use_binning:
             # --- DOWNSAMPLING PATH ---
@@ -2000,6 +2291,29 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
                         if has_sequences:
                             feature_dict["sequence"] = seq_coords_b
                             feature_dict["sequence_prevalence"] = prev_coords_b
+                        # Fetch codon annotation for binned mismatch bars
+                        if has_codon_annotation and is_bars and fps_b:
+                            codon_cats = [""] * len(fps_b)
+                            codon_chgs = [""] * len(fps_b)
+                            aa_chgs = [""] * len(fps_b)
+                            try:
+                                pos_set = set(fps_b)
+                                ph = ','.join(['?'] * len(pos_set))
+                                cur.execute(
+                                    f"SELECT First_position, Codon_category, Codon_change, AA_change "
+                                    f"FROM Feature_mismatches_with_codons "
+                                    f"WHERE Contig_id = ? AND Sample_id = ? AND First_position IN ({ph})",
+                                    (contig_id, sid, *pos_set)
+                                )
+                                codon_lookup = {r[0]: (r[1] or "", r[2] or "", r[3] or "") for r in cur.fetchall()}
+                                for i, fp in enumerate(fps_b):
+                                    if fp in codon_lookup:
+                                        codon_cats[i], codon_chgs[i], aa_chgs[i] = codon_lookup[fp]
+                            except Exception:
+                                pass
+                            feature_dict["codon_category"] = codon_cats
+                            feature_dict["codon_change"] = codon_chgs
+                            feature_dict["aa_change"] = aa_chgs
                         result[sid].append(feature_dict)
 
         else:
@@ -2115,8 +2429,9 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
 
             elif has_sequences:
                 params = list(sample_ids) + [contig_id] + extra_params
+                codon_cols_batch = ", Codon_category, Codon_change, AA_change" if has_codon_annotation else ""
                 cur.execute(
-                    f"SELECT Sample_id, First_position, {_LP}, Value, Sequence, Sequence_prevalence "
+                    f"SELECT Sample_id, First_position, {_LP}, Value, Sequence, Sequence_prevalence{codon_cols_batch} "
                     f"FROM {feature_table} "
                     f"WHERE Sample_id IN ({placeholders}) AND Contig_id=?{position_filter} "
                     f"ORDER BY Sample_id, First_position",
@@ -2126,9 +2441,17 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
 
                 # Group by sample_id
                 rows_by_sample = {sid: [] for sid in sample_ids}
-                for sid, first, last, val, seq, seq_prev in all_rows:
+                codon_by_sample = {sid: [] for sid in sample_ids} if has_codon_annotation else None
+                for row in all_rows:
+                    if has_codon_annotation:
+                        sid, first, last, val, seq, seq_prev, cc, cchg, achg = row
+                    else:
+                        sid, first, last, val, seq, seq_prev = row
+                        cc = cchg = achg = None
                     if sid in rows_by_sample:
                         rows_by_sample[sid].append((first, last, val, seq, seq_prev))
+                        if has_codon_annotation:
+                            codon_by_sample[sid].append((cc or "", cchg or "", achg or ""))
 
                 for sid in sample_ids:
                     expanded = _expand_rle_rows(rows_by_sample[sid], type_picked, has_stats, is_scaled, xstart, xend, is_relative_scaled, min_relative_value, has_sequences)
@@ -2139,6 +2462,11 @@ def get_feature_data_batch(cur, feature, contig_id, sample_ids, xstart=None, xen
                         }
                         feature_dict.update(expanded)
                         feature_dict["is_relative_scaled"] = is_relative_scaled
+                        if has_codon_annotation and codon_by_sample[sid]:
+                            # Mismatches are single-position bars so RLE expansion is 1:1
+                            feature_dict["codon_category"] = [c[0] for c in codon_by_sample[sid]]
+                            feature_dict["codon_change"] = [c[1] for c in codon_by_sample[sid]]
+                            feature_dict["aa_change"] = [c[2] for c in codon_by_sample[sid]]
                         result[sid].append(feature_dict)
 
             else:
@@ -2256,7 +2584,7 @@ def parse_requested_features(list_features):
 
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=100, genbank_path=None, feature_types=None, use_phage_colors=False, plot_isoforms=True, plot_sequence=False, same_y_scale=False, genemap_size=None, downsample_threshold=None, max_genemap_window=None, max_sequence_window=None, min_relative_value=0.0):
+def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name, xstart=None, xend=None, subplot_size=100, genbank_path=None, feature_types=None, use_phage_colors=False, plot_isoforms=True, plot_sequence=False, plot_translated_sequence=False, same_y_scale=False, genemap_size=None, sequence_size=None, downsample_threshold=None, max_genemap_window=None, max_sequence_window=None, min_relative_value=0.0):
     """Generate a Bokeh plot for a single sample."""
     cur = conn.cursor()
 
@@ -2299,11 +2627,21 @@ def generate_bokeh_plot_per_sample(conn, list_features, contig_name, sample_name
     # --- Add sequence subplot right after annotation (top of data tracks) ---
     _seq_threshold = max_sequence_window if max_sequence_window is not None else 1_000
     if plot_sequence and xstart is not None and xend is not None and (xend - xstart) <= _seq_threshold:
-        seq_subplot = make_bokeh_sequence_subplot(conn, contig_name, xstart, xend, subplot_size // 2, shared_xrange)
+        _seq_height = sequence_size if sequence_size is not None else subplot_size // 2
+        seq_subplot = make_bokeh_sequence_subplot(conn, contig_name, xstart, xend, _seq_height, shared_xrange)
         if seq_subplot:
             subplots.append(seq_subplot)
     elif plot_sequence and xstart is not None and xend is not None and (xend - xstart) > _seq_threshold:
         print(f"Sequence not plotted: window > {_seq_threshold} bp", flush=True)
+
+    # --- Add translated sequence subplot right after DNA sequence ---
+    if plot_translated_sequence and xstart is not None and xend is not None and (xend - xstart) <= _seq_threshold:
+        _seq_height = sequence_size if sequence_size is not None else subplot_size // 2
+        trans_subplot = make_bokeh_translated_sequence_subplot(conn, contig_name, xstart, xend, _seq_height, shared_xrange)
+        if trans_subplot:
+            subplots.append(trans_subplot)
+    elif plot_translated_sequence and xstart is not None and xend is not None and (xend - xstart) > _seq_threshold:
+        print(f"Translated sequence not plotted: window > {_seq_threshold} bp", flush=True)
 
     requested_features, include_repeat_count, include_repeat_identity = parse_requested_features(list_features)
 

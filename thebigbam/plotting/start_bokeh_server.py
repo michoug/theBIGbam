@@ -574,6 +574,15 @@ def create_layout(db_path):
                 else:
                     print(f"Warning: Sequence will not be plotted for regions larger than {max_seq_window} bp.", flush=True)
 
+            # Only plot translated sequence if window is <= threshold from spinner
+            plot_translated_sequence = False
+            if translated_sequence_cbg is not None and 0 in translated_sequence_cbg.active:
+                max_seq_window = int(max_sequence_window_input.value)
+                if (xend - xstart) <= max_seq_window:
+                    plot_translated_sequence = True
+                else:
+                    print(f"Warning: Translated sequence will not be plotted for regions larger than {max_seq_window} bp.", flush=True)
+
             # Only plot genome map if window is <= threshold from spinner
             plot_genemap = True
             max_genemap_window = int(max_genemap_window_input.value)
@@ -587,6 +596,7 @@ def create_layout(db_path):
             # Read subplot height from spinner
             subplot_size = int(subplot_height_input.value)
             genemap_size = int(genemap_height_input.value)
+            sequence_size = int(sequence_height_input.value)
             max_binning = int(max_binning_window_input.value)
             min_coverage_freq = float(min_coverage_freq_input.value)
 
@@ -646,8 +656,8 @@ def create_layout(db_path):
                     conn, selected_var, contig, xstart=xstart, xend=xend, genbank_path=genbank_path,
                     genome_features=genome_features if genome_features else None, allowed_samples=set(filtered_samples),
                     feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_sequence=plot_sequence,
-                    same_y_scale=same_y_scale, subplot_size=subplot_size, genemap_size=genemap_size,
-                    order_by_column=order_by, downsample_threshold=max_binning,
+                    plot_translated_sequence=plot_translated_sequence, same_y_scale=same_y_scale, subplot_size=subplot_size, genemap_size=genemap_size,
+                    sequence_size=sequence_size, order_by_column=order_by, downsample_threshold=max_binning,
                     max_genemap_window=max_genemap_window, min_relative_value=min_coverage_freq
                 )
             else:
@@ -671,8 +681,9 @@ def create_layout(db_path):
                 grid = generate_bokeh_plot_per_sample(
                     conn, requested_features, contig, sample, xstart=xstart, xend=xend, genbank_path=genbank_path,
                     feature_types=selected_feature_types, use_phage_colors=use_phage_colors, plot_isoforms=plot_isoforms,
-                    plot_sequence=plot_sequence, same_y_scale=False, subplot_size=subplot_size, genemap_size=genemap_size,
-                    downsample_threshold=max_binning,
+                    plot_sequence=plot_sequence, plot_translated_sequence=plot_translated_sequence,
+                    same_y_scale=False, subplot_size=subplot_size, genemap_size=genemap_size,
+                    sequence_size=sequence_size, downsample_threshold=max_binning,
                     max_genemap_window=int(max_genemap_window_input.value),
                     max_sequence_window=int(max_sequence_window_input.value),
                     min_relative_value=min_coverage_freq
@@ -1608,6 +1619,20 @@ def create_layout(db_path):
         sequence_cbg = CheckboxGroup(labels=["Plot sequence"], active=[])
         sequence_row = row(sequence_cbg, sizing_mode="stretch_width")
 
+    # Check if translated annotation data is available
+    has_translated_data = False
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Contig_annotation_translated'")
+        has_translated_data = cur.fetchone() is not None
+    except Exception:
+        pass
+
+    translated_sequence_cbg = None
+    translated_sequence_row = None
+    if has_translated_data:
+        translated_sequence_cbg = CheckboxGroup(labels=["Plot translated sequence"], active=[])
+        translated_sequence_row = row(translated_sequence_cbg, sizing_mode="stretch_width")
 
     if feature_type_multichoice is not None or combined_features_cbg is not None:
         # Build simple Genome section header (no collapse needed - Contigs section handles that)
@@ -1627,6 +1652,8 @@ def create_layout(db_path):
             genome_children.append(feature_type_multichoice)
         if sequence_row is not None:
             genome_children.append(sequence_row)
+        if translated_sequence_row is not None:
+            genome_children.append(translated_sequence_row)
         if phage_colors_cbg is not None:
             genome_children.append(phage_colors_cbg)
         if plot_isoforms_cbg is not None:
@@ -1640,9 +1667,11 @@ def create_layout(db_path):
     if genome_section is not None:
         below_contig_children = list(below_contig_children) + [genome_section]
 
-    # Fallback: if no genome section exists, append sequence_row directly
+    # Fallback: if no genome section exists, append sequence/translated rows directly
     if genome_section is None and sequence_row is not None:
         below_contig_children.append(sequence_row)
+    if genome_section is None and translated_sequence_row is not None:
+        below_contig_children.append(translated_sequence_row)
 
     below_contig_content = column(
         *below_contig_children,
@@ -1717,7 +1746,7 @@ def create_layout(db_path):
     max_genemap_window_row = row(max_genemap_window_input, max_genemap_window_label, sizing_mode="stretch_width", margin=(5, 0, 5, 0))
 
     max_sequence_window_input = Spinner(value=1000, low=10, high=1000000, step=100, width=100, margin=(0, 2, 0, 0))
-    max_sequence_window_label = Div(text="Max window size for sequence (bp)", margin=(5, 0, 5, 5))
+    max_sequence_window_label = Div(text="Max window size for sequence plots (bp)", margin=(5, 0, 5, 5))
     max_sequence_window_row = row(max_sequence_window_input, max_sequence_window_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
 
     max_binning_window_input = Spinner(value=100000, low=10, high=1000000, step=1000, width=100, margin=(0, 2, 0, 0))
@@ -1732,6 +1761,10 @@ def create_layout(db_path):
     genemap_height_label = Div(text="Height of gene map (px)", width=160, margin=(5, 0, 5, 5))
     genemap_height_row = row(genemap_height_input, genemap_height_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
 
+    sequence_height_input = Spinner(value=50, low=10, high=1000, step=10, width=80, margin=(0, 2, 0, 0))
+    sequence_height_label = Div(text="Height of sequence plots (px)", width=160, margin=(5, 0, 5, 5))
+    sequence_height_row = row(sequence_height_input, sequence_height_label, sizing_mode="stretch_width", margin=(0, 0, 5, 0))
+
     subplot_height_input = Spinner(value=100, low=10, high=1000, step=10, width=80, margin=(0, 2, 0, 0))
     subplot_height_label = Div(text="Height per subplot (px)", width=160, margin=(5, 0, 5, 5))
     subplot_height_row = row(subplot_height_input, subplot_height_label, sizing_mode="stretch_width")
@@ -1740,7 +1773,7 @@ def create_layout(db_path):
         sample_order_row, same_y_scale_row,
         max_genemap_window_row, max_sequence_window_row, max_binning_window_row,
         min_coverage_freq_row,
-        genemap_height_row, subplot_height_row,
+        genemap_height_row, sequence_height_row, subplot_height_row,
         sizing_mode="stretch_width"
     )
     plotting_params_toggle_btn.on_click(make_toggle_callback(plotting_params_toggle_btn, plotting_params_content))

@@ -1205,17 +1205,14 @@ fn insert_annotations(conn: &Connection, annotations: &[FeatureAnnotation]) -> R
         }
         
         // Check if this is a CDS with a PHAROKKA function
-        if ann.feature_type == "CDS" {
+        if !has_pharokka_function && ann.feature_type == "CDS" {
             if let Some(function) = &ann.function {
                 let func_lower = function.to_lowercase();
                 for pharokka_key in &pharokka_keys {
                     if func_lower.contains(pharokka_key) {
                         has_pharokka_function = true;
-                        break;
+                        break;  // Exit inner pharokka_key loop only
                     }
-                }
-                if has_pharokka_function {
-                    break;  // Early exit once we find one
                 }
             }
         }

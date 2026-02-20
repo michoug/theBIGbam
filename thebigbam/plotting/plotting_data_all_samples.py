@@ -1,10 +1,10 @@
 from bokeh.models import Range1d
 from bokeh.layouts import gridplot
 
-from .plotting_data_per_sample import get_contig_info, get_feature_data, get_feature_data_batch, get_variable_metadata, get_repeats_aggregated_data, make_bokeh_subplot, make_bokeh_genemap, make_bokeh_sequence_subplot
+from .plotting_data_per_sample import get_contig_info, get_feature_data, get_feature_data_batch, get_variable_metadata, get_repeats_aggregated_data, make_bokeh_subplot, make_bokeh_genemap, make_bokeh_sequence_subplot, make_bokeh_translated_sequence_subplot
 
 ### Function to generate the bokeh plot
-def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130, genbank_path=None, genome_features=None, allowed_samples=None, feature_types=None, use_phage_colors=False, plot_sequence=False, same_y_scale=False, genemap_size=None, order_by_column=None, downsample_threshold=None, max_genemap_window=None, min_relative_value=0.0):
+def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xend=None, subplot_size=130, genbank_path=None, genome_features=None, allowed_samples=None, feature_types=None, use_phage_colors=False, plot_sequence=False, plot_translated_sequence=False, same_y_scale=False, genemap_size=None, sequence_size=None, order_by_column=None, downsample_threshold=None, max_genemap_window=None, min_relative_value=0.0):
     """Generate a Bokeh plot showing all samples for a single variable.
 
     Args:
@@ -134,10 +134,20 @@ def generate_bokeh_plot_all_samples(conn, variable, contig_name, xstart=None, xe
                 continue
 
     # --- Add sequence subplot right after annotation (top of genome tracks) ---
+    seq_subplot_added = False
+    _seq_height = sequence_size if sequence_size is not None else subplot_size // 2
     if plot_sequence:
-        seq_subplot = make_bokeh_sequence_subplot(conn, contig_name, xstart, xend, subplot_size // 2, shared_xrange)
+        seq_subplot = make_bokeh_sequence_subplot(conn, contig_name, xstart, xend, _seq_height, shared_xrange)
         if seq_subplot:
             genome_subplots.insert(0, seq_subplot)
+            seq_subplot_added = True
+
+    # --- Add translated sequence subplot after DNA sequence ---
+    if plot_translated_sequence:
+        trans_subplot = make_bokeh_translated_sequence_subplot(conn, contig_name, xstart, xend, _seq_height, shared_xrange)
+        if trans_subplot:
+            insert_pos = 1 if seq_subplot_added else 0
+            genome_subplots.insert(insert_pos, trans_subplot)
 
     # --- Add one subplot per sample for the main variable ---
     # Requested features are variables like 'coverage', 'reads_starts', etc.
