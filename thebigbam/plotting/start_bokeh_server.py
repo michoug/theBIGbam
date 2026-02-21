@@ -263,7 +263,7 @@ def create_layout(db_path):
             col_info = filtering_metadata.get(category, {}).get('columns', {}).get(column_name, {})
             col_source = col_info.get('source')
 
-            if col_source == 'Contig_annotation' and has_sample_table:
+            if col_source == 'Contig_annotation' and widgets['has_samples']:
                 # Annotation column - join with Contig_annotation table
                 query = f'''
                     SELECT DISTINCT c.Contig_name, s.Sample_name
@@ -281,7 +281,7 @@ def create_layout(db_path):
                     JOIN Contig c ON ca.Contig_id = c.Contig_id
                     WHERE ca."{column_name}" {operator} ?
                 '''
-            elif category == 'Contig' and has_sample_table:
+            elif category == 'Contig' and widgets['has_samples']:
                 # Contig table has no Sample_name, left-join to preserve contigs with 0 samples
                 query = f'''
                     SELECT DISTINCT c.Contig_name, s.Sample_name
