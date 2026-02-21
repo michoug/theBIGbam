@@ -44,10 +44,16 @@ def build_controls(conn):
     )
 
     # Widget Selector for Samples (autocomplete with max 20 suggestions)
-    cur.execute("SELECT Sample_name FROM Sample ORDER BY Sample_name")
-    samples = [r[0] for r in cur.fetchall()]
+    # Sample table only exists when BAM files were provided
+    cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Sample'")
+    has_sample_table = cur.fetchone() is not None
+    if has_sample_table:
+        cur.execute("SELECT Sample_name FROM Sample ORDER BY Sample_name")
+        samples = [r[0] for r in cur.fetchall()]
+    else:
+        samples = []
     has_samples = len(samples) > 0
-    
+
     # If only one sample in database, pre-fill the field
     sample_select = SearchableSelect(
         value=samples[0] if len(samples) == 1 else "",
@@ -58,15 +64,16 @@ def build_controls(conn):
     )
 
     # Build presence mappings: sample -> contigs and contig -> samples
-    cur.execute("""
-    SELECT Contig.Contig_name, Sample.Sample_name FROM Coverage
-      JOIN Contig ON Coverage.Contig_id = Contig.Contig_id
-      JOIN Sample ON Coverage.Sample_id = Sample.Sample_id
-    """)
     sample_to_contigs = {}
     contig_to_samples = {}
-    for contig_name, sample_name in cur.fetchall():
-        sample_to_contigs.setdefault(sample_name, set()).add(contig_name)
+    if has_sample_table:
+        cur.execute("""
+        SELECT Contig.Contig_name, Sample.Sample_name FROM Coverage
+          JOIN Contig ON Coverage.Contig_id = Contig.Contig_id
+          JOIN Sample ON Coverage.Sample_id = Sample.Sample_id
+        """)
+        for contig_name, sample_name in cur.fetchall():
+            sample_to_contigs.setdefault(sample_name, set()).add(contig_name)
         contig_to_samples.setdefault(contig_name, set()).add(sample_name)
 
     # Get variables that have data (their feature table exists)
@@ -256,7 +263,7 @@ def create_layout(db_path):
             col_info = filtering_metadata.get(category, {}).get('columns', {}).get(column_name, {})
             col_source = col_info.get('source')
 
-            if col_source == 'Contig_annotation':
+            if col_source == 'Contig_annotation' and has_sample_table:
                 # Annotation column - join with Contig_annotation table
                 query = f'''
                     SELECT DISTINCT c.Contig_name, s.Sample_name
@@ -266,13 +273,28 @@ def create_layout(db_path):
                     LEFT JOIN Sample s ON p.Sample_id = s.Sample_id
                     WHERE ca."{column_name}" {operator} ?
                 '''
-            elif category == 'Contig':
+            elif col_source == 'Contig_annotation':
+                # Annotation column - no samples available
+                query = f'''
+                    SELECT DISTINCT c.Contig_name, NULL
+                    FROM Contig_annotation ca
+                    JOIN Contig c ON ca.Contig_id = c.Contig_id
+                    WHERE ca."{column_name}" {operator} ?
+                '''
+            elif category == 'Contig' and has_sample_table:
                 # Contig table has no Sample_name, left-join to preserve contigs with 0 samples
                 query = f'''
                     SELECT DISTINCT c.Contig_name, s.Sample_name
                     FROM Contig c
                     LEFT JOIN Coverage p ON c.Contig_id = p.Contig_id
                     LEFT JOIN Sample s ON p.Sample_id = s.Sample_id
+                    WHERE c."{column_name}" {operator} ?
+                '''
+            elif category == 'Contig':
+                # Contig table - no samples available
+                query = f'''
+                    SELECT DISTINCT c.Contig_name, NULL
+                    FROM Contig c
                     WHERE c."{column_name}" {operator} ?
                 '''
             elif category == 'Sample':

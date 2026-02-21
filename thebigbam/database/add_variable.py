@@ -65,8 +65,12 @@ def run_add_variable(args):
             raise ValueError(f"ERROR: Variable '{var_name}' already exists in the database.")
 
         # --- Read known samples and contigs ---
-        cur.execute("SELECT Sample_name, Sample_id FROM Sample")
-        samples = dict(cur.fetchall())
+        cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Sample'")
+        if cur.fetchone() is not None:
+            cur.execute("SELECT Sample_name, Sample_id FROM Sample")
+            samples = dict(cur.fetchall())
+        else:
+            samples = {}
         cur.execute("SELECT Contig_name, Contig_id, Contig_length FROM Contig")
         contigs_info = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
 
@@ -81,6 +85,8 @@ def run_add_variable(args):
         if any_samples_empty and not all_samples_empty:
             raise ValueError("ERROR: Mixed Sample values — either fill Sample for all rows or leave empty for all.")
         contig_only = all_samples_empty
+        if not contig_only and not samples:
+            raise ValueError("ERROR: CSV has Sample values but database has no samples (genbank-only mode). Leave the Sample column empty for contig-level variables.")
 
         # Set feature table name based on mode
         feature_table = f"Contig_{var_name}" if contig_only else f"Feature_{var_name}"
@@ -218,26 +224,6 @@ def run_add_variable(args):
             if rows_to_insert:
                 cur.executemany(f"INSERT INTO {feature_table} (Contig_id, Sample_id, First_position, Last_position, Value) VALUES (?, ?, ?, ?, ?)", rows_to_insert)
 
-            # --- Update Summary table with row counts per contig/sample ---
-            # Skip Summary inserts for contig-only (consistent with built-in contig-level features)
-            if rows_to_insert:
-                # Get Variable_id for summary
-                cur.execute("SELECT Variable_id FROM Variable WHERE Variable_name=?", (var_name,))
-                variable_id = cur.fetchone()[0]
-
-                summary_counts = {}
-                for contig_id, sample_id, first_pos, last_pos, value in rows_to_insert:
-                    key = (contig_id, sample_id)
-                    summary_counts[key] = summary_counts.get(key, 0) + 1
-
-                summary_rows = [(contig_id, sample_id, variable_id, count)
-                              for (contig_id, sample_id), count in summary_counts.items()]
-
-                cur.executemany(
-                    "INSERT INTO Summary (Contig_id, Sample_id, Variable_id, Row_count) VALUES (?, ?, ?, ?)",
-                    summary_rows
-                )
-
         conn.commit()
         print(f"Variable '{var_name}' added and {len(rows_to_insert)} records inserted into '{feature_table}'")
 
@@ -282,9 +268,6 @@ def run_remove_variable(args):
 
         # Drop the associated feature table
         cur.execute(f"DROP TABLE IF EXISTS {feature_table_name}")
-
-        # Clean up Summary rows (only exist for sample-level vars, harmless no-op for contig-only)
-        cur.execute("DELETE FROM Summary WHERE Variable_id=?", (variable_id,))
 
         # Remove the Variable metadata row
         cur.execute("DELETE FROM Variable WHERE Variable_id=?", (variable_id,))

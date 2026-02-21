@@ -90,6 +90,12 @@ def run_add_sample_metadata(args):
         # Connect to database (writable)
         conn = duckdb.connect(db_path)
         
+        # Check Sample table exists (genbank-only mode has no Sample table)
+        if conn.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Sample'").fetchone() is None:
+            print("No Sample table in database (genbank-only mode). Cannot add sample metadata.")
+            conn.close()
+            return 1
+
         # Get existing Sample table columns
         result = conn.execute("PRAGMA table_info(Sample)").fetchall()
         existing_columns = {row[1] for row in result}  # Column name is at index 1

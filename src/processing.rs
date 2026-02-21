@@ -550,7 +550,8 @@ fn add_features_from_arrays(
     // Coverage (always compress self-referentially)
     let primary_reads_f64: Vec<f64> = arrays.primary_reads.iter().map(|&x| x as f64).collect();
     if flags.coverage {
-        // Save strand-specific coverage (VIEW will compute total primary_reads)
+        // Save total and strand-specific coverage
+        add_compressed_feature(&primary_reads_f64, "primary_reads", contig_name, config, output);
         let primary_reads_plus_f64: Vec<f64> = arrays.primary_reads_plus_only.iter().map(|&x| x as f64).collect();
         let primary_reads_minus_f64: Vec<f64> = arrays.primary_reads_minus_only.iter().map(|&x| x as f64).collect();
         add_compressed_feature(&primary_reads_plus_f64, "primary_reads_plus_only", contig_name, config, output);
@@ -1255,7 +1256,7 @@ pub fn run_all_samples(
     std::thread::sleep(std::time::Duration::from_millis(50));
 
     // 4. Create database, write annotations
-    let db_writer = DbWriter::create(output_db, &contigs, &annotations)?;
+    let db_writer = DbWriter::create(output_db, &contigs, &annotations, !bam_files.is_empty())?;
 
     // 5. Circularity mismatch warnings (advisory, uses contigs + BAM headers)
     if !bam_files.is_empty() {
@@ -1303,6 +1304,8 @@ pub fn run_all_samples(
     if bam_files.is_empty() {
         eprintln!("\n### No BAM files provided - skipping sample processing");
         eprintln!("Database populated with {} contigs and {} annotations", contigs.len(), annotations.len());
+
+        db_writer.finalize()?;
 
         return Ok(ProcessResult {
             samples_processed: 0,

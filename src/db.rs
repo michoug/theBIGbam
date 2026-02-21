@@ -27,10 +27,10 @@ use crate::types::{feature_table_name, ContigInfo, FeatureAnnotation, FeaturePoi
 /// Thread-safe database connection wrapper for sequential writes.
 pub struct DbWriter {
     conn: Mutex<Connection>,
+    has_bam: bool,
     contig_name_to_id: HashMap<String, i64>,
     sample_name_to_id: Mutex<HashMap<String, i64>>,
     next_sample_id: Mutex<i64>,
-    variable_name_to_id: HashMap<String, i64>,
     /// Tracks which feature tables have been created (lazy creation)
     created_tables: Mutex<HashSet<String>>,
 }
@@ -41,6 +41,7 @@ impl DbWriter {
         db_path: &Path,
         contigs: &[ContigInfo],
         annotations: &[FeatureAnnotation],
+        has_bam: bool,
     ) -> Result<Self> {
         // Remove existing database if present
         let _ = std::fs::remove_file(db_path);
@@ -49,7 +50,7 @@ impl DbWriter {
             .with_context(|| format!("Failed to create database: {}", db_path.display()))?;
 
         // Create tables
-        create_core_tables(&conn)?;
+        create_core_tables(&conn, has_bam)?;
         create_variable_tables(&conn)?;
 
         // Insert contigs
@@ -74,19 +75,12 @@ impl DbWriter {
             .map(|(i, c)| (c.name.clone(), (i + 1) as i64))
             .collect();
 
-        // Build variable name -> id mapping
-        let variable_name_to_id: HashMap<String, i64> = {
-            let mut stmt = conn.prepare("SELECT Variable_name, Variable_id FROM Variable")?;
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-
         Ok(Self {
             conn: Mutex::new(conn),
+            has_bam,
             contig_name_to_id,
             sample_name_to_id: Mutex::new(HashMap::new()),
             next_sample_id: Mutex::new(1),
-            variable_name_to_id,
             created_tables: Mutex::new(HashSet::new()),
         })
     }
@@ -407,16 +401,12 @@ impl DbWriter {
             by_variable.entry(&f.feature).or_default().push(f);
         }
 
-        // Track row counts for summary table
-        let mut summary_data: Vec<(i64, i64, i64)> = Vec::new(); // (contig_id, variable_id, count)
-
         // Lock created_tables for lazy table creation
         let mut created_tables = self.created_tables.lock().unwrap();
 
         for v in VARIABLES {
-            // Skip primary_reads - it's a VIEW
             // Skip contig-level variables stored in Contig_* tables (not per-sample)
-            if v.name == "primary_reads" || v.name == "direct_repeat_count" || v.name == "inverted_repeat_count" || v.name == "direct_repeat_identity" || v.name == "inverted_repeat_identity" || v.name == "gc_content" {
+            if v.name == "direct_repeat_count" || v.name == "inverted_repeat_count" || v.name == "direct_repeat_identity" || v.name == "inverted_repeat_identity" || v.name == "gc_content" {
                 continue;
             }
 
@@ -433,8 +423,7 @@ impl DbWriter {
             // Determine if this variable stores scaled integers (now only mapq, since tau is removed)
             let is_scaled = v.name == "mapq";
 
-            // Count rows per contig
-            let mut contig_row_counts: HashMap<i64, i64> = HashMap::new();
+
 
             // Use Appender for bulk loading
             let mut appender = conn.appender(&table_name)
@@ -453,7 +442,7 @@ impl DbWriter {
                         let std = f.std.map(|v| if is_scaled { (v * 100.0).round() as i32 } else { v.round() as i32 });
                         let last_pos: Option<i32> = if is_single_pos { None } else { Some(f.end_pos) };
                         appender.append_row(params![contig_id, sample_id, f.start_pos, last_pos, value, mean, median, std, &f.sequence, f.sequence_prevalence])?;
-                        *contig_row_counts.entry(contig_id).or_insert(0) += 1;
+
                     }
                 }
             } else if has_stats {
@@ -465,7 +454,7 @@ impl DbWriter {
                         let std = f.std.map(|v| if is_scaled { (v * 100.0).round() as i32 } else { v.round() as i32 });
                         let last_pos: Option<i32> = if is_single_pos { None } else { Some(f.end_pos) };
                         appender.append_row(params![contig_id, sample_id, f.start_pos, last_pos, value, mean, median, std])?;
-                        *contig_row_counts.entry(contig_id).or_insert(0) += 1;
+
                     }
                 }
             } else if has_sequences && has_codons {
@@ -474,7 +463,7 @@ impl DbWriter {
                         let value = if is_scaled { (f.value * 100.0).round() as i32 } else { f.value.round() as i32 };
                         let last_pos: Option<i32> = if is_single_pos { None } else { Some(f.end_pos) };
                         appender.append_row(params![contig_id, sample_id, f.start_pos, last_pos, value, &f.sequence, f.sequence_prevalence, &f.codon_category, &f.codon_change, &f.aa_change])?;
-                        *contig_row_counts.entry(contig_id).or_insert(0) += 1;
+
                     }
                 }
             } else if has_sequences {
@@ -483,7 +472,7 @@ impl DbWriter {
                         let value = if is_scaled { (f.value * 100.0).round() as i32 } else { f.value.round() as i32 };
                         let last_pos: Option<i32> = if is_single_pos { None } else { Some(f.end_pos) };
                         appender.append_row(params![contig_id, sample_id, f.start_pos, last_pos, value, &f.sequence, f.sequence_prevalence])?;
-                        *contig_row_counts.entry(contig_id).or_insert(0) += 1;
+
                     }
                 }
             } else {
@@ -492,7 +481,7 @@ impl DbWriter {
                         let value = if is_scaled { (f.value * 100.0).round() as i32 } else { f.value.round() as i32 };
                         let last_pos: Option<i32> = if is_single_pos { None } else { Some(f.end_pos) };
                         appender.append_row(params![contig_id, sample_id, f.start_pos, last_pos, value])?;
-                        *contig_row_counts.entry(contig_id).or_insert(0) += 1;
+
                     }
                 }
             }
@@ -500,30 +489,7 @@ impl DbWriter {
             appender.flush()
                 .with_context(|| format!("Failed to flush appender for {}", table_name))?;
 
-            // Collect summary data
-            if let Some(&variable_id) = self.variable_name_to_id.get(v.name) {
-                for (&contig_id, &count) in &contig_row_counts {
-                    summary_data.push((contig_id, variable_id, count));
-                }
-
-                // For primary_reads VIEW, use plus_only counts
-                if v.name == "primary_reads_plus_only" {
-                    if let Some(&primary_reads_var_id) = self.variable_name_to_id.get("primary_reads") {
-                        for (&contig_id, &count) in &contig_row_counts {
-                            summary_data.push((contig_id, primary_reads_var_id, count));
-                        }
-                    }
-                }
-            }
         }
-
-        // Insert summary data using appender
-        let mut summary_appender = conn.appender("Summary")
-            .context("Failed to create Summary appender")?;
-        for (contig_id, variable_id, count) in summary_data {
-            summary_appender.append_row(params![contig_id, sample_id, variable_id, count])?;
-        }
-        summary_appender.flush().context("Failed to flush Summary appender")?;
 
         Ok(())
     }
@@ -763,8 +729,8 @@ impl DbWriter {
         let conn = self.conn.into_inner().unwrap();
         let created_tables = self.created_tables.into_inner().unwrap();
 
-        // Only create views if underlying tables exist
-        create_views(&conn, &created_tables)?;
+        // Create derived views
+        create_views(&conn, self.has_bam)?;
 
         // Delete Variable entries for features without tables
         cleanup_unused_variables(&conn, &created_tables)?;
@@ -871,7 +837,7 @@ fn compact_pvalue(p: f64) -> String {
 }
 
 /// Create core database tables (no indexes - DuckDB uses zone maps).
-fn create_core_tables(conn: &Connection) -> Result<()> {
+fn create_core_tables(conn: &Connection, has_bam: bool) -> Result<()> {
     conn.execute(
         "CREATE TABLE Contig (
             Contig_id INTEGER PRIMARY KEY,
@@ -887,6 +853,7 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
     )
     .context("Failed to create Contig table")?;
 
+    if has_bam {
     conn.execute(
         "CREATE TABLE Sample (
             Sample_id INTEGER PRIMARY KEY,
@@ -963,6 +930,7 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
         [],
     )
     .context("Failed to create PhageTermini table")?;
+    } // end if has_bam (Sample, Coverage, PhageMechanisms, PhageTermini)
 
     // Contig_directRepeats table - stores direct repeats (same orientation)
     // Pident stored as INTEGER (×100)
@@ -994,114 +962,6 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
     )
     .context("Failed to create Contig_invertedRepeats table")?;
 
-    // SQL Views for repeat aggregation (sweep-line algorithm computed on demand)
-    // These views produce (Contig_id, First_position, Last_position, Value) like other Contig_* tables,
-    // allowing the standard binning logic in get_feature_data() to work with repeats.
-
-    // View: Contig_direct_repeat_count - count of overlapping direct repeats per segment
-    conn.execute(
-        "CREATE VIEW Contig_direct_repeat_count AS
-        WITH boundaries AS (
-            SELECT Contig_id, LEAST(Position1, Position2) AS pos FROM Contig_directRepeats
-            UNION
-            SELECT Contig_id, GREATEST(Position1, Position2) + 1 AS pos FROM Contig_directRepeats
-        ),
-        segments AS (
-            SELECT Contig_id, pos AS seg_start,
-                   LEAD(pos) OVER (PARTITION BY Contig_id ORDER BY pos) - 1 AS seg_end
-            FROM boundaries
-        )
-        SELECT s.Contig_id,
-               s.seg_start AS First_position,
-               s.seg_end AS Last_position,
-               (SELECT COUNT(*) FROM Contig_directRepeats r
-                WHERE r.Contig_id = s.Contig_id
-                  AND LEAST(r.Position1, r.Position2) <= s.seg_end
-                  AND GREATEST(r.Position1, r.Position2) >= s.seg_start) AS Value
-        FROM segments s
-        WHERE s.seg_end IS NOT NULL",
-        [],
-    )
-    .context("Failed to create Contig_direct_repeat_count view")?;
-
-    // View: Contig_inverted_repeat_count - count of overlapping inverted repeats per segment
-    conn.execute(
-        "CREATE VIEW Contig_inverted_repeat_count AS
-        WITH boundaries AS (
-            SELECT Contig_id, LEAST(Position1, Position2) AS pos FROM Contig_invertedRepeats
-            UNION
-            SELECT Contig_id, GREATEST(Position1, Position2) + 1 AS pos FROM Contig_invertedRepeats
-        ),
-        segments AS (
-            SELECT Contig_id, pos AS seg_start,
-                   LEAD(pos) OVER (PARTITION BY Contig_id ORDER BY pos) - 1 AS seg_end
-            FROM boundaries
-        )
-        SELECT s.Contig_id,
-               s.seg_start AS First_position,
-               s.seg_end AS Last_position,
-               (SELECT COUNT(*) FROM Contig_invertedRepeats r
-                WHERE r.Contig_id = s.Contig_id
-                  AND LEAST(r.Position1, r.Position2) <= s.seg_end
-                  AND GREATEST(r.Position1, r.Position2) >= s.seg_start) AS Value
-        FROM segments s
-        WHERE s.seg_end IS NOT NULL",
-        [],
-    )
-    .context("Failed to create Contig_inverted_repeat_count view")?;
-
-    // View: Contig_direct_repeat_identity - max identity of overlapping direct repeats per segment
-    conn.execute(
-        "CREATE VIEW Contig_direct_repeat_identity AS
-        WITH boundaries AS (
-            SELECT Contig_id, LEAST(Position1, Position2) AS pos FROM Contig_directRepeats
-            UNION
-            SELECT Contig_id, GREATEST(Position1, Position2) + 1 AS pos FROM Contig_directRepeats
-        ),
-        segments AS (
-            SELECT Contig_id, pos AS seg_start,
-                   LEAD(pos) OVER (PARTITION BY Contig_id ORDER BY pos) - 1 AS seg_end
-            FROM boundaries
-        )
-        SELECT s.Contig_id,
-               s.seg_start AS First_position,
-               s.seg_end AS Last_position,
-               (SELECT MAX(r.Pident) / 100.0 FROM Contig_directRepeats r
-                WHERE r.Contig_id = s.Contig_id
-                  AND LEAST(r.Position1, r.Position2) <= s.seg_end
-                  AND GREATEST(r.Position1, r.Position2) >= s.seg_start) AS Value
-        FROM segments s
-        WHERE s.seg_end IS NOT NULL",
-        [],
-    )
-    .context("Failed to create Contig_direct_repeat_identity view")?;
-
-    // View: Contig_inverted_repeat_identity - max identity of overlapping inverted repeats per segment
-    conn.execute(
-        "CREATE VIEW Contig_inverted_repeat_identity AS
-        WITH boundaries AS (
-            SELECT Contig_id, LEAST(Position1, Position2) AS pos FROM Contig_invertedRepeats
-            UNION
-            SELECT Contig_id, GREATEST(Position1, Position2) + 1 AS pos FROM Contig_invertedRepeats
-        ),
-        segments AS (
-            SELECT Contig_id, pos AS seg_start,
-                   LEAD(pos) OVER (PARTITION BY Contig_id ORDER BY pos) - 1 AS seg_end
-            FROM boundaries
-        )
-        SELECT s.Contig_id,
-               s.seg_start AS First_position,
-               s.seg_end AS Last_position,
-               (SELECT MAX(r.Pident) / 100.0 FROM Contig_invertedRepeats r
-                WHERE r.Contig_id = s.Contig_id
-                  AND LEAST(r.Position1, r.Position2) <= s.seg_end
-                  AND GREATEST(r.Position1, r.Position2) >= s.seg_start) AS Value
-        FROM segments s
-        WHERE s.seg_end IS NOT NULL",
-        [],
-    )
-    .context("Failed to create Contig_inverted_repeat_identity view")?;
-
     // Contig_GCContent table - stores GC content (contig-level, sample-independent)
     // Value stored as INTEGER (0-100 percentage)
     conn.execute(
@@ -1128,6 +988,7 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
     )
     .context("Failed to create Contig_GCSkew table")?;
 
+    if has_bam {
     // Misassembly table - counts at ≥50% prevalence threshold
     conn.execute(
         "CREATE TABLE Misassembly (
@@ -1192,6 +1053,7 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
         [],
     )
     .context("Failed to create Topology table")?;
+    } // end if has_bam (Misassembly, Microdiversity, Side_misassembly, Topology)
 
     // No auto-increment ID needed
     conn.execute(
@@ -1243,19 +1105,6 @@ fn create_core_tables(conn: &Connection) -> Result<()> {
         [],
     )
     .context("Failed to create Annotated_types table")?;
-
-    // (Contig_id, Sample_id, Variable_id) is the natural key
-    conn.execute(
-        "CREATE TABLE Summary (
-            Contig_id INTEGER NOT NULL,
-            Sample_id INTEGER NOT NULL,
-            Variable_id INTEGER NOT NULL,
-            Row_count INTEGER NOT NULL,
-            PRIMARY KEY (Contig_id, Sample_id, Variable_id)
-        )",
-        [],
-    )
-    .context("Failed to create Summary table")?;
 
     // Constants table - stores metadata flags about database content
     // Pre-computed at database creation time (not per-request)
@@ -1690,85 +1539,116 @@ fn create_feature_table_if_needed(
     Ok(())
 }
 
-/// Create views after all data is inserted.
-fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<()> {
-    // Only create primary_reads VIEW if both underlying tables exist
-    let plus_table = "Feature_primary_reads_plus_only";
-    let minus_table = "Feature_primary_reads_minus_only";
-    if created_tables.contains(plus_table) && created_tables.contains(minus_table) {
-        // Create a VIEW that computes primary_reads as sum of plus and minus strands
-        // NOTE: The Bokeh server now bypasses this VIEW by computing in Python
-        // (merging Feature_primary_reads_plus_only + Feature_primary_reads_minus_only)
-        // to avoid OOM issues. This VIEW is kept for backward compatibility.
-        conn.execute(
-            "CREATE VIEW Feature_primary_reads AS
-         WITH
-         boundaries AS (
-             SELECT Contig_id, Sample_id, First_position AS pos
-             FROM Feature_primary_reads_plus_only
-             UNION
-             SELECT Contig_id, Sample_id, Last_position + 1
-             FROM Feature_primary_reads_plus_only
-             UNION
-             SELECT Contig_id, Sample_id, First_position
-             FROM Feature_primary_reads_minus_only
-             UNION
-             SELECT Contig_id, Sample_id, Last_position + 1
-             FROM Feature_primary_reads_minus_only
-         ),
-         segments AS (
-             SELECT
-                 Contig_id,
-                 Sample_id,
-                 pos AS First_position,
-                 LEAD(pos) OVER (
-                     PARTITION BY Contig_id, Sample_id
-                     ORDER BY pos
-                 ) - 1 AS Last_position
-             FROM boundaries
-         ),
-         summed AS (
-             SELECT
-                 s.Contig_id,
-                 s.Sample_id,
-                 s.First_position,
-                 s.Last_position,
-                 COALESCE(SUM(p.Value), 0) +
-                 COALESCE(SUM(m.Value), 0) AS Value
-             FROM segments s
-             LEFT JOIN Feature_primary_reads_plus_only p
-                 ON p.Contig_id = s.Contig_id
-                AND p.Sample_id = s.Sample_id
-                AND p.First_position <= s.First_position
-                AND p.Last_position >= s.Last_position
-             LEFT JOIN Feature_primary_reads_minus_only m
-                 ON m.Contig_id = s.Contig_id
-                AND m.Sample_id = s.Sample_id
-                AND m.First_position <= s.First_position
-                AND m.Last_position >= s.Last_position
-             WHERE s.Last_position >= s.First_position
-             GROUP BY
-                 s.Contig_id,
-                 s.Sample_id,
-                 s.First_position,
-                 s.Last_position
-         )
-         SELECT
-             ROW_NUMBER() OVER (
-                 ORDER BY Contig_id, Sample_id, First_position
-             ) AS Feature_id,
-             Contig_id,
-             Sample_id,
-             First_position,
-             Last_position,
-             Value
-         FROM summed
-         WHERE Value != 0",
-        [],
-        )
-        .context("Failed to create primary_reads VIEW")?;
-    }
+/// Create materialized tables and views after all data is inserted.
+fn create_views(conn: &Connection, has_bam: bool) -> Result<()> {
+    // Feature_primary_reads is now written directly as a table from Rust processing data
+    // (no longer reconstructed from plus+minus strands via SQL boundary sweep).
 
+    // Materialized repeat tables (sweep-line algorithm, computed once after all repeat data is inserted).
+    // These produce (Contig_id, First_position, Last_position, Value) like other Contig_* tables,
+    // allowing the standard binning logic in get_feature_data() to work with repeats.
+
+    conn.execute(
+        "CREATE TABLE Contig_direct_repeat_count AS
+        WITH boundaries AS (
+            SELECT Contig_id, LEAST(Position1, Position2) AS pos FROM Contig_directRepeats
+            UNION
+            SELECT Contig_id, GREATEST(Position1, Position2) + 1 AS pos FROM Contig_directRepeats
+        ),
+        segments AS (
+            SELECT Contig_id, pos AS seg_start,
+                   LEAD(pos) OVER (PARTITION BY Contig_id ORDER BY pos) - 1 AS seg_end
+            FROM boundaries
+        )
+        SELECT s.Contig_id,
+               s.seg_start AS First_position,
+               s.seg_end AS Last_position,
+               (SELECT COUNT(*) FROM Contig_directRepeats r
+                WHERE r.Contig_id = s.Contig_id
+                  AND LEAST(r.Position1, r.Position2) <= s.seg_end
+                  AND GREATEST(r.Position1, r.Position2) >= s.seg_start) AS Value
+        FROM segments s
+        WHERE s.seg_end IS NOT NULL",
+        [],
+    )
+    .context("Failed to create Contig_direct_repeat_count table")?;
+
+    conn.execute(
+        "CREATE TABLE Contig_inverted_repeat_count AS
+        WITH boundaries AS (
+            SELECT Contig_id, LEAST(Position1, Position2) AS pos FROM Contig_invertedRepeats
+            UNION
+            SELECT Contig_id, GREATEST(Position1, Position2) + 1 AS pos FROM Contig_invertedRepeats
+        ),
+        segments AS (
+            SELECT Contig_id, pos AS seg_start,
+                   LEAD(pos) OVER (PARTITION BY Contig_id ORDER BY pos) - 1 AS seg_end
+            FROM boundaries
+        )
+        SELECT s.Contig_id,
+               s.seg_start AS First_position,
+               s.seg_end AS Last_position,
+               (SELECT COUNT(*) FROM Contig_invertedRepeats r
+                WHERE r.Contig_id = s.Contig_id
+                  AND LEAST(r.Position1, r.Position2) <= s.seg_end
+                  AND GREATEST(r.Position1, r.Position2) >= s.seg_start) AS Value
+        FROM segments s
+        WHERE s.seg_end IS NOT NULL",
+        [],
+    )
+    .context("Failed to create Contig_inverted_repeat_count table")?;
+
+    conn.execute(
+        "CREATE TABLE Contig_direct_repeat_identity AS
+        WITH boundaries AS (
+            SELECT Contig_id, LEAST(Position1, Position2) AS pos FROM Contig_directRepeats
+            UNION
+            SELECT Contig_id, GREATEST(Position1, Position2) + 1 AS pos FROM Contig_directRepeats
+        ),
+        segments AS (
+            SELECT Contig_id, pos AS seg_start,
+                   LEAD(pos) OVER (PARTITION BY Contig_id ORDER BY pos) - 1 AS seg_end
+            FROM boundaries
+        )
+        SELECT s.Contig_id,
+               s.seg_start AS First_position,
+               s.seg_end AS Last_position,
+               COALESCE((SELECT MAX(r.Pident) / 100.0 FROM Contig_directRepeats r
+                WHERE r.Contig_id = s.Contig_id
+                  AND LEAST(r.Position1, r.Position2) <= s.seg_end
+                  AND GREATEST(r.Position1, r.Position2) >= s.seg_start), 0) AS Value
+        FROM segments s
+        WHERE s.seg_end IS NOT NULL",
+        [],
+    )
+    .context("Failed to create Contig_direct_repeat_identity table")?;
+
+    conn.execute(
+        "CREATE TABLE Contig_inverted_repeat_identity AS
+        WITH boundaries AS (
+            SELECT Contig_id, LEAST(Position1, Position2) AS pos FROM Contig_invertedRepeats
+            UNION
+            SELECT Contig_id, GREATEST(Position1, Position2) + 1 AS pos FROM Contig_invertedRepeats
+        ),
+        segments AS (
+            SELECT Contig_id, pos AS seg_start,
+                   LEAD(pos) OVER (PARTITION BY Contig_id ORDER BY pos) - 1 AS seg_end
+            FROM boundaries
+        )
+        SELECT s.Contig_id,
+               s.seg_start AS First_position,
+               s.seg_end AS Last_position,
+               COALESCE((SELECT MAX(r.Pident) / 100.0 FROM Contig_invertedRepeats r
+                WHERE r.Contig_id = s.Contig_id
+                  AND LEAST(r.Position1, r.Position2) <= s.seg_end
+                  AND GREATEST(r.Position1, r.Position2) >= s.seg_start), 0) AS Value
+        FROM segments s
+        WHERE s.seg_end IS NOT NULL",
+        [],
+    )
+    .context("Failed to create Contig_inverted_repeat_identity table")?;
+
+    if has_bam {
     // Explicit_coverage VIEW with RPKM and TPM
     conn.execute(
         "CREATE VIEW Explicit_coverage AS
@@ -1976,6 +1856,7 @@ fn create_views(conn: &Connection, created_tables: &HashSet<String>) -> Result<(
          JOIN Sample s ON m.Sample_id = s.Sample_id",
     )
     .context("Failed to create Explicit_phage_termini VIEW")?;
+    } // end if has_bam (Explicit_* views)
 
     Ok(())
 }
@@ -1993,19 +1874,7 @@ fn cleanup_unused_variables(conn: &Connection, created_tables: &HashSet<String>)
     for (var_name, table_name) in rows {
         // Skip special cases:
         // - direct_repeats/inverted_repeats/gc_content/gc_skew: data stored in Contig_* tables (always exist)
-        // - primary_reads: is a VIEW, not a table (depends on plus/minus tables)
         if var_name == "direct_repeat_count" || var_name == "inverted_repeat_count" || var_name == "direct_repeat_identity" || var_name == "inverted_repeat_identity" || var_name == "gc_content" || var_name == "gc_skew" {
-            continue;
-        }
-
-        // For primary_reads VIEW, check if the underlying tables exist
-        if var_name == "primary_reads" {
-            let plus_exists = created_tables.contains("Feature_primary_reads_plus_only");
-            let minus_exists = created_tables.contains("Feature_primary_reads_minus_only");
-            if !plus_exists || !minus_exists {
-                conn.execute("DELETE FROM Variable WHERE Variable_name = ?1", params![var_name])?;
-                deleted_count += 1;
-            }
             continue;
         }
 

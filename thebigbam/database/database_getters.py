@@ -198,6 +198,11 @@ def list_samples(db_path):
     """Print Sample_name values from Sample table."""
     conn = duckdb.connect(db_path, read_only=True)
     cur = conn.cursor()
+    cur.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Sample'")
+    if cur.fetchone() is None:
+        print("No samples in the database (genbank-only mode).")
+        conn.close()
+        return
     cur.execute("SELECT Sample_name FROM Sample ORDER BY Sample_name")
     rows = [r[0] for r in cur.fetchall()]
     if not rows:
@@ -234,6 +239,10 @@ CONTIG_INTERNAL_COLUMNS = {
 def list_sample_metadata(db_path):
     """Print user-added column names on the Sample table."""
     conn = duckdb.connect(db_path, read_only=True)
+    if conn.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Sample'").fetchone() is None:
+        conn.close()
+        print("No Sample table in database (genbank-only mode).")
+        return
     cols = [r[0] for r in conn.execute("DESCRIBE Sample").fetchall()]
     conn.close()
     user_cols = [c for c in cols if c not in SAMPLE_INTERNAL_COLUMNS]
@@ -263,6 +272,10 @@ def remove_sample_metadata(db_path, colname):
         print(f"Error: '{colname}' is a built-in column and cannot be removed.")
         return
     conn = duckdb.connect(db_path)
+    if conn.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'Sample'").fetchone() is None:
+        conn.close()
+        print("No Sample table in database (genbank-only mode).")
+        return
     cols = [r[0] for r in conn.execute("DESCRIBE Sample").fetchall()]
     if colname not in cols:
         conn.close()

@@ -362,7 +362,7 @@ def make_bokeh_subplot(feature_dict, height, x_range, sample_title=None, show_to
     p.toolbar.logo = None
     p.xgrid.visible = False
 
-    p.y_range.start = min(0, *(y for d in feature_dict for y in d["y"]))
+    p.y_range.start = min(0, *(y for d in feature_dict for y in d["y"] if y is not None))
     # Cap y-axis at 1 for relative-to-coverage features (values are ratios between 0 and 1)
     if all(d.get("is_relative_scaled", False) for d in feature_dict):
         p.y_range = Range1d(p.y_range.start, 1)
