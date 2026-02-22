@@ -250,6 +250,21 @@ def build_summary_data(conn, contig_name, sample_names):
 
     cur = conn.cursor()
 
+    # Check which Explicit_* views exist — clear column dicts for missing ones
+    view_col_map = [
+        ('Explicit_coverage', coverage_cols),
+        ('Explicit_misassembly', misassembly_cols),
+        ('Explicit_microdiversity', microdiversity_cols),
+        ('Explicit_side_misassembly', side_misassembly_cols),
+        ('Explicit_phage_mechanisms', phage_cols),
+        ('Explicit_topology', topology_cols),
+    ]
+    for view_name, col_dict in view_col_map:
+        try:
+            cur.execute(f"SELECT 1 FROM {view_name} LIMIT 0")
+        except Exception:
+            col_dict.clear()
+
     # Initialize data dict with Sample column
     data = {"Sample": list(sample_names)}
     n = len(sample_names)

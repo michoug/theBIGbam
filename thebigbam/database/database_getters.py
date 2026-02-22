@@ -61,6 +61,7 @@ def get_filtering_metadata(db_path: str) -> dict:
 
     # Text type names in DuckDB
     text_types = {'VARCHAR', 'TEXT', 'STRING'}
+    bool_types = {'BOOLEAN', 'BOOL'}
 
     result = {}
     for category, config in category_config.items():
@@ -79,11 +80,17 @@ def get_filtering_metadata(db_path: str) -> dict:
             if col_name in exclude:
                 continue
 
-            is_text = any(t in col_type.upper() for t in text_types)
+            is_bool = col_type.upper() in bool_types
+            is_text = is_bool or any(t in col_type.upper() for t in text_types)
             col_data = {'type': 'text' if is_text else 'numeric'}
 
+            # For boolean columns, expose as text with yes/no values
+            if is_bool:
+                col_data['distinct_values'] = ['yes', 'no']
+                col_data['is_bool'] = True
+
             # For text columns, get distinct values
-            if is_text:
+            elif is_text:
                 try:
                     distinct = conn.execute(
                         f"SELECT DISTINCT \"{col_name}\" FROM {source} WHERE \"{col_name}\" IS NOT NULL ORDER BY \"{col_name}\""

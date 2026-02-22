@@ -2,6 +2,7 @@ from pathlib import Path
 import subprocess
 import shutil
 import shlex
+import sys
 import tempfile
 import warnings
 from typing import Optional
@@ -71,6 +72,54 @@ def run_mapping_per_sample(args):
         minimap2_params=minimap2_params,
         bwa_params=bwa_params,
     ) or 0
+
+def _get_version() -> str:
+    """Get theBIGbam version from pyproject.toml or fallback."""
+    try:
+        from importlib.metadata import version
+        return version("thebigbam")
+    except Exception:
+        return "unknown"
+
+
+def _inject_bam_headers(bam_path: Path, circular: bool, threads: int, command_line: str) -> None:
+    """Inject @PG and @CO headers into a BAM file using samtools reheader."""
+    version = _get_version()
+
+    # Read existing header
+    result = subprocess.run(
+        ["samtools", "view", "-H", str(bam_path)],
+        capture_output=True, text=True, check=True,
+    )
+    header_lines = result.stdout.rstrip("\n").split("\n")
+
+    # Append @PG and @CO lines
+    pg_line = f"@PG\tID:theBIGbam\tPN:theBIGbam\tVN:{version}\tCL:{command_line}"
+    circular_str = "true" if circular else "false"
+    co_line = f"@CO\ttheBIGbam:circular={circular_str}"
+
+    header_lines.append(pg_line)
+    header_lines.append(co_line)
+    new_header = "\n".join(header_lines) + "\n"
+
+    # Write new header to temp file, reheader to temp BAM, then replace original
+    header_file = Path(tempfile.mkstemp(suffix=".sam", prefix="header_")[1])
+    reheadered_bam = Path(tempfile.mkstemp(suffix=".bam", prefix="reheader_")[1])
+    try:
+        header_file.write_text(new_header)
+        with reheadered_bam.open("wb") as out:
+            subprocess.run(
+                ["samtools", "reheader", str(header_file), str(bam_path)],
+                stdout=out, check=True,
+            )
+        shutil.move(str(reheadered_bam), str(bam_path))
+    finally:
+        for f in (header_file, reheadered_bam):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
 
 def map_with_mapper(threads: int, assembly_file: Path, mapper: str, read1: Optional[Path],
                       read2: Optional[Path], output_file: Path, circular: bool = False,
@@ -182,6 +231,22 @@ def map_with_mapper(threads: int, assembly_file: Path, mapper: str, read1: Optio
             )
 
         # Index final BAM
+        subprocess.run(["samtools", "index", "-@", str(threads), str(output_file)], check=True)
+
+        # Inject @PG and @CO metadata headers
+        cmd_parts = [mapper, str(assembly)]
+        if read1:
+            cmd_parts.extend(["-r1", str(read1)])
+        if read2:
+            cmd_parts.extend(["-r2", str(read2)])
+        if interleaved:
+            cmd_parts.extend(["--interleaved", str(interleaved)])
+        if circular:
+            cmd_parts.append("--circular")
+        command_line = "thebigbam mapping-per-sample " + " ".join(cmd_parts)
+        _inject_bam_headers(output_file, circular, threads, command_line)
+
+        # Re-index after header rewrite
         subprocess.run(["samtools", "index", "-@", str(threads), str(output_file)], check=True)
 
     finally:

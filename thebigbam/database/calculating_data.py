@@ -12,7 +12,7 @@ except ImportError:
     _rust = None
 
 
-def calculating_all_features_parallel(list_modules, bam_files, output_db, min_aligned_fraction, min_coverage_depth, curve_ratio, bar_ratio, contig_variation_percentage=0.1, circular=False, n_sample_cores=None, sequencing_type=None, genbank_path=None, assembly_path=None):
+def calculating_all_features_parallel(list_modules, bam_files, output_db, min_aligned_fraction, min_coverage_depth, curve_ratio, bar_ratio, contig_variation_percentage=0.1, n_sample_cores=None, sequencing_type=None, genbank_path=None, assembly_path=None):
     """Process all BAM files in parallel using Rust bindings."""
     if not HAS_RUST:
         sys.exit("ERROR: Rust bindings (thebigbam_rs) are required but not available. Please install them first.")
@@ -35,7 +35,6 @@ def calculating_all_features_parallel(list_modules, bam_files, output_db, min_al
             curve_ratio=float(curve_ratio),
             bar_ratio=float(bar_ratio),
             contig_variation_percentage=float(contig_variation_percentage),
-            circular=circular,
             create_indexes=True,
             assembly_path=assembly_path if assembly_path else "",
         )
@@ -53,7 +52,6 @@ def add_calculate_args(parser):
     parser.add_argument('-t', '--threads', type=int, default=4, help='Number of threads available (default: 4)')
     parser.add_argument("-g", "--genbank", help="Path to annotation file: GenBank (.gbk, .gbff) or GFF3 (.gff) format. Required if no BAM files provided.")
     parser.add_argument("-b", "--bam_files", help="Path to bam file or directory containing mapping files (BAM format). Optional if genbank is provided.")
-    parser.add_argument("--circular", action="store_true", help="Set if assembly was doubled during mapping (enables modulo logic)")
     parser.add_argument("-o", "--output", required=True, help="Output database file path (.db)")
     parser.add_argument("-m", "--modules", required=False, default=None, help="List of modules to compute (comma-separated). If not provided, all modules are computed. Options: Coverage, Misalignment, Long-reads, Paired-reads, Phage termini")
     parser.add_argument("-a", "--assembly", help="Path to assembly FASTA file (only needed for autoblast when genbank lacks sequence data)")
@@ -108,7 +106,6 @@ def run_calculate_args(args):
     variation_percentage = args.variation_percentage
     coverage_percentage = args.coverage_percentage
     contig_variation_percentage = args.contig_variation_percentage
-    circular = args.circular
     n_cores = int(args.threads)
 
     output_db = args.output
@@ -130,7 +127,7 @@ def run_calculate_args(args):
     print("\nCalculating values for all requested features from mapping files...", flush=True)
     calculating_all_features_parallel(
         requested_modules, bam_files, output_db, min_aligned_fraction, min_coverage_depth, variation_percentage, coverage_percentage,
-        contig_variation_percentage=contig_variation_percentage, circular=circular, n_sample_cores=n_cores,
+        contig_variation_percentage=contig_variation_percentage, n_sample_cores=n_cores,
         sequencing_type=args.sequencing_type, genbank_path=genbank_path,
         assembly_path=assembly_path,
     )

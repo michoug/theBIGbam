@@ -69,7 +69,6 @@ mod python {
     ///     min_aligned_fraction: Minimum alignment-length coverage fraction for contig inclusion (default 50.0)
     ///     min_coverage_depth: Minimum mean coverage depth for contig inclusion (default 0.0 = disabled)
     ///     compress_ratio: Compression ratio threshold (default 10.0)
-    ///     circular: Whether the genome is circular (default False)
     ///     create_indexes: Whether to create database indexes (default True)
     ///     assembly_path: Path to assembly FASTA file for autoblast (default "")
     ///
@@ -79,7 +78,7 @@ mod python {
     ///         - "samples_failed": int
     ///         - "total_time": float (seconds)
     #[pyfunction]
-    #[pyo3(signature = (genbank_path, bam_files, output_db, modules, threads, sequencing_type=None, min_aligned_fraction=50.0, min_coverage_depth=0.0, curve_ratio=10.0, bar_ratio=10.0, contig_variation_percentage=10.0, circular=false, create_indexes=true, assembly_path=""))]
+    #[pyo3(signature = (genbank_path, bam_files, output_db, modules, threads, sequencing_type=None, min_aligned_fraction=50.0, min_coverage_depth=0.0, curve_ratio=10.0, bar_ratio=10.0, contig_variation_percentage=10.0, create_indexes=true, assembly_path=""))]
     fn process_all_samples<'py>(
         py: Python<'py>,
         genbank_path: &str,
@@ -93,7 +92,6 @@ mod python {
         curve_ratio: f64,
         bar_ratio: f64,
         contig_variation_percentage: f64,
-        circular: bool,
         create_indexes: bool,
         assembly_path: &str,
     ) -> PyResult<Bound<'py, PyDict>> {
@@ -112,7 +110,6 @@ mod python {
             curve_ratio,
             bar_ratio,
             contig_variation_percentage,
-            circular,
             sequencing_type: seq_type,
             phagetermini_config: PhageTerminiConfig::default(),
             gc_params: GCParams::default(),

@@ -316,7 +316,11 @@ def create_layout(db_path):
 
             # Coerce value type to match column type (prevents DuckDB implicit cast errors)
             col_type = col_info.get('type', 'numeric')
-            if col_type == 'text' and not isinstance(value, str):
+            is_bool = col_info.get('is_bool', False)
+            if is_bool:
+                # Convert yes/no back to boolean for SQL
+                value = value.lower() == 'yes' if isinstance(value, str) else bool(value)
+            elif col_type == 'text' and not isinstance(value, str):
                 value = str(value)
             elif col_type == 'numeric' and isinstance(value, str):
                 try:

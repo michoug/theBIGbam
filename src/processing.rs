@@ -14,6 +14,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use rust_htslib::bam::{IndexedReader, Read as BamRead};
 use rust_htslib::htslib;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,8 +53,6 @@ pub struct ProcessConfig {
     pub bar_ratio: f64,
     /// RLE compression tolerance for contig-level features like GC content (default 0.1%)
     pub contig_variation_percentage: f64,
-    /// Circular genome flag: if true, assembly was doubled during mapping (enables modulo logic)
-    pub circular: bool,
     /// Sequencing type: if None, auto-detect per sample; if Some, use for all samples
     pub sequencing_type: Option<SequencingType>,
     /// Phage termini detection configuration
@@ -130,52 +129,70 @@ fn check_missing_md_tags(bam: &mut IndexedReader) -> bool {
     checked > 0 && missing_md == checked
 }
 
-/// Check for circularity mismatch between BAM and GenBank/FASTA.
-/// Returns Some(warning_message) if mismatch detected, None otherwise.
-fn check_circularity_mismatch(
+/// Detect whether a sample BAM was mapped circularly (doubled assembly).
+///
+/// Detection strategy:
+/// 1. Check BAM `@CO` header for `theBIGbam:circular=true/false` (written by mapping-per-sample)
+/// 2. Compare BAM contig lengths vs FASTA contig lengths (2× = circular, 1× = linear)
+/// 3. If ambiguous, return an error
+fn detect_sample_circularity(
     bam: &IndexedReader,
     contigs: &[ContigInfo],
-    circular: bool,
     sample_name: &str,
-) -> Option<String> {
+) -> Result<bool> {
     let header = bam.header();
 
-    // Check first contig only to avoid spam
-    if header.target_count() == 0 {
-        return None;
+    // 1. Check @CO header for theBIGbam:circular=true/false
+    let header_text = String::from_utf8_lossy(header.as_bytes());
+    for line in header_text.lines() {
+        if let Some(rest) = line.strip_prefix("@CO\t") {
+            if let Some(val) = rest.strip_prefix("theBIGbam:circular=") {
+                match val.trim() {
+                    "true" => {
+                        eprintln!("  Sample '{}': circular=true (from BAM header)", sample_name);
+                        return Ok(true);
+                    }
+                    "false" => {
+                        eprintln!("  Sample '{}': circular=false (from BAM header)", sample_name);
+                        return Ok(false);
+                    }
+                    _ => {} // unrecognized value, fall through to length check
+                }
+            }
+        }
     }
 
-    let ref_name = match std::str::from_utf8(header.tid2name(0)) {
-        Ok(s) => s,
-        Err(_) => return None,
-    };
+    // 2. Compare BAM contig lengths vs FASTA contig lengths
+    if header.target_count() == 0 {
+        return Ok(false);
+    }
+
+    let ref_name = std::str::from_utf8(header.tid2name(0))
+        .context("Invalid UTF-8 in BAM reference name")?;
     let bam_length = header.target_len(0).unwrap_or(0) as usize;
 
-    // Find matching contig in GenBank/FASTA
-    let contig_info = contigs.iter().find(|c| c.name == ref_name)?;
-    let genbank_length = contig_info.length;
-
-    if circular {
-        // --circular used: expect bam_length = 2 * genbank_length
-        if bam_length == genbank_length {
-            return Some(format!(
-                "Warning: in sample '{}', BAM references are the same size as the FASTA contigs, \
-                 you likely did a normal mapping and should not use the --circular flag",
-                sample_name
-            ));
-        }
-    } else {
-        // --circular NOT used: expect bam_length = genbank_length
-        if bam_length == genbank_length * 2 {
-            return Some(format!(
-                "Warning: in sample '{}', BAM references are twice the size of FASTA contigs, \
-                 you likely did a circular mapping and should use the --circular flag",
-                sample_name
+    // Find matching contig in GenBank/FASTA list
+    if let Some(contig_info) = contigs.iter().find(|c| c.name == ref_name) {
+        let fasta_length = contig_info.length;
+        if bam_length == fasta_length * 2 {
+            eprintln!("  Sample '{}': circular=true (BAM contigs are 2× FASTA length)", sample_name);
+            return Ok(true);
+        } else if bam_length == fasta_length {
+            eprintln!("  Sample '{}': circular=false (BAM contigs match FASTA length)", sample_name);
+            return Ok(false);
+        } else {
+            return Err(anyhow::anyhow!(
+                "Sample '{}': ambiguous circularity — BAM contig '{}' length {} \
+                 does not match FASTA length {} or 2× FASTA length {}. \
+                 Use theBIGbam mapping-per-sample to produce BAMs with circularity metadata.",
+                sample_name, ref_name, bam_length, fasta_length, fasta_length * 2
             ));
         }
     }
 
-    None
+    // No matching contig in FASTA (BAM-only mode) — assume linear
+    eprintln!("  Sample '{}': circular=false (no FASTA reference to compare)", sample_name);
+    Ok(false)
 }
 
 /// Strict upfront validation of all inputs.
@@ -284,13 +301,35 @@ fn validate_inputs(
     Ok(())
 }
 
-/// Run circularity mismatch warnings (advisory only, not blocking).
-/// Called after annotation parsing since it needs contig info.
-fn warn_circularity_mismatches(
+/// Quick scan of @CO headers only (no logging). Used for BAM-only contig extraction
+/// before the full detection runs.
+fn quick_co_header_scan(bam_files: &[PathBuf]) -> Result<HashMap<PathBuf, bool>> {
+    let mut result = HashMap::new();
+    for bam_path in bam_files {
+        let bam = IndexedReader::from_path(bam_path)
+            .with_context(|| format!("Failed to open BAM: {}", bam_path.display()))?;
+        let header_text = String::from_utf8_lossy(bam.header().as_bytes());
+        let mut circular = false;
+        for line in header_text.lines() {
+            if let Some(rest) = line.strip_prefix("@CO\t") {
+                if let Some(val) = rest.strip_prefix("theBIGbam:circular=") {
+                    circular = val.trim() == "true";
+                    break;
+                }
+            }
+        }
+        result.insert(bam_path.clone(), circular);
+    }
+    Ok(result)
+}
+
+/// Detect circularity for all samples upfront. Returns a map of BAM path → is_circular.
+fn detect_all_sample_circularities(
     bam_files: &[PathBuf],
     contigs: &[ContigInfo],
-    circular: bool,
-) {
+) -> Result<HashMap<PathBuf, bool>> {
+    eprintln!("\n### Auto-detecting circularity per sample...");
+    let mut result = HashMap::new();
     for bam_path in bam_files {
         let sample_name = bam_path
             .file_stem()
@@ -298,15 +337,13 @@ fn warn_circularity_mismatches(
             .to_string_lossy()
             .replace("_with_MD", "");
 
-        let bam = match IndexedReader::from_path(bam_path) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
+        let bam = IndexedReader::from_path(bam_path)
+            .with_context(|| format!("Failed to open BAM for circularity detection: {}", bam_path.display()))?;
 
-        if let Some(warning) = check_circularity_mismatch(&bam, contigs, circular, &sample_name) {
-            eprintln!("{}", warning);
-        }
+        let is_circular = detect_sample_circularity(&bam, contigs, &sample_name)?;
+        result.insert(bam_path.clone(), is_circular);
     }
+    Ok(result)
 }
 
 /// Merge sequences from a FASTA file into existing contig info.
@@ -497,6 +534,7 @@ fn add_features_from_arrays(
     contig_name: &str,
     contig_length: usize,
     config: &ProcessConfig,
+    is_circular: bool,
     seq_type: SequencingType,
     flags: ModuleFlags,
     primary_count: u64,
@@ -560,7 +598,7 @@ fn add_features_from_arrays(
         
         // Secondary reads (self-referential curve)
         // When circular=true, subtract primary coverage to remove artifact secondary alignments from doubled assembly
-        let secondary_reads_f64: Vec<f64> = if config.circular {
+        let secondary_reads_f64: Vec<f64> = if is_circular {
             arrays.secondary_reads.iter()
                 .zip(&arrays.primary_reads)
                 .map(|(&sec, &cov)| if sec > cov { (sec - cov) as f64 } else { 0.0 })
@@ -905,7 +943,7 @@ fn add_features_from_arrays(
                 clipped_ratio,
                 &pt_config,
                 contig_length,
-                config.circular,
+                is_circular,
                 &dtr_regions,
             );
 
@@ -922,7 +960,7 @@ fn add_features_from_arrays(
                 &start_areas,
                 &end_areas,
                 contig_length,
-                config.circular,
+                is_circular,
                 &dtr_regions,
             );
 
@@ -985,9 +1023,10 @@ pub fn process_sample(
     contigs: &[ContigInfo],
     modules: &[String],
     config: &ProcessConfig,
+    is_circular: bool,
     repeats: &[RepeatsData],
     annotations: &[crate::types::FeatureAnnotation],
-) -> Result<(Vec<FeaturePoint>, Vec<PresenceData>, Vec<PackagingData>, Vec<MisassemblyData>, Vec<MicrodiversityData>, Vec<SideMisassemblyData>, Vec<TopologyData>, String, SequencingType, u64, u64)> {
+) -> Result<(Vec<FeaturePoint>, Vec<PresenceData>, Vec<PackagingData>, Vec<MisassemblyData>, Vec<MicrodiversityData>, Vec<SideMisassemblyData>, Vec<TopologyData>, String, SequencingType, u64, u64, bool)> {
     let sample_name = bam_path
         .file_stem()
         .unwrap_or_default()
@@ -1026,7 +1065,7 @@ pub fn process_sample(
             // Extract header info before mutable borrow
             let ref_name = std::str::from_utf8(bam.header().tid2name(tid)).ok()?.to_string();
             let bam_length = bam.header().target_len(tid).unwrap_or(0) as usize;
-            let ref_length = if config.circular { bam_length / 2 } else { bam_length };
+            let ref_length = if is_circular { bam_length / 2 } else { bam_length };
 
             // Skip if contig not in GenBank list
             let contig_info = contigs.iter().find(|c| c.name == ref_name);
@@ -1046,7 +1085,7 @@ pub fn process_sample(
 
             // Process contig using streaming - single pass over reads
             // Early coverage check happens inside process_contig_streaming
-            let (mut arrays, coverage_pct, primary_count) = match process_contig_streaming(&mut bam, &ref_name, ref_length, seq_type, flags, config.circular, config.min_aligned_fraction, config.phagetermini_config.min_clipping_length) {
+            let (mut arrays, coverage_pct, primary_count) = match process_contig_streaming(&mut bam, &ref_name, ref_length, seq_type, flags, is_circular, config.min_aligned_fraction, config.phagetermini_config.min_clipping_length) {
                 Ok(Some(result)) => result,
                 Ok(None) => return None,
                 Err(e) => {
@@ -1065,7 +1104,7 @@ pub fn process_sample(
 
             // Calculate features for this contig
             let mut features = Vec::new();
-            let (packaging_info, metrics_info) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, seq_type, flags, primary_count, repeats, cds_index.as_ref(), &mut features);
+            let (packaging_info, metrics_info) = add_features_from_arrays(&mut arrays, &ref_name, ref_length, config, is_circular, seq_type, flags, primary_count, repeats, cds_index.as_ref(), &mut features);
             let coverage_median = arrays.coverage_median() as f32;
             let coverage_trimmed_mean = arrays.coverage_trimmed_mean(0.05) as f32;
 
@@ -1147,36 +1186,36 @@ pub fn process_sample(
         }
     }
 
-    Ok((all_features, all_presences, all_packaging, all_misassembly, all_microdiversity, all_side_misassembly, all_topology, sample_name, seq_type, total_reads, mapped_reads))
+    Ok((all_features, all_presences, all_packaging, all_misassembly, all_microdiversity, all_side_misassembly, all_topology, sample_name, seq_type, total_reads, mapped_reads, is_circular))
 }
 
 /// Extract contig information from BAM file headers.
 /// Deduplicates contigs across all BAM files.
-fn extract_contigs_from_bams(bam_files: &[PathBuf], circular: bool) -> Result<Vec<ContigInfo>> {
-    use std::collections::HashMap;
-    
+/// Uses per-sample circularity map: circular BAMs have doubled contig lengths.
+fn extract_contigs_from_bams(bam_files: &[PathBuf], circularity_map: &HashMap<PathBuf, bool>) -> Result<Vec<ContigInfo>> {
     let mut contig_map: HashMap<String, usize> = HashMap::new();
-    
+
     // Scan all BAM files to collect unique contigs
     for bam_path in bam_files {
+        let circular = circularity_map.get(bam_path).copied().unwrap_or(false);
         let bam = IndexedReader::from_path(bam_path)
             .with_context(|| format!("Failed to open BAM file: {}", bam_path.display()))?;
         let header = bam.header();
-        
+
         for tid in 0..header.target_count() {
             let ref_name = std::str::from_utf8(header.tid2name(tid))
                 .context("Invalid UTF-8 in reference name")?
                 .to_string();
             let bam_length = header.target_len(tid).unwrap_or(0) as usize;
-            
+
             // For circular genomes, BAM length is doubled, so actual length is half
             let actual_length = if circular { bam_length / 2 } else { bam_length };
-            
+
             // Use the contig if not seen, or verify length matches
             contig_map.entry(ref_name.clone())
                 .and_modify(|existing_len| {
                     if *existing_len != actual_length {
-                        eprintln!("Warning: Contig '{}' has different lengths across BAM files ({} vs {})", 
+                        eprintln!("Warning: Contig '{}' has different lengths across BAM files ({} vs {})",
                                   ref_name, *existing_len, actual_length);
                     }
                 })
@@ -1226,9 +1265,20 @@ pub fn run_all_samples(
 
     // 2. Parse annotations (GenBank/GFF3) or extract contigs from BAMs
     eprintln!("\n### Parsing input files...");
-    let (mut contigs, mut annotations) = if genbank_path.as_os_str().is_empty() {
+
+    let has_genbank = !genbank_path.as_os_str().is_empty();
+
+    // For BAM-only mode, do a quiet @CO-only scan for contig extraction (no log messages).
+    // The full detection with logging happens once at step 5 below.
+    let preliminary_map = if !bam_files.is_empty() && !has_genbank {
+        quick_co_header_scan(bam_files)?
+    } else {
+        HashMap::new()
+    };
+
+    let (mut contigs, mut annotations) = if !has_genbank {
         eprintln!("No GenBank file provided - extracting contigs from BAM headers");
-        let contigs = extract_contigs_from_bams(bam_files, config.circular)?;
+        let contigs = extract_contigs_from_bams(bam_files, &preliminary_map)?;
         eprintln!("Found {} contigs from BAM files", contigs.len());
         (contigs, Vec::new())
     } else {
@@ -1262,10 +1312,12 @@ pub fn run_all_samples(
     // 4. Create database, write annotations
     let db_writer = DbWriter::create(output_db, &contigs, &annotations, !bam_files.is_empty())?;
 
-    // 5. Circularity mismatch warnings (advisory, uses contigs + BAM headers)
-    if !bam_files.is_empty() {
-        warn_circularity_mismatches(bam_files, &contigs, config.circular);
-    }
+    // 5. Auto-detect circularity per sample (now with contigs available for length comparison)
+    let circularity_map = if !bam_files.is_empty() {
+        detect_all_sample_circularities(bam_files, &contigs)?
+    } else {
+        HashMap::new()
+    };
 
     // 6. If sequences available, run autoblast with rayon
     let has_sequences = contigs.iter().any(|c| c.sequence.is_some());
@@ -1324,7 +1376,7 @@ pub fn run_all_samples(
     eprintln!("\n### Processing {} samples with {} threads", bam_files.len(), config.threads);
     eprintln!("Modules: {}\n", modules.join(", "));
 
-    let result = process_samples_parallel(&bam_files, &contigs, modules, config, db_writer, &repeats, &annotations)?;
+    let result = process_samples_parallel(&bam_files, &contigs, modules, config, &circularity_map, db_writer, &repeats, &annotations)?;
 
     print_summary(&result, output_db);
 
@@ -1337,6 +1389,7 @@ struct SampleResult {
     sequencing_type: SequencingType,
     total_reads: u64,
     mapped_reads: u64,
+    is_circular: bool,
     features: Vec<FeaturePoint>,
     presences: Vec<PresenceData>,
     packaging: Vec<PackagingData>,
@@ -1351,6 +1404,7 @@ fn process_samples_parallel(
     contigs: &[ContigInfo],
     modules: &[String],
     config: &ProcessConfig,
+    circularity_map: &HashMap<PathBuf, bool>,
     db_writer: DbWriter,
     repeats: &[RepeatsData],
     annotations: &[crate::types::FeatureAnnotation],
@@ -1365,7 +1419,7 @@ fn process_samples_parallel(
     //
     // Sequential mode only for single-threaded operation
     if config.threads == 1 {
-        return process_samples_sequential(bam_files, contigs, modules, config, db_writer, is_tty, repeats, annotations);
+        return process_samples_sequential(bam_files, contigs, modules, config, circularity_map, db_writer, is_tty, repeats, annotations);
     }
 
     // Adaptive channel size based on memory pressure from contig count
@@ -1422,7 +1476,6 @@ fn process_samples_parallel(
     let write_pb_clone = write_pb.clone();
     let is_tty_writer = is_tty;
     let total_writer = total;
-    let circular = config.circular;
 
     // Spawn dedicated writer thread
     let writer_handle = thread::spawn(move || -> Result<(usize, std::time::Duration)> {
@@ -1434,7 +1487,7 @@ fn process_samples_parallel(
             written_count += 1;
 
             // Insert sample
-            if let Err(e) = db_writer.insert_sample(&result.sample_name, result.sequencing_type.as_str(), result.total_reads, result.mapped_reads) {
+            if let Err(e) = db_writer.insert_sample(&result.sample_name, result.sequencing_type.as_str(), result.total_reads, result.mapped_reads, result.is_circular) {
                 eprintln!("\nError inserting sample {}: {}", result.sample_name, e);
                 let msg = format!("ERR: {}", result.sample_name);
                 write_pb_clone.set_message(msg.clone());
@@ -1455,7 +1508,7 @@ fn process_samples_parallel(
                 &result.side_misassembly,
                 &result.topology,
                 &result.features,
-                circular,
+                result.is_circular,
             ) {
                 eprintln!("\nError writing data for {}: {}", result.sample_name, e);
                 let msg = format!("ERR: {}", result.sample_name);
@@ -1484,8 +1537,9 @@ fn process_samples_parallel(
     bam_files.par_iter().for_each(|bam_path| {
         let sample_start = std::time::Instant::now();
 
-        match process_sample(bam_path, contigs, modules, config, repeats, annotations) {
-            Ok((features, presences, packaging, misassembly, microdiversity, side_misassembly, topology, sample_name, sequencing_type, total_reads, mapped_reads)) => {
+        let sample_circular = circularity_map.get(bam_path).copied().unwrap_or(false);
+        match process_sample(bam_path, contigs, modules, config, sample_circular, repeats, annotations) {
+            Ok((features, presences, packaging, misassembly, microdiversity, side_misassembly, topology, sample_name, sequencing_type, total_reads, mapped_reads, is_circular)) => {
                 let sample_time = sample_start.elapsed().as_secs_f64();
                 completed_count.fetch_add(1, Ordering::SeqCst);
                 let msg = format!("{} ({:.2}s)", sample_name, sample_time);
@@ -1501,6 +1555,7 @@ fn process_samples_parallel(
                     sequencing_type,
                     total_reads,
                     mapped_reads,
+                    is_circular,
                     features,
                     presences,
                     packaging,
@@ -1558,6 +1613,7 @@ fn process_samples_sequential(
     contigs: &[ContigInfo],
     modules: &[String],
     config: &ProcessConfig,
+    circularity_map: &HashMap<PathBuf, bool>,
     db_writer: DbWriter,
     is_tty: bool,
     repeats: &[RepeatsData],
@@ -1589,15 +1645,16 @@ fn process_samples_sequential(
     for bam_path in bam_files {
         let sample_start = std::time::Instant::now();
 
-        match process_sample(bam_path, contigs, modules, config, repeats, annotations) {
-            Ok((features, presences, packaging, misassembly, microdiversity, side_misassembly, topology, sample_name, sequencing_type, total_reads, mapped_reads)) => {
+        let sample_circular = circularity_map.get(bam_path).copied().unwrap_or(false);
+        match process_sample(bam_path, contigs, modules, config, sample_circular, repeats, annotations) {
+            Ok((features, presences, packaging, misassembly, microdiversity, side_misassembly, topology, sample_name, sequencing_type, total_reads, mapped_reads, is_circular)) => {
                 let process_elapsed = sample_start.elapsed();
                 processing_time_total += process_elapsed;
 
                 let write_start = std::time::Instant::now();
 
                 // Insert sample
-                if let Err(e) = db_writer.insert_sample(&sample_name, sequencing_type.as_str(), total_reads, mapped_reads) {
+                if let Err(e) = db_writer.insert_sample(&sample_name, sequencing_type.as_str(), total_reads, mapped_reads, is_circular) {
                     eprintln!("\nError inserting sample {}: {}", sample_name, e);
                     failed += 1;
                     pb.inc(1);
@@ -1614,7 +1671,7 @@ fn process_samples_sequential(
                     &side_misassembly,
                     &topology,
                     &features,
-                    config.circular,
+                    is_circular,
                 ) {
                     eprintln!("\nError writing data for {}: {}", sample_name, e);
                     failed += 1;

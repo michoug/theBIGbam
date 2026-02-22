@@ -86,7 +86,7 @@ impl DbWriter {
     }
 
     /// Insert a sample and return its ID.
-    pub fn insert_sample(&self, sample_name: &str, sequencing_type: &str, total_reads: u64, mapped_reads: u64) -> Result<i64> {
+    pub fn insert_sample(&self, sample_name: &str, sequencing_type: &str, total_reads: u64, mapped_reads: u64, circular_mapping: bool) -> Result<i64> {
         // Get next sample ID
         let sample_id = {
             let mut next_id = self.next_sample_id.lock().unwrap();
@@ -97,8 +97,8 @@ impl DbWriter {
 
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO Sample (Sample_id, Sample_name, Sequencing_type, Number_of_reads, Number_of_mapped_reads) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![sample_id, sample_name, sequencing_type, total_reads as i64, mapped_reads as i64],
+            "INSERT INTO Sample (Sample_id, Sample_name, Sequencing_type, Number_of_reads, Number_of_mapped_reads, Circular_mapping) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![sample_id, sample_name, sequencing_type, total_reads as i64, mapped_reads as i64, circular_mapping],
         )?;
         drop(conn);
 
@@ -735,6 +735,11 @@ impl DbWriter {
         // Delete Variable entries for features without tables
         cleanup_unused_variables(&conn, &created_tables)?;
 
+        // Drop empty module tables and their views (prevents empty UI sections)
+        if self.has_bam {
+            drop_empty_tables(&conn)?;
+        }
+
         // Force checkpoint to compress data and write to disk
         conn.execute("CHECKPOINT", [])
             .context("Failed to checkpoint database")?;
@@ -860,7 +865,8 @@ fn create_core_tables(conn: &Connection, has_bam: bool) -> Result<()> {
             Sample_name TEXT UNIQUE,
             Sequencing_type TEXT,
             Number_of_reads INTEGER,
-            Number_of_mapped_reads INTEGER
+            Number_of_mapped_reads INTEGER,
+            Circular_mapping BOOLEAN
         )",
         [],
     )
@@ -1887,6 +1893,33 @@ fn cleanup_unused_variables(conn: &Connection, created_tables: &HashSet<String>)
 
     if deleted_count > 0 {
         eprintln!("Removed {} unused variable entries from database", deleted_count);
+    }
+
+    Ok(())
+}
+
+/// Drop empty module-dependent tables and their views.
+/// Prevents empty sections in the Filtering/Summary UI when modules weren't calculated.
+fn drop_empty_tables(conn: &Connection) -> Result<()> {
+    let table_view_map: &[(&str, &[&str])] = &[
+        ("Misassembly", &["Explicit_misassembly"]),
+        ("Microdiversity", &["Explicit_microdiversity"]),
+        ("Side_misassembly", &["Explicit_side_misassembly"]),
+        ("Topology", &["Explicit_topology"]),
+        ("PhageTermini", &["Explicit_phage_termini"]),
+        ("PhageMechanisms", &["Explicit_phage_mechanisms"]),
+    ];
+
+    for (table, views) in table_view_map {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| row.get(0))
+            .unwrap_or(0);
+        if count == 0 {
+            for view in *views {
+                conn.execute(&format!("DROP VIEW IF EXISTS {}", view), [])?;
+            }
+            conn.execute(&format!("DROP TABLE IF EXISTS {}", table), [])?;
+        }
     }
 
     Ok(())
