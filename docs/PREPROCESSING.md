@@ -18,7 +18,16 @@ This means reads that cross the origin of a circular genome will have their alig
 
 **Compatibility warning:** although this encoding is SAM-spec-compliant, most downstream tools (IGV, samtools depth, variant callers, etc.) do not yet implement circular coordinate handling. Programs that are unaware of this part of the specification will likely produce incorrect results for reads wrapping around the origin. Verify that your downstream tool explicitly supports circular genomes before relying on the output outside of theBIGbam.
 
-**MAPQ caveat:** in circular mode the mapper sees two equally good alignments for every read (one per copy of the doubled reference), which can cause it to assign lower MAPQ scores than the same read would receive against a single-copy reference. The ghost secondary removal step corrects the read count but cannot recover the original MAPQ without reimplementing the mapper's scoring algorithm. MAPQ-based filtering thresholds may therefore need to be relaxed when working with circular-mode BAMs.
+**MAPQ caveat:** in circular mode the mapper sees the doubled reference as two distinct loci, so every read produces at least one ghost alignment that competes with the real one. The mapper therefore assigns lower MAPQ scores than the same read would receive against a single-copy reference, because MAPQ quantifies the confidence that the *reported* alignment is the only good one — and in a doubled reference there are always at least two.
+
+The circular-BAM conversion step removes these ghost secondary and supplementary alignments, restoring the correct read count. For reads whose *only* competing alignments were ghosts (i.e. after removal they have no remaining secondary or supplementary records), the conversion sets MAPQ to 60, which is the conventional value for a uniquely mapping read. Reads that retain legitimate secondary or supplementary alignments after ghost removal keep their original MAPQ unchanged.
+
+Full MAPQ recalculation is not possible because both minimap2 and bwa-mem2 derive MAPQ from internal values that are never written to BAM output:
+
+- **minimap2** uses chaining scores (*f*₁, *f*₂) and anchor counts to compute MAPQ; these are discarded after alignment.
+- **bwa-mem2** uses chaining scores, seed coverage, and the repetitive fraction (*frac_rep*); these are likewise internal only.
+
+Without access to those intermediate values, no post-hoc tool can faithfully reproduce the mapper's MAPQ formula. Setting MAPQ=60 for de-ghosted unique mappers is the most accurate correction available.
 
 Another feature of this mapping process is the computation of MD tags using samtools. MD tags are useful to quickly identify mismatches among the mapped reads.
 

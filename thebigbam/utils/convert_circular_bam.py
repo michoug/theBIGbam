@@ -79,7 +79,9 @@ def _filter_ghost_alignments(reads, original_lengths):
     another supplementary of the same query name has the same
     ``pos % original_ln`` on the same contig.
 
-    Returns (kept_reads, n_ghost_secondary, n_ghost_supplementary).
+    Returns (kept_reads, n_ghost_secondary, n_ghost_supplementary,
+    mapq_fix_reads) where mapq_fix_reads is a set of read objects whose
+    ghosts were removed and have no remaining real secondaries/supplementaries.
     """
     primaries = []
     secondaries = []
@@ -130,7 +132,15 @@ def _filter_ghost_alignments(reads, original_lengths):
             seen_supp_positions.add(key)
         kept_supp.append(r)
 
-    return primaries + kept_sec + kept_supp, n_ghost_sec, n_ghost_supp
+    # Identify primaries needing MAPQ fix: ghosts were removed and
+    # no real secondaries/supplementaries remain for this read group
+    mapq_fix_reads = set()
+    if (n_ghost_sec > 0 or n_ghost_supp > 0) and not kept_sec and not kept_supp:
+        for r in primaries:
+            if not r.is_unmapped:
+                mapq_fix_reads.add(id(r))
+
+    return primaries + kept_sec + kept_supp, n_ghost_sec, n_ghost_supp, mapq_fix_reads
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +213,7 @@ def convert_circular_bam(
 
     total_ghost_sec = 0
     total_ghost_supp = 0
+    total_mapq_fixed = 0
 
     try:
         with pysam.AlignmentFile(namesorted, "rb", threads=threads) as infile:
@@ -222,12 +233,15 @@ def convert_circular_bam(
                     key=lambda r: r.query_name,
                 ):
                     reads = list(group)
-                    kept, n_gs, n_gsup = _filter_ghost_alignments(reads, original_lengths)
+                    kept, n_gs, n_gsup, mapq_fix = _filter_ghost_alignments(reads, original_lengths)
                     total_ghost_sec += n_gs
                     total_ghost_supp += n_gsup
+                    total_mapq_fixed += len(mapq_fix)
 
                     for read in kept:
                         _adjust_read(read, original_lengths)
+                        if id(read) in mapq_fix:
+                            read.mapping_quality = 60
                         outfile.write(read)
 
     finally:
@@ -247,6 +261,7 @@ def convert_circular_bam(
 
     print(
         f"Circular BAM conversion: discarded {total_ghost_sec} ghost secondary "
-        f"and {total_ghost_supp} ghost supplementary alignments",
+        f"and {total_ghost_supp} ghost supplementary alignments, "
+        f"fixed MAPQ to 60 for {total_mapq_fixed} primary alignments",
         flush=True,
     )
