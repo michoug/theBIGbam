@@ -4,22 +4,32 @@ build-backend = "maturin"
 
 [project]
 name = "thebigbam"
-version = "0.1.0"
-description = "Interactive and static plotting of mapping-derived features for microbial genomes"
+version = "1.0.0"
+description = "Compression and interactive exploration of large-scale sequencing alignments with circular mapping support"
 readme = "README.md"
-authors = [{ name = "Your Name" }]
+authors = [{ name = "Martin Boutroux", email = "martinboutroux@outlook.fr" }]
 license = { text = "MIT" }
 requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Homepage = "https://github.com/bhagavadgitadu22/theBIGbam"
+Repository = "https://github.com/bhagavadgitadu22/theBIGbam"
+Issues = "https://github.com/bhagavadgitadu22/theBIGbam/issues"
 
 dependencies = [
     "bokeh>=3.0",
     "panel>=1.0",
     "biopython>=1.79",
     "pysam>=0.20",
-    "numpy>=1.24",
-    "numba>=0.56",
     "dna-features-viewer>=1.0",
-    "pyarrow>=14.0",
     "duckdb>=1.0",
 ]
 
