@@ -42,7 +42,7 @@ To avoid potential compilation errors:
 - On macOS: `brew install xz bzip2 zlib`
 - On HPC clusters: you may need to load the LLVM module first: `module load llvm`
 
-If you cannot use and of these methods and still get errors related to `libclang` during installation such as :
+If you cannot use any of these methods and still get errors related to `libclang` during installation such as :
 
 ```bash
 thread 'main' (3889591) panicked at /home/gmichoud/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bindgen-0.69.5/lib.rs:622:31:
